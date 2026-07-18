@@ -6,7 +6,9 @@ use leptos_ui_theme_core::{
     ThemeError, TokenDomain, sha256,
 };
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, thiserror::Error)]
@@ -25,6 +27,8 @@ pub enum CodegenError {
     CssValue { path: String, reason: String },
     #[error("generated output exceeds the configured byte limit")]
     OutputLimit,
+    #[error("generated output changed while applying: {0}")]
+    Conflict(String),
 }
 
 #[derive(Clone, Debug)]
@@ -37,6 +41,15 @@ pub struct GeneratedArtifact {
 pub struct BuildResult {
     pub artifacts: Vec<GeneratedArtifact>,
     pub profiles: Vec<ResolvedProfile>,
+}
+
+struct PendingArtifact {
+    relative: String,
+    path: PathBuf,
+    stage: PathBuf,
+    backup: PathBuf,
+    previous: Option<Vec<u8>>,
+    bytes: Vec<u8>,
 }
 
 #[derive(Serialize)]
@@ -162,15 +175,42 @@ pub fn build(root: &Path) -> Result<BuildResult, CodegenError> {
 }
 
 pub fn apply(root: &Path, result: &BuildResult) -> Result<Vec<String>, CodegenError> {
-    let mut changed = Vec::new();
-    for artifact in &result.artifacts {
+    apply_artifacts(root, &result.artifacts)
+}
+
+pub fn apply_artifacts(
+    root: &Path,
+    artifacts: &[GeneratedArtifact],
+) -> Result<Vec<String>, CodegenError> {
+    let mut paths = BTreeSet::new();
+    for artifact in artifacts {
+        let relative = Path::new(&artifact.path);
+        if relative.is_absolute()
+            || artifact.path.is_empty()
+            || !relative
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_)))
+            || !paths.insert(&artifact.path)
+        {
+            return Err(CodegenError::Core(ThemeError::Security(
+                artifact.path.clone(),
+            )));
+        }
+    }
+    let canonical_root = std::fs::canonicalize(root).map_err(|source| CodegenError::Io {
+        path: root.to_path_buf(),
+        source,
+    })?;
+    let mut pending = Vec::new();
+    for (ordinal, artifact) in artifacts.iter().enumerate() {
         let path = root.join(&artifact.path);
         if path.is_symlink() {
             return Err(CodegenError::Core(ThemeError::Security(
                 artifact.path.clone(),
             )));
         }
-        if std::fs::read(&path).ok().as_deref() == Some(&artifact.bytes) {
+        let previous = read_optional(&path)?;
+        if previous.as_deref() == Some(&artifact.bytes) {
             continue;
         }
         if let Some(parent) = path.parent() {
@@ -178,24 +218,130 @@ pub fn apply(root: &Path, result: &BuildResult) -> Result<Vec<String>, CodegenEr
                 path: parent.to_path_buf(),
                 source,
             })?;
+            let canonical_parent =
+                std::fs::canonicalize(parent).map_err(|source| CodegenError::Io {
+                    path: parent.to_path_buf(),
+                    source,
+                })?;
+            if !canonical_parent.starts_with(&canonical_root) {
+                return Err(CodegenError::Core(ThemeError::Security(
+                    artifact.path.clone(),
+                )));
+            }
         }
-        let temporary = path.with_extension(format!(
-            "{}.leptos-ui-theme.tmp",
-            path.extension()
-                .and_then(|value| value.to_str())
-                .unwrap_or("file")
-        ));
-        std::fs::write(&temporary, &artifact.bytes).map_err(|source| CodegenError::Io {
-            path: temporary.clone(),
-            source,
-        })?;
-        std::fs::rename(&temporary, &path).map_err(|source| CodegenError::Io {
-            path: path.clone(),
-            source,
-        })?;
-        changed.push(artifact.path.clone());
+        let transaction = format!("{}-{ordinal:06}", std::process::id());
+        let stage = sibling(&path, &format!(".leptos-ui-theme-{transaction}.stage"));
+        let backup = sibling(&path, &format!(".leptos-ui-theme-{transaction}.backup"));
+        if stage.exists() || backup.exists() {
+            return Err(CodegenError::Conflict(artifact.path.clone()));
+        }
+        pending.push(PendingArtifact {
+            relative: artifact.path.clone(),
+            path,
+            stage,
+            backup,
+            previous,
+            bytes: artifact.bytes.clone(),
+        });
     }
-    Ok(changed)
+
+    for (index, item) in pending.iter().enumerate() {
+        let write = (|| {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&item.stage)?;
+            file.write_all(&item.bytes)?;
+            file.sync_all()
+        })();
+        if let Err(source) = write {
+            cleanup_pending(&pending[..index]);
+            return Err(CodegenError::Io {
+                path: item.stage.clone(),
+                source,
+            });
+        }
+    }
+
+    for item in &pending {
+        let current = match read_optional(&item.path) {
+            Ok(current) => current,
+            Err(error) => {
+                cleanup_pending(&pending);
+                return Err(error);
+            }
+        };
+        if item.path.is_symlink() || current != item.previous {
+            cleanup_pending(&pending);
+            return Err(CodegenError::Conflict(item.relative.clone()));
+        }
+    }
+
+    for (installed, item) in pending.iter().enumerate() {
+        if item.previous.is_some()
+            && let Err(source) = std::fs::rename(&item.path, &item.backup)
+        {
+            rollback(&pending[..installed]);
+            cleanup_pending(&pending);
+            return Err(CodegenError::Io {
+                path: item.path.clone(),
+                source,
+            });
+        }
+        if let Err(source) = std::fs::rename(&item.stage, &item.path) {
+            if item.previous.is_some() {
+                let _ = std::fs::rename(&item.backup, &item.path);
+            }
+            rollback(&pending[..installed]);
+            cleanup_pending(&pending);
+            return Err(CodegenError::Io {
+                path: item.path.clone(),
+                source,
+            });
+        }
+    }
+    for item in &pending {
+        if item.backup.exists() {
+            std::fs::remove_file(&item.backup).map_err(|source| CodegenError::Io {
+                path: item.backup.clone(),
+                source,
+            })?;
+        }
+    }
+    Ok(pending.into_iter().map(|item| item.relative).collect())
+}
+
+fn sibling(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(suffix);
+    path.with_file_name(name)
+}
+
+fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, CodegenError> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(CodegenError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn cleanup_pending(pending: &[PendingArtifact]) {
+    for item in pending {
+        let _ = std::fs::remove_file(&item.stage);
+        let _ = std::fs::remove_file(&item.backup);
+    }
+}
+
+fn rollback(installed: &[PendingArtifact]) {
+    for item in installed.iter().rev() {
+        let _ = std::fs::remove_file(&item.path);
+        if item.backup.exists() {
+            let _ = std::fs::rename(&item.backup, &item.path);
+        }
+    }
 }
 
 pub fn check(root: &Path, result: &BuildResult) -> Vec<String> {
@@ -380,11 +526,13 @@ fn serialize_css(token: &ResolvedToken) -> Result<String, CodegenError> {
                     .get("alpha")
                     .and_then(serde_json::Value::as_f64)
                     .unwrap_or(1.0);
-                return Ok(format!(
-                    "color({space} {} / {})",
-                    components.join(" "),
-                    format_number(alpha)
-                ));
+                let components = components.join(" ");
+                let alpha = format_number(alpha);
+                return match space {
+                    "oklch" => Ok(format!("oklch({components} / {alpha})")),
+                    "srgb" | "display-p3" => Ok(format!("color({space} {components} / {alpha})")),
+                    _ => Err(fail("unsupported color space")),
+                };
             }
             Err(fail("unsupported object value"))
         }
@@ -636,11 +784,92 @@ fn profile<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::format_number;
+    use super::{GeneratedArtifact, apply_artifacts, format_number, serialize_css};
+    use leptos_ui_theme_core::{ResolvedToken, TokenDomain};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    fn temporary_directory() -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "leptos-ui-theme-codegen-{}-{}",
+            std::process::id(),
+            NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&path).expect("create temporary directory");
+        path
+    }
 
     #[test]
     fn numbers_are_stable() {
         assert_eq!(format_number(-0.0), "0");
         assert_eq!(format_number(1.25), "1.25");
+    }
+
+    #[test]
+    fn oklch_uses_valid_css_function_syntax() {
+        let token = ResolvedToken {
+            path: "color.primary".into(),
+            token_type: "color".into(),
+            css_custom_property: "--kit-color-primary".into(),
+            domain: TokenDomain::Theme,
+            value: serde_json::json!({
+                "colorSpace": "oklch",
+                "components": [0.62, 0.2, 260.0],
+                "alpha": 0.8
+            }),
+            provenance: "test".into(),
+            alias_of: None,
+        };
+        assert_eq!(
+            serialize_css(&token).expect("serialize color"),
+            "oklch(0.62 0.2 260 / 0.8)"
+        );
+    }
+
+    #[test]
+    fn artifact_application_is_idempotent() {
+        let root = temporary_directory();
+        let artifacts = vec![
+            GeneratedArtifact {
+                path: "generated/theme.css".into(),
+                bytes: b"theme\n".to_vec(),
+            },
+            GeneratedArtifact {
+                path: "theme.lock.json".into(),
+                bytes: b"lock\n".to_vec(),
+            },
+        ];
+        assert_eq!(
+            apply_artifacts(&root, &artifacts)
+                .expect("first apply")
+                .len(),
+            2
+        );
+        assert!(
+            apply_artifacts(&root, &artifacts)
+                .expect("second apply")
+                .is_empty()
+        );
+        std::fs::remove_dir_all(root).expect("remove temporary directory");
+    }
+
+    #[test]
+    fn preflight_failure_does_not_write_an_earlier_artifact() {
+        let root = temporary_directory();
+        std::fs::write(root.join("blocked"), b"not a directory").expect("create blocking file");
+        let artifacts = vec![
+            GeneratedArtifact {
+                path: "first.txt".into(),
+                bytes: b"first".to_vec(),
+            },
+            GeneratedArtifact {
+                path: "blocked/second.txt".into(),
+                bytes: b"second".to_vec(),
+            },
+        ];
+        assert!(apply_artifacts(&root, &artifacts).is_err());
+        assert!(!root.join("first.txt").exists());
+        std::fs::remove_dir_all(root).expect("remove temporary directory");
     }
 }

@@ -2,7 +2,9 @@
 #![doc = "Command orchestration for the `leptos_ui_theme` CLI."]
 
 use clap::{Args, Parser, Subcommand};
-use leptos_ui_theme_codegen::{apply, build, check};
+use leptos_ui_theme_codegen::{
+    CodegenError, GeneratedArtifact, apply, apply_artifacts, build, check,
+};
 use leptos_ui_theme_core::{CONFIG_FILE, Profile, ProjectConfig, ThemeCompiler, ThemeError};
 use serde::Serialize;
 use serde_json::json;
@@ -89,6 +91,7 @@ impl CliError {
             Self::Core(ThemeError::Security(_)) => 5,
             Self::Core(ThemeError::Contract(_)) => 6,
             Self::Core(_) => 3,
+            Self::Codegen(CodegenError::Conflict(_)) => 4,
             Self::Codegen(_) | Self::Json(_) | Self::Io { .. } => 70,
         }
     }
@@ -273,9 +276,19 @@ fn init(start: &Path, dry_run: bool) -> Result<Outcome, CliError> {
         ),
     ];
     if !dry_run {
-        for (path, bytes) in &files {
-            create_new(&root.join(path), bytes)?;
+        for (path, _) in &files {
+            if root.join(path).exists() {
+                return Err(CliError::Conflict(format!("{path} already exists")));
+            }
         }
+        let artifacts = files
+            .iter()
+            .map(|(path, bytes)| GeneratedArtifact {
+                path: path.clone(),
+                bytes: bytes.clone(),
+            })
+            .collect::<Vec<_>>();
+        apply_artifacts(&root, &artifacts)?;
     }
     Ok(Outcome {
         command: "init",
@@ -354,7 +367,7 @@ fn explain_command(root: &Path, token_path: &str, profile: &str) -> Result<Outco
         status: Status::Success,
         exit_code: 0,
         changes: Vec::new(),
-        data: json!({"profile": profile, "path": token.path, "type": token.token_type, "value": token.value, "provenance": token.provenance}),
+        data: json!({"profile": profile, "path": token.path, "type": token.token_type, "value": token.value, "provenance": token.provenance, "aliasOf": token.alias_of}),
     })
 }
 
@@ -434,10 +447,14 @@ fn add_command(
         (source_path, b"{}\n".to_vec()),
     ];
     if !dry_run {
-        for (path, bytes) in &files[..2] {
-            replace(&root.join(path), bytes)?;
-        }
-        create_new(&root.join(&files[2].0), &files[2].1)?;
+        let artifacts = files
+            .iter()
+            .map(|(path, bytes)| GeneratedArtifact {
+                path: path.clone(),
+                bytes: bytes.clone(),
+            })
+            .collect::<Vec<_>>();
+        apply_artifacts(root, &artifacts)?;
     }
     Ok(Outcome {
         command: "add",
@@ -464,35 +481,6 @@ fn pretty_json(value: &impl Serialize) -> Result<Vec<u8>, CliError> {
     let mut bytes = serde_json::to_vec_pretty(value)?;
     bytes.push(b'\n');
     Ok(bytes)
-}
-
-fn create_new(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
-    if path.exists() {
-        return Err(CliError::Conflict(format!(
-            "{} already exists",
-            path.display()
-        )));
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| CliError::Io {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    }
-    std::fs::write(path, bytes).map_err(|source| CliError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
-fn replace(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
-    if path.is_symlink() {
-        return Err(ThemeError::Security(path.display().to_string()).into());
-    }
-    std::fs::write(path, bytes).map_err(|source| CliError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
 }
 
 fn print_human(outcome: &Outcome) {
