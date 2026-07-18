@@ -1,0 +1,25 @@
+[package]
+name = "leptos_ui_theme_cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme.workspace = true
+description = "Command-line interface for leptos_ui_theme"
+
+[lints]
+workspace = true
+
+[dependencies]
+clap.workspace = true
+leptos_ui_theme_codegen.workspace = true
+leptos_ui_theme_core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[[bin]]
+name = "leptos_ui_theme"
+path = "src/main.rs"

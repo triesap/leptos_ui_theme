@@ -1,7 +1,9 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
-    "crates/*"
+    "crates/leptos_ui_theme_core",
+    "crates/leptos_ui_theme_codegen",
+    "crates/leptos_ui_theme_cli",
 ]
 
 [workspace.package]
@@ -17,16 +19,16 @@ rust-version = "1.92.0"
 unsafe_code = "forbid"
 
 [workspace.dependencies]
+clap = { version = "4.5.50", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.145", features = ["preserve_order"] }
+sha2 = "0.10.9"
+thiserror = "2.0.17"
+
+leptos_ui_theme_core = { version = "0.1.0", path = "crates/leptos_ui_theme_core" }
+leptos_ui_theme_codegen = { version = "0.1.0", path = "crates/leptos_ui_theme_codegen" }
 
 [profile.release]
 codegen-units = 1
 lto = true
-opt-level = "z"
-strip = true
-
-[profile.wasm-release]
-inherits = "release"
-codegen-units = 1
-lto = true
-opt-level = "z"
-panic = "abort"
+opt-level = 3

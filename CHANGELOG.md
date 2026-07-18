@@ -7,4 +7,6 @@ Semantic Versioning.
 
 ## [Unreleased]
 
-- Initial leptos_ui_theme bootstrap.
+- Add the three-crate compiler workspace, DTCG resolution, deterministic CSS
+  and Rust generation, locks, and the `init`, `add`, `build`, `check`, `list`,
+  `explain`, and strict `doctor` CLI flows.
