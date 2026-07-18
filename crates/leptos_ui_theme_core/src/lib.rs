@@ -1,14 +1,16 @@
 #![forbid(unsafe_code)]
 #![doc = "Core models, validation, and token resolution for `leptos_ui_theme`."]
 
+mod color;
 mod contract;
 mod kit;
 mod model;
 mod resolver;
 
+pub use color::{Srgb, parse_color, validate_contrast};
 pub use contract::{
-    ContractCompatibility, Deprecation, KitTokenContract, TokenDomain, TokenMapping,
-    canonical_contract_digest,
+    ContractCompatibility, ContrastCheck, ContrastKind, Deprecation, KitTokenContract, TokenDomain,
+    TokenMapping, canonical_contract_digest,
 };
 pub use kit::{KitCapability, KitLock, VerifiedKit, discover_kit};
 pub use model::{

@@ -1,6 +1,6 @@
 use crate::contract::{KitTokenContract, TokenDomain};
 use crate::model::{ColorScheme, Profile, ProjectConfig};
-use crate::{CONFIG_FILE, ThemeError, discover_kit, read_json};
+use crate::{CONFIG_FILE, ThemeError, discover_kit, read_json, validate_contrast};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -196,12 +196,14 @@ impl ThemeCompiler {
                 provenance: value.provenance.clone(),
             });
         }
-        Ok(ResolvedProfile {
+        let resolved = ResolvedProfile {
             id: profile.id.clone(),
             label: profile.label.clone(),
             color_scheme: profile.color_scheme,
             values,
-        })
+        };
+        validate_contrast(&self.contract, &resolved.values)?;
+        Ok(resolved)
     }
 
     fn apply_modifier(

@@ -16,7 +16,7 @@ pub struct KitTokenContract {
     pub dtcg_profile: String,
     pub canonical_digest: String,
     pub tokens: Vec<TokenMapping>,
-    pub contrast_checks: Vec<serde_json::Value>,
+    pub contrast_checks: Vec<ContrastCheck>,
     #[serde(default)]
     pub extensions: BTreeMap<String, serde_json::Value>,
 }
@@ -45,6 +45,29 @@ pub struct TokenMapping {
 pub struct Deprecation {
     pub message: String,
     pub replacement: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ContrastCheck {
+    pub id: String,
+    pub foreground: String,
+    pub background: String,
+    pub kind: ContrastKind,
+    pub minimum: f64,
+    #[serde(default)]
+    pub composite_on: Option<Vec<Vec<String>>>,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ContrastKind {
+    Text,
+    LargeText,
+    NonText,
+    FocusIndicator,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, Ord, PartialEq, PartialOrd)]
@@ -148,6 +171,22 @@ impl KitTokenContract {
                 )));
             }
             previous = Some(mapping.order);
+        }
+        let mut contrast_ids = BTreeSet::new();
+        for check in &self.contrast_checks {
+            if check.id.is_empty()
+                || check.id.len() > 63
+                || !check.minimum.is_finite()
+                || !(1.0..=21.0).contains(&check.minimum)
+                || !contrast_ids.insert(&check.id)
+                || !paths.contains(&check.foreground)
+                || !paths.contains(&check.background)
+            {
+                return Err(ThemeError::Contract(format!(
+                    "invalid contrast check `{}`",
+                    check.id
+                )));
+            }
         }
         Ok(compatibility)
     }
