@@ -13,6 +13,7 @@ pub struct ResolvedToken {
     pub domain: TokenDomain,
     pub value: serde_json::Value,
     pub provenance: String,
+    pub alias_of: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -160,9 +161,11 @@ impl ThemeCompiler {
         }
 
         resolve_aliases(&mut raw, self.config.limits.max_reference_depth)?;
+        apply_deprecations(&self.contract, &mut raw)?;
         let mut values = Vec::with_capacity(self.contract.tokens.len());
         for mapping in &self.contract.tokens {
-            let Some(value) = raw.get(&mapping.path) else {
+            let terminal = self.contract.terminal_mapping(&mapping.path)?;
+            let Some(value) = raw.get(&terminal.path) else {
                 if mapping.required {
                     return Err(ThemeError::Resolution(format!(
                         "required token `{}` is unresolved",
@@ -171,29 +174,36 @@ impl ThemeCompiler {
                 }
                 continue;
             };
-            if value.token_type != mapping.token_type {
+            if value.token_type != terminal.token_type {
                 return Err(ThemeError::Resolution(format!(
                     "token `{}` has type `{}` but contract requires `{}`",
-                    mapping.path, value.token_type, mapping.token_type
+                    terminal.path, value.token_type, terminal.token_type
                 )));
             }
             if value.provenance != "contract-default"
-                && (!mapping.theme_override
-                    || (mapping.domain != TokenDomain::Theme
-                        && Some(mapping.domain) != axis_domain))
+                && (!terminal.theme_override
+                    || (terminal.domain != TokenDomain::Theme
+                        && Some(terminal.domain) != axis_domain))
             {
                 return Err(ThemeError::Resolution(format!(
                     "source is not allowed to override token `{}` in domain `{:?}`",
-                    mapping.path, mapping.domain
+                    terminal.path, terminal.domain
                 )));
             }
+            let alias_of = mapping.deprecation.as_ref().map(|_| terminal.path.clone());
             values.push(ResolvedToken {
                 path: mapping.path.clone(),
                 token_type: mapping.token_type.clone(),
                 css_custom_property: mapping.css_custom_property.clone(),
                 domain: mapping.domain,
-                value: value.value.clone(),
+                value: alias_of
+                    .as_ref()
+                    .map(|_| {
+                        serde_json::Value::String(format!("var({})", terminal.css_custom_property))
+                    })
+                    .unwrap_or_else(|| value.value.clone()),
                 provenance: value.provenance.clone(),
+                alias_of,
             });
         }
         let resolved = ResolvedProfile {
@@ -278,6 +288,32 @@ fn flatten_tokens(
         .get("$type")
         .and_then(serde_json::Value::as_str)
         .or(inherited_type);
+    if let Some(root) = object.get("$root") {
+        if prefix.is_empty() {
+            return Err(ThemeError::Resolution(
+                "a document root cannot declare a $root token".into(),
+            ));
+        }
+        let root = root
+            .as_object()
+            .ok_or_else(|| ThemeError::Resolution(format!("token `{prefix}` must be an object")))?;
+        let token_value = root
+            .get("$value")
+            .ok_or_else(|| ThemeError::Resolution(format!("token `{prefix}` has no $value")))?;
+        let token_type = root
+            .get("$type")
+            .and_then(serde_json::Value::as_str)
+            .or(declared_type)
+            .ok_or_else(|| ThemeError::Resolution(format!("token `{prefix}` has no type")))?;
+        output.insert(
+            prefix.into(),
+            RawToken {
+                token_type: token_type.into(),
+                value: token_value.clone(),
+                provenance: path.display().to_string(),
+            },
+        );
+    }
     for (name, child) in object {
         if name.starts_with('$') {
             continue;
@@ -352,9 +388,164 @@ fn resolve_aliases(
     Ok(())
 }
 
+fn apply_deprecations(
+    contract: &KitTokenContract,
+    values: &mut BTreeMap<String, RawToken>,
+) -> Result<(), ThemeError> {
+    for mapping in contract
+        .tokens
+        .iter()
+        .filter(|mapping| mapping.deprecation.is_some())
+    {
+        let Some(legacy) = values.remove(&mapping.path) else {
+            continue;
+        };
+        let terminal = contract.terminal_mapping(&mapping.path)?;
+        match values.get(&terminal.path) {
+            Some(current)
+                if current.provenance != "contract-default"
+                    && (current.token_type != legacy.token_type
+                        || current.value != legacy.value) =>
+            {
+                return Err(ThemeError::Resolution(format!(
+                    "deprecated token `{}` conflicts with replacement `{}`",
+                    mapping.path, terminal.path
+                )));
+            }
+            Some(current) if current.provenance != "contract-default" => {}
+            _ => {
+                values.insert(
+                    terminal.path.clone(),
+                    RawToken {
+                        provenance: format!("{} -> {}", legacy.provenance, terminal.path),
+                        ..legacy
+                    },
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn alias_target(value: &str) -> Option<&str> {
     value
         .strip_prefix('{')?
         .strip_suffix('}')
         .filter(|value| !value.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RawToken, apply_deprecations, flatten_tokens};
+    use crate::KitTokenContract;
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    fn contract() -> KitTokenContract {
+        serde_json::from_value(serde_json::json!({
+            "$schema": "https://triesap.github.io/leptos_ui_kit/schema/0.2.0/token-contract.schema.json",
+            "schemaVersion": "1.0.0",
+            "contractId": "leptos-ui-kit",
+            "abiVersion": 1,
+            "revision": 2,
+            "dtcgVersion": "2025.10",
+            "dtcgProfile": "format+color+resolver:2025.10",
+            "canonicalDigest": "unused",
+            "tokens": [
+                {
+                    "path": "color.legacy",
+                    "type": "color",
+                    "cssCustomProperty": "--kit-color-legacy",
+                    "domain": "theme",
+                    "required": false,
+                    "order": 1,
+                    "themeOverride": true,
+                    "deprecation": {
+                        "message": "Use color.primary",
+                        "replacement": "color.primary"
+                    }
+                },
+                {
+                    "path": "color.primary",
+                    "type": "color",
+                    "cssCustomProperty": "--kit-color-primary",
+                    "domain": "theme",
+                    "required": true,
+                    "order": 2,
+                    "themeOverride": true,
+                    "default": "#000000"
+                }
+            ],
+            "contrastChecks": []
+        }))
+        .expect("contract fixture")
+    }
+
+    #[test]
+    fn group_root_becomes_the_group_token() {
+        let document = serde_json::json!({
+            "color": {
+                "$type": "color",
+                "$root": {"$value": "#123456"},
+                "accent": {"$value": "#abcdef"}
+            }
+        });
+        let mut output = BTreeMap::new();
+        flatten_tokens(&document, None, "", Path::new("tokens.json"), &mut output)
+            .expect("flatten tokens");
+        assert_eq!(output["color"].value, "#123456");
+        assert_eq!(output["color.accent"].value, "#abcdef");
+    }
+
+    #[test]
+    fn deprecated_assignment_replaces_the_terminal_default() {
+        let contract = contract();
+        contract.validate().expect("valid contract");
+        let mut values = BTreeMap::from([
+            (
+                "color.legacy".into(),
+                RawToken {
+                    token_type: "color".into(),
+                    value: serde_json::json!("#ffffff"),
+                    provenance: "theme.tokens.json".into(),
+                },
+            ),
+            (
+                "color.primary".into(),
+                RawToken {
+                    token_type: "color".into(),
+                    value: serde_json::json!("#000000"),
+                    provenance: "contract-default".into(),
+                },
+            ),
+        ]);
+        apply_deprecations(&contract, &mut values).expect("redirect assignment");
+        assert!(!values.contains_key("color.legacy"));
+        assert_eq!(values["color.primary"].value, "#ffffff");
+        assert!(values["color.primary"].provenance.contains("color.primary"));
+    }
+
+    #[test]
+    fn conflicting_deprecated_and_terminal_assignments_fail() {
+        let contract = contract();
+        let mut values = BTreeMap::from([
+            (
+                "color.legacy".into(),
+                RawToken {
+                    token_type: "color".into(),
+                    value: serde_json::json!("#ffffff"),
+                    provenance: "legacy.tokens.json".into(),
+                },
+            ),
+            (
+                "color.primary".into(),
+                RawToken {
+                    token_type: "color".into(),
+                    value: serde_json::json!("#000000"),
+                    provenance: "primary.tokens.json".into(),
+                },
+            ),
+        ]);
+        assert!(apply_deprecations(&contract, &mut values).is_err());
+    }
 }

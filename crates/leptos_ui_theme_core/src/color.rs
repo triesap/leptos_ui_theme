@@ -104,7 +104,7 @@ pub fn validate_contrast(
 ) -> Result<(), ThemeError> {
     let colors: BTreeMap<&str, Srgb> = values
         .iter()
-        .filter(|token| token.token_type == "color")
+        .filter(|token| token.token_type == "color" && token.alias_of.is_none())
         .map(|token| Ok((token.path.as_str(), parse_color(&token.value)?)))
         .collect::<Result<_, ThemeError>>()?;
     for check in &contract.contrast_checks {

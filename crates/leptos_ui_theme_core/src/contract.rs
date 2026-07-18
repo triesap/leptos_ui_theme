@@ -172,6 +172,31 @@ impl KitTokenContract {
             }
             previous = Some(mapping.order);
         }
+        for mapping in &self.tokens {
+            let Some(deprecation) = &mapping.deprecation else {
+                continue;
+            };
+            if mapping.required
+                || mapping.default.is_some()
+                || deprecation.message.trim().is_empty()
+            {
+                return Err(ThemeError::Contract(format!(
+                    "deprecated mapping `{}` must be optional, default-free, and have a message",
+                    mapping.path
+                )));
+            }
+            let terminal = self.terminal_mapping(&mapping.path)?;
+            if terminal.path == mapping.path
+                || terminal.token_type != mapping.token_type
+                || terminal.domain != mapping.domain
+                || terminal.theme_override != mapping.theme_override
+            {
+                return Err(ThemeError::Contract(format!(
+                    "deprecated mapping `{}` has an incompatible replacement",
+                    mapping.path
+                )));
+            }
+        }
         let mut contrast_ids = BTreeSet::new();
         for check in &self.contrast_checks {
             if check.id.is_empty()
@@ -189,6 +214,31 @@ impl KitTokenContract {
             }
         }
         Ok(compatibility)
+    }
+
+    pub fn terminal_mapping(&self, path: &str) -> Result<&TokenMapping, ThemeError> {
+        let mut current = path;
+        let mut seen = BTreeSet::new();
+        loop {
+            if !seen.insert(current) {
+                return Err(ThemeError::Contract(format!(
+                    "deprecation replacement cycle at `{path}`"
+                )));
+            }
+            let mapping = self
+                .tokens
+                .iter()
+                .find(|mapping| mapping.path == current)
+                .ok_or_else(|| {
+                    ThemeError::Contract(format!(
+                        "unknown deprecation replacement `{current}` for `{path}`"
+                    ))
+                })?;
+            match &mapping.deprecation {
+                Some(deprecation) => current = &deprecation.replacement,
+                None => return Ok(mapping),
+            }
+        }
     }
 
     pub fn installed_digest(path: &Path) -> Result<String, ThemeError> {
