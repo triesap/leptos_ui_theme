@@ -35,6 +35,7 @@ pub struct ThemeCompiler {
 
 #[derive(Debug, Deserialize)]
 struct ResolverDocument {
+    version: String,
     #[serde(default)]
     sets: serde_json::Map<String, serde_json::Value>,
     #[serde(default)]
@@ -71,6 +72,7 @@ impl ThemeCompiler {
     pub fn resolve(&self) -> Result<Vec<ResolvedProfile>, ThemeError> {
         let resolver_path = self.root.join(&self.config.resolver);
         let resolver: ResolverDocument = read_json(&resolver_path)?;
+        validate_resolver(&resolver)?;
         self.config
             .profiles
             .named
@@ -93,6 +95,7 @@ impl ThemeCompiler {
     ) -> Result<Vec<ResolvedProfile>, ThemeError> {
         let resolver_path = self.root.join(&self.config.resolver);
         let resolver: ResolverDocument = read_json(&resolver_path)?;
+        validate_resolver(&resolver)?;
         let base = self.config.profile(&self.config.profiles.default)?;
         contexts
             .iter()
@@ -138,9 +141,10 @@ impl ThemeCompiler {
         }
 
         for order in &resolver.resolution_order {
-            let Some(reference) = order.get("$ref").and_then(serde_json::Value::as_str) else {
-                continue;
-            };
+            let reference = order
+                .get("$ref")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| ThemeError::Resolution("resolutionOrder entry lacks $ref".into()))?;
             if let Some(name) = reference.strip_prefix("#/sets/") {
                 let set = resolver.sets.get(name).ok_or_else(|| {
                     ThemeError::Resolution(format!("unknown resolver set `{name}`"))
@@ -148,6 +152,10 @@ impl ThemeCompiler {
                 apply_sources(set.get("sources"), resolver_path, &mut raw)?;
             } else if let Some(modifier_name) = reference.strip_prefix("#/modifiers/") {
                 self.apply_modifier(profile, resolver, modifier_name, resolver_path, &mut raw)?;
+            } else {
+                return Err(ThemeError::Resolution(format!(
+                    "unsupported resolutionOrder reference `{reference}`"
+                )));
             }
         }
         for modifier in profile.inputs.keys() {
@@ -241,6 +249,21 @@ impl ThemeCompiler {
     }
 }
 
+fn validate_resolver(resolver: &ResolverDocument) -> Result<(), ThemeError> {
+    if resolver.version != "2025.10" {
+        return Err(ThemeError::Resolution(format!(
+            "unsupported resolver version `{}`",
+            resolver.version
+        )));
+    }
+    if resolver.resolution_order.is_empty() {
+        return Err(ThemeError::Resolution(
+            "resolver resolutionOrder is empty".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn apply_sources(
     sources: Option<&serde_json::Value>,
     resolver_path: &Path,
@@ -256,16 +279,46 @@ fn apply_sources(
             .get("$ref")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| ThemeError::Resolution("resolver source lacks $ref".into()))?;
-        if reference.starts_with('#') || reference.contains("..") || reference.contains('\\') {
+        let (file_reference, pointer) = reference
+            .split_once('#')
+            .map_or((reference, None), |(file, pointer)| (file, Some(pointer)));
+        if file_reference.is_empty()
+            || Path::new(file_reference).is_absolute()
+            || file_reference.contains("..")
+            || file_reference.contains('\\')
+            || file_reference.contains(':')
+            || pointer.is_some_and(|pointer| !pointer.is_empty() && !pointer.starts_with('/'))
+        {
             return Err(ThemeError::Security(format!(
                 "unsafe resolver reference `{reference}`"
             )));
         }
         let base = resolver_path.parent().unwrap_or_else(|| Path::new("."));
-        let path = base.join(reference);
+        let path = base.join(file_reference);
+        let canonical_base = std::fs::canonicalize(base).map_err(|source| ThemeError::Io {
+            path: base.to_path_buf(),
+            source,
+        })?;
+        let path = std::fs::canonicalize(&path).map_err(|source| ThemeError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        if !path.starts_with(&canonical_base) {
+            return Err(ThemeError::Security(format!(
+                "resolver reference escapes the token root: `{reference}`"
+            )));
+        }
         let value: serde_json::Value = read_json(&path)?;
+        let value = match pointer {
+            Some("") | None => &value,
+            Some(pointer) => value.pointer(pointer).ok_or_else(|| {
+                ThemeError::Resolution(format!(
+                    "unknown JSON Pointer `#{pointer}` in `{file_reference}`"
+                ))
+            })?,
+        };
         let mut flattened = BTreeMap::new();
-        flatten_tokens(&value, None, "", &path, &mut flattened)?;
+        flatten_tokens(value, None, "", &path, &mut flattened)?;
         raw.extend(flattened);
     }
     Ok(())
@@ -357,6 +410,7 @@ fn resolve_aliases(
     for key in keys {
         let mut seen = BTreeSet::new();
         let mut current = key.clone();
+        let mut resolved = false;
         for _ in 0..=max_depth {
             if !seen.insert(current.clone()) {
                 return Err(ThemeError::Resolution(format!("alias cycle at `{key}`")));
@@ -380,9 +434,15 @@ fn resolve_aliases(
                         },
                     );
                 }
+                resolved = true;
                 break;
             };
             current = alias.into();
+        }
+        if !resolved {
+            return Err(ThemeError::Resolution(format!(
+                "alias depth exceeds configured maximum at `{key}`"
+            )));
         }
     }
     Ok(())
@@ -436,7 +496,10 @@ fn alias_target(value: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RawToken, apply_deprecations, flatten_tokens};
+    use super::{
+        RawToken, ResolverDocument, apply_deprecations, flatten_tokens, resolve_aliases,
+        validate_resolver,
+    };
     use crate::KitTokenContract;
     use std::collections::BTreeMap;
     use std::path::Path;
@@ -547,5 +610,46 @@ mod tests {
             ),
         ]);
         assert!(apply_deprecations(&contract, &mut values).is_err());
+    }
+
+    #[test]
+    fn unsupported_resolver_versions_fail() {
+        let resolver: ResolverDocument = serde_json::from_value(serde_json::json!({
+            "version": "2024.1",
+            "resolutionOrder": [{"$ref": "#/sets/base"}]
+        }))
+        .expect("resolver fixture");
+        assert!(validate_resolver(&resolver).is_err());
+    }
+
+    #[test]
+    fn alias_depth_limit_fails_instead_of_leaving_an_alias() {
+        let mut values = BTreeMap::from([
+            (
+                "a".into(),
+                RawToken {
+                    token_type: "number".into(),
+                    value: serde_json::json!("{b}"),
+                    provenance: "test".into(),
+                },
+            ),
+            (
+                "b".into(),
+                RawToken {
+                    token_type: "number".into(),
+                    value: serde_json::json!("{c}"),
+                    provenance: "test".into(),
+                },
+            ),
+            (
+                "c".into(),
+                RawToken {
+                    token_type: "number".into(),
+                    value: serde_json::json!(1),
+                    provenance: "test".into(),
+                },
+            ),
+        ]);
+        assert!(resolve_aliases(&mut values, 1).is_err());
     }
 }
