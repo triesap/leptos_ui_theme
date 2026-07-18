@@ -1,4 +1,4 @@
-use crate::{ThemeError, read_json, sha256};
+use crate::{ThemeError, sha256};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -68,8 +68,31 @@ pub enum ContractCompatibility {
 
 impl KitTokenContract {
     pub fn load(path: &Path) -> Result<Self, ThemeError> {
-        let contract: Self = read_json(path)?;
+        let bytes = std::fs::read(path).map_err(|source| ThemeError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|source| ThemeError::Json {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        let contract: Self =
+            serde_json::from_value(value.clone()).map_err(|source| ThemeError::Json {
+                path: path.to_path_buf(),
+                source,
+            })?;
         contract.validate()?;
+        let actual = canonical_contract_digest(&value)?;
+        let expected = contract
+            .canonical_digest
+            .strip_prefix("sha256:")
+            .unwrap_or(&contract.canonical_digest);
+        if expected != actual {
+            return Err(ThemeError::Contract(format!(
+                "canonical digest mismatch: declared {expected}, computed {actual}"
+            )));
+        }
         Ok(contract)
     }
 
@@ -136,6 +159,61 @@ impl KitTokenContract {
         })?;
         Ok(sha256(&bytes))
     }
+}
+
+pub fn canonical_contract_digest(value: &serde_json::Value) -> Result<String, ThemeError> {
+    let mut semantic = value.clone();
+    semantic
+        .as_object_mut()
+        .ok_or_else(|| ThemeError::Contract("token contract must be an object".into()))?
+        .remove("canonicalDigest");
+    let mut bytes = Vec::new();
+    write_canonical(&semantic, &mut bytes)?;
+    Ok(sha256(&bytes))
+}
+
+fn write_canonical(value: &serde_json::Value, output: &mut Vec<u8>) -> Result<(), ThemeError> {
+    match value {
+        serde_json::Value::Null => output.extend_from_slice(b"null"),
+        serde_json::Value::Bool(value) => {
+            output.extend_from_slice(if *value { b"true" } else { b"false" })
+        }
+        serde_json::Value::Number(value) => output.extend_from_slice(value.to_string().as_bytes()),
+        serde_json::Value::String(value) => output.extend_from_slice(
+            serde_json::to_string(value)
+                .map_err(|error| ThemeError::Contract(error.to_string()))?
+                .as_bytes(),
+        ),
+        serde_json::Value::Array(values) => {
+            output.push(b'[');
+            for (index, value) in values.iter().enumerate() {
+                if index != 0 {
+                    output.push(b',');
+                }
+                write_canonical(value, output)?;
+            }
+            output.push(b']');
+        }
+        serde_json::Value::Object(values) => {
+            output.push(b'{');
+            let mut entries: Vec<_> = values.iter().collect();
+            entries.sort_by(|(left, _), (right, _)| left.encode_utf16().cmp(right.encode_utf16()));
+            for (index, (key, value)) in entries.into_iter().enumerate() {
+                if index != 0 {
+                    output.push(b',');
+                }
+                output.extend_from_slice(
+                    serde_json::to_string(key)
+                        .map_err(|error| ThemeError::Contract(error.to_string()))?
+                        .as_bytes(),
+                );
+                output.push(b':');
+                write_canonical(value, output)?;
+            }
+            output.push(b'}');
+        }
+    }
+    Ok(())
 }
 
 fn valid_mapping_path(value: &str) -> bool {

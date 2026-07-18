@@ -89,6 +89,26 @@ impl ThemeCompiler {
             .ok_or_else(|| ThemeError::Resolution(format!("unknown profile `{profile}`")))
     }
 
+    pub fn resolve_axis(
+        &self,
+        modifier: &str,
+        contexts: &[String],
+    ) -> Result<Vec<ResolvedProfile>, ThemeError> {
+        let resolver_path = self.root.join(&self.config.resolver);
+        let resolver: ResolverDocument = read_json(&resolver_path)?;
+        let base = self.config.profile(&self.config.profiles.default)?;
+        contexts
+            .iter()
+            .map(|context| {
+                let mut profile = base.clone();
+                profile.id = context.clone();
+                profile.label = None;
+                profile.inputs.insert(modifier.into(), context.clone());
+                self.resolve_profile(&profile, &resolver, &resolver_path)
+            })
+            .collect()
+    }
+
     fn resolve_profile(
         &self,
         profile: &Profile,

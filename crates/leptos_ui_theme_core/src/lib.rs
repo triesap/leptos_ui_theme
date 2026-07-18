@@ -7,6 +7,7 @@ mod resolver;
 
 pub use contract::{
     ContractCompatibility, Deprecation, KitTokenContract, TokenDomain, TokenMapping,
+    canonical_contract_digest,
 };
 pub use model::{
     AxesConfig, AxisConfig, BootstrapConfig, BootstrapMode, ColorScheme, ExternalBootstrap,

@@ -566,37 +566,46 @@ mod tests {
         init(&root, false).unwrap();
         let contract_path = root.join("src/components/ui/_kit/token-contract.json");
         std::fs::create_dir_all(contract_path.parent().unwrap()).unwrap();
+        let mut contract = serde_json::json!({
+            "$schema": "https://triesap.github.io/leptos_ui_kit/schema/0.2.0/token-contract.schema.json",
+            "schemaVersion": "1.0.0",
+            "contractId": "leptos-ui-kit",
+            "abiVersion": 1,
+            "revision": 2,
+            "dtcgVersion": "2025.10",
+            "dtcgProfile": "format+color+resolver:2025.10",
+            "canonicalDigest": "",
+            "tokens": [{
+                "path": "color.surface",
+                "type": "color",
+                "cssCustomProperty": "--kit-color-surface",
+                "domain": "theme",
+                "required": true,
+                "order": 0,
+                "themeOverride": true,
+                "default": "#ffffff"
+            }],
+            "contrastChecks": []
+        });
+        let digest = leptos_ui_theme_core::canonical_contract_digest(&contract).unwrap();
+        contract["canonicalDigest"] = format!("sha256:{digest}").into();
         std::fs::write(
             &contract_path,
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "$schema": "https://triesap.github.io/leptos_ui_kit/schema/0.2.0/token-contract.schema.json",
-                "schemaVersion": "1.0.0",
-                "contractId": "leptos-ui-kit",
-                "abiVersion": 1,
-                "revision": 2,
-                "dtcgVersion": "2025.10",
-                "dtcgProfile": "format+color+resolver:2025.10",
-                "canonicalDigest": format!("sha256:{}", "0".repeat(64)),
-                "tokens": [{
-                    "path": "color.surface",
-                    "type": "color",
-                    "cssCustomProperty": "--kit-color-surface",
-                    "domain": "theme",
-                    "required": true,
-                    "order": 0,
-                    "themeOverride": true,
-                    "default": "#ffffff"
-                }],
-                "contrastChecks": []
-            }))
-            .unwrap(),
+            serde_json::to_vec_pretty(&contract).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("index.html"),
+            "<!doctype html>\n<html>\n<head>\n<link data-trunk rel=\"css\" href=\"styles/kit.css\">\n</head>\n<body></body>\n</html>\n",
         )
         .unwrap();
         let outcome = build_command(&root, false).unwrap();
-        assert_eq!(outcome.changes.len(), 3);
+        assert_eq!(outcome.changes.len(), 4);
         let css = std::fs::read_to_string(root.join("styles/themes.css")).unwrap();
         assert!(css.contains("@layer leptos-ui-kit.themes"));
         assert!(css.contains("--kit-color-surface: #ffffff"));
+        let index = std::fs::read_to_string(root.join("index.html")).unwrap();
+        assert!(index.contains("<!-- leptos-ui-theme:start -->"));
         let second = build_command(&root, false).unwrap();
         assert!(second.changes.is_empty());
         std::fs::remove_dir_all(root).unwrap();
