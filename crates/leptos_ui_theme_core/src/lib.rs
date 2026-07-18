@@ -2,6 +2,7 @@
 #![doc = "Core models, validation, and token resolution for `leptos_ui_theme`."]
 
 mod contract;
+mod kit;
 mod model;
 mod resolver;
 
@@ -9,6 +10,7 @@ pub use contract::{
     ContractCompatibility, Deprecation, KitTokenContract, TokenDomain, TokenMapping,
     canonical_contract_digest,
 };
+pub use kit::{KitCapability, KitLock, VerifiedKit, discover_kit};
 pub use model::{
     AxesConfig, AxisConfig, BootstrapConfig, BootstrapMode, ColorScheme, ExternalBootstrap,
     HtmlConfig, KitConfig, Limits, Outputs, Profile, Profiles, ProjectConfig, SeededOutputs,

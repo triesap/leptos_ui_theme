@@ -589,9 +589,58 @@ mod tests {
         });
         let digest = leptos_ui_theme_core::canonical_contract_digest(&contract).unwrap();
         contract["canonicalDigest"] = format!("sha256:{digest}").into();
+        let contract_bytes = serde_json::to_vec_pretty(&contract).unwrap();
+        std::fs::write(&contract_path, &contract_bytes).unwrap();
+        let stylesheet_path = root.join("styles/kit.css");
+        std::fs::create_dir_all(stylesheet_path.parent().unwrap()).unwrap();
+        let stylesheet_bytes =
+            b"@layer leptos-ui-kit.tokens, leptos-ui-kit.themes, leptos-ui-kit.components;\n";
+        std::fs::write(&stylesheet_path, stylesheet_bytes).unwrap();
+        let contract_bytes_digest =
+            format!("sha256:{}", leptos_ui_theme_core::sha256(&contract_bytes));
+        let stylesheet_bytes_digest =
+            format!("sha256:{}", leptos_ui_theme_core::sha256(stylesheet_bytes));
+        let capability_path = root.join("src/components/ui/_kit/theme-integration.json");
+        let capability = serde_json::json!({
+            "$schema": "https://triesap.github.io/leptos_ui_kit/schema/0.2.0/theme-integration.schema.json",
+            "schemaVersion": "1.0.0",
+            "producer": {"package": "leptos_ui_kit_cli", "version": "0.2.0", "repository": "https://github.com/triesap/leptos_ui_kit", "checksum": null},
+            "primitives": {"package": "web_ui_primitives", "requirement": ">=0.2.0,<0.3.0", "version": "0.2.0", "checksum": "sha256:test", "presenceAbi": 2},
+            "contract": {"path": "token-contract.json", "contractId": "leptos-ui-kit", "abiVersion": 1, "revision": 2, "canonicalDigest": contract["canonicalDigest"], "installedBytesDigest": contract_bytes_digest},
+            "stylesheet": {"path": "styles/kit.css", "installedBytesDigest": stylesheet_bytes_digest},
+            "layerAbi": {"version": 1, "order": ["leptos-ui-kit.tokens", "leptos-ui-kit.themes", "leptos-ui-kit.components"]},
+            "portalAbi": {"version": 1, "mountType": "web_ui_primitives::leptos::PortalMount", "bodyHost": true}
+        });
+        let capability_bytes = serde_json::to_vec_pretty(&capability).unwrap();
+        std::fs::write(&capability_path, &capability_bytes).unwrap();
+        let lock = serde_json::json!({"themeIntegration": {
+            "producerPackage": "leptos_ui_kit_cli",
+            "producerVersion": "0.2.0",
+            "producerChecksum": null,
+            "primitivesPackage": "web_ui_primitives",
+            "primitivesRequirement": ">=0.2.0,<0.3.0",
+            "primitivesVersion": "0.2.0",
+            "primitivesChecksum": "sha256:test",
+            "presenceAbiVersion": 2,
+            "contractPath": "src/components/ui/_kit/token-contract.json",
+            "contractId": "leptos-ui-kit",
+            "contractAbiVersion": 1,
+            "contractRevision": 2,
+            "contractCanonicalDigest": contract["canonicalDigest"],
+            "contractBytesDigest": contract_bytes_digest,
+            "capabilityPath": "src/components/ui/_kit/theme-integration.json",
+            "capabilityBytesDigest": format!("sha256:{}", leptos_ui_theme_core::sha256(&capability_bytes)),
+            "stylesheetPath": "styles/kit.css",
+            "stylesheetBytesDigest": stylesheet_bytes_digest,
+            "layerAbiVersion": 1,
+            "layerOrder": ["leptos-ui-kit.tokens", "leptos-ui-kit.themes", "leptos-ui-kit.components"],
+            "portalAbiVersion": 1,
+            "portalMountType": "web_ui_primitives::leptos::PortalMount",
+            "portalBodyHost": true
+        }});
         std::fs::write(
-            &contract_path,
-            serde_json::to_vec_pretty(&contract).unwrap(),
+            root.join("src/components/ui/_kit/kit.lock.json"),
+            serde_json::to_vec_pretty(&lock).unwrap(),
         )
         .unwrap();
         std::fs::write(

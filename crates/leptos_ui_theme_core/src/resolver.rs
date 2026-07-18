@@ -1,6 +1,6 @@
 use crate::contract::{KitTokenContract, TokenDomain};
 use crate::model::{ColorScheme, Profile, ProjectConfig};
-use crate::{CONFIG_FILE, ThemeError, read_json};
+use crate::{CONFIG_FILE, ThemeError, discover_kit, read_json};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -55,13 +55,9 @@ impl ThemeCompiler {
         let config_path = root.join(CONFIG_FILE);
         let config: ProjectConfig = read_json(&config_path)?;
         config.validate()?;
-        let contract_relative = config
-            .kit
-            .contract_path
-            .as_deref()
-            .unwrap_or("src/components/ui/_kit/token-contract.json");
-        let contract_path = root.join(contract_relative);
-        let contract = KitTokenContract::load(&contract_path)?;
+        let kit = discover_kit(&root, &config.kit)?;
+        let contract_path = kit.contract_path;
+        let contract = kit.contract;
         Ok(Self {
             root,
             config_path,

@@ -257,6 +257,11 @@ impl ProjectConfig {
                 "profile count is outside configured limits".into(),
             ));
         }
+        if self.kit.lock_paths.is_empty() || self.kit.lock_paths.len() > 32 {
+            return Err(ThemeError::Config(
+                "kit.lockPaths must contain between 1 and 32 paths".into(),
+            ));
+        }
         let mut ids = BTreeSet::new();
         for profile in &self.profiles.named {
             validate_theme_id(&profile.id)?;
