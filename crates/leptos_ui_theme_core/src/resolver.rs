@@ -74,7 +74,7 @@ impl ThemeCompiler {
             .profiles
             .named
             .iter()
-            .map(|profile| self.resolve_profile(profile, &resolver, &resolver_path))
+            .map(|profile| self.resolve_profile(profile, &resolver, &resolver_path, None))
             .collect()
     }
 
@@ -100,7 +100,17 @@ impl ThemeCompiler {
                 profile.id = context.clone();
                 profile.label = None;
                 profile.inputs.insert(modifier.into(), context.clone());
-                self.resolve_profile(&profile, &resolver, &resolver_path)
+                let domain = match modifier {
+                    "density" => TokenDomain::Density,
+                    "motion" => TokenDomain::Motion,
+                    "contrast" => TokenDomain::Contrast,
+                    _ => {
+                        return Err(ThemeError::Resolution(format!(
+                            "unsupported selection axis `{modifier}`"
+                        )));
+                    }
+                };
+                self.resolve_profile(&profile, &resolver, &resolver_path, Some(domain))
             })
             .collect()
     }
@@ -110,6 +120,7 @@ impl ThemeCompiler {
         profile: &Profile,
         resolver: &ResolverDocument,
         resolver_path: &Path,
+        axis_domain: Option<TokenDomain>,
     ) -> Result<ResolvedProfile, ThemeError> {
         let mut raw = BTreeMap::<String, RawToken>::new();
         for mapping in &self.contract.tokens {
@@ -164,6 +175,16 @@ impl ThemeCompiler {
                 return Err(ThemeError::Resolution(format!(
                     "token `{}` has type `{}` but contract requires `{}`",
                     mapping.path, value.token_type, mapping.token_type
+                )));
+            }
+            if value.provenance != "contract-default"
+                && (!mapping.theme_override
+                    || (mapping.domain != TokenDomain::Theme
+                        && Some(mapping.domain) != axis_domain))
+            {
+                return Err(ThemeError::Resolution(format!(
+                    "source is not allowed to override token `{}` in domain `{:?}`",
+                    mapping.path, mapping.domain
                 )));
             }
             values.push(ResolvedToken {

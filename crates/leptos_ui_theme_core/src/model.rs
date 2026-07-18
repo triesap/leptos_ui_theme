@@ -250,6 +250,14 @@ impl ProjectConfig {
         if self.dtcg_version != "2025.10" {
             return Err(ThemeError::Config("dtcgVersion must be 2025.10".into()));
         }
+        for attribute in [
+            &self.selectors.theme,
+            &self.selectors.density,
+            &self.selectors.motion,
+            &self.selectors.contrast,
+        ] {
+            validate_attribute(attribute)?;
+        }
         if self.profiles.named.is_empty()
             || self.profiles.named.len() > self.limits.max_profiles as usize
         {
@@ -261,6 +269,12 @@ impl ProjectConfig {
             return Err(ThemeError::Config(
                 "kit.lockPaths must contain between 1 and 32 paths".into(),
             ));
+        }
+        if self.storage_key.is_empty()
+            || self.storage_key.len() > 255
+            || self.storage_key.contains('\0')
+        {
+            return Err(ThemeError::Config("storageKey is invalid".into()));
         }
         let mut ids = BTreeSet::new();
         for profile in &self.profiles.named {
@@ -280,6 +294,39 @@ impl ProjectConfig {
                 "profiles.default must equal profiles.system.light".into(),
             ));
         }
+        match (&self.html.index_path, &self.html.index_candidates) {
+            (Some(_), None) => {}
+            (None, Some(candidates)) if !candidates.is_empty() && candidates.len() <= 16 => {
+                let unique: BTreeSet<_> = candidates.iter().collect();
+                if unique.len() != candidates.len() {
+                    return Err(ThemeError::Config("duplicate HTML index candidate".into()));
+                }
+            }
+            _ => {
+                return Err(ThemeError::Config(
+                    "exactly one of html.indexPath and html.indexCandidates must be non-null"
+                        .into(),
+                ));
+            }
+        }
+        match (&self.bootstrap.mode, &self.bootstrap.external) {
+            (BootstrapMode::ExternalSync, Some(external)) => {
+                validate_relative_path(&external.output_path)?;
+                validate_relative_path(&external.served_path)?;
+            }
+            (BootstrapMode::ExternalSync, None) => {
+                return Err(ThemeError::Config(
+                    "external bootstrap config is missing".into(),
+                ));
+            }
+            (_, None) => {}
+            (_, Some(_)) => {
+                return Err(ThemeError::Config(
+                    "bootstrap.external is allowed only for external-sync".into(),
+                ));
+            }
+        }
+        self.validate_axes()?;
         let light = self.profile(&self.profiles.system.light)?;
         let dark = self.profile(&self.profiles.system.dark)?;
         if light.color_scheme != ColorScheme::Light
@@ -306,6 +353,50 @@ impl ProjectConfig {
                 return Err(ThemeError::Config(format!(
                     "overlapping output path `{path}`"
                 )));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_axes(&self) -> Result<(), ThemeError> {
+        let Some(axes) = &self.axes else {
+            return Ok(());
+        };
+        for (name, selector, axis) in [
+            ("density", &self.selectors.density, axes.density.as_ref()),
+            ("motion", &self.selectors.motion, axes.motion.as_ref()),
+            ("contrast", &self.selectors.contrast, axes.contrast.as_ref()),
+        ] {
+            let Some(axis) = axis else { continue };
+            if &axis.attribute != selector || axis.contexts.is_empty() {
+                return Err(ThemeError::Config(format!(
+                    "invalid {name} axis attribute/contexts"
+                )));
+            }
+            let unique: BTreeSet<_> = axis.contexts.iter().collect();
+            if unique.len() != axis.contexts.len() || !unique.contains(&axis.default_context) {
+                return Err(ThemeError::Config(format!(
+                    "invalid {name} axis context inventory"
+                )));
+            }
+            match (name, &axis.system) {
+                ("density", None) => {}
+                ("density", Some(_)) => {
+                    return Err(ThemeError::Config(
+                        "density axis cannot have a system query".into(),
+                    ));
+                }
+                (_, Some(system)) => {
+                    let expected = if name == "motion" {
+                        "(prefers-reduced-motion: reduce)"
+                    } else {
+                        "(prefers-contrast: more)"
+                    };
+                    if system.query != expected || !unique.contains(&system.context) {
+                        return Err(ThemeError::Config(format!("invalid {name} system mapping")));
+                    }
+                }
+                (_, None) => {}
             }
         }
         Ok(())
@@ -373,4 +464,21 @@ pub fn validate_relative_path(value: &str) -> Result<(), ThemeError> {
         return Err(ThemeError::Security(value.into()));
     }
     Ok(())
+}
+
+fn validate_attribute(value: &str) -> Result<(), ThemeError> {
+    let valid = value.starts_with("data-")
+        && value.len() <= 63
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && !value.ends_with('-')
+        && !value.contains("--");
+    if valid {
+        Ok(())
+    } else {
+        Err(ThemeError::Config(format!(
+            "invalid selector attribute `{value}`"
+        )))
+    }
 }
