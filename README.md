@@ -1,11 +1,12 @@
 # leptos_ui_theme
 
 `leptos_ui_theme` is a source-first design-token compiler and CLI for Leptos
-applications built with `leptos_ui_kit`. It validates local DTCG token sources
-against the installed kit contract, then generates deterministic CSS, Rust
-theme metadata, first-paint bootstrap code, and a lock file.
+applications built with `leptos_ui_kit`. It validates local DTCG 2025.10 token
+and resolver files against an installed kit contract, then generates
+deterministic CSS, Rust theme metadata, first-paint bootstrap code, HTML
+integration, and a lock file.
 
-Typical usage:
+Install the CLI and initialize it from an application directory:
 
 ```text
 leptos_ui_theme init
@@ -15,31 +16,9 @@ leptos_ui_theme check
 leptos_ui_theme doctor --strict
 ```
 
-The compiler validates closed project and kit-contract models, resolves local
-DTCG resolver sources, and writes byte-stable theme artifacts. `build` is
-idempotent, while `check`, `list`, `explain`, and strict `doctor` are read-only.
-
-Kit discovery consumes a typed `installed-kit-capability.json`; it does not
-reinterpret the kit generator's own install lock. `kit.capabilityPaths` and an
-optional `kit.contractPath` are relative to a caller-provided security
-workspace root. Token inputs, HTML, and outputs remain relative to the
-directory containing `leptos-ui-theme.json`. Library consumers use
-`ThemeCompiler::load_with_workspace` and
-`leptos_ui_theme_codegen::build_with_workspace` when those roots differ.
-Capability fingerprints omit physical paths, so an otherwise identical
-installation retains its identity after relocation.
-
-Patched HTML must contain exactly one line-bounded
-`<!-- leptos-ui-theme:anchor -->`. The compiler inserts or reconciles only its
-managed region after that anchor and preserves all existing Trunk links and
-other app-owned markup.
-
-The artifact plan includes Unix publication modes. New files and generated
-whole-file outputs converge to `0644` independently of the process umask,
-while existing app-owned seeded files and HTML retain their modes. Transaction
-recovery validates both the expected byte digest and publication mode. Inline
-bootstrap mode emits the exact CSP source expression for the generated script
-in the theme lock and command result.
+`build` is deterministic and idempotent. `check`, `list`, `explain`, and
+`doctor --strict` inspect the project without writing. The tool never edits
+kit-owned files or application dependencies.
 
 ## Contributing
 
