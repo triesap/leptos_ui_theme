@@ -1325,6 +1325,11 @@ pub fn check(_root: &Path, result: &BuildResult) -> Vec<String> {
     stale
 }
 
+pub fn revalidate_build_result(root: &Path, result: &BuildResult) -> Result<(), CodegenError> {
+    result.plan.revalidate(root)?;
+    verify_consumed_inputs(root, &result.workspace_root, &result.consumed_inputs)
+}
+
 pub fn generate_css(
     config: &ProjectConfig,
     profiles: &[ResolvedProfile],

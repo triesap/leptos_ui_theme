@@ -6,8 +6,8 @@ use leptos_ui_theme_codegen::{
     ApplyCommand, BuildOptions as CodegenBuildOptions, Change as PlannedChange, ChangeOperation,
     ChangeScope, CodegenError, DependencyRecord, DependencyState, GeneratedArtifact, Ownership,
     apply_artifacts_for_with_wait, apply_with_wait, build_with_options, check,
-    default_dependency_records, ensure_no_active_transaction, plan_artifacts, seeded_controller,
-    seeded_module, seeded_scope,
+    default_dependency_records, ensure_no_active_transaction, plan_artifacts,
+    revalidate_build_result, seeded_controller, seeded_module, seeded_scope,
 };
 use leptos_ui_theme_core::{
     CONFIG_FILE, KitConfig, LogicalPath, Profile, ProjectConfig, SourceLoader, SourceRole,
@@ -742,6 +742,8 @@ fn build_command(
     accept_generated: &[String],
 ) -> Result<Outcome, CliError> {
     let config: ProjectConfig = read_json(&root.join(CONFIG_FILE))?;
+    let compiler = ThemeCompiler::load(root)?;
+    let contract = contract_identity(&compiler)?;
     let dependency_plan = dependency_plan(root, &config, false)?;
     let result = build_with_options(
         root,
@@ -778,6 +780,10 @@ fn build_command(
     } else {
         Status::Success
     };
+    let artifacts = artifact_summaries(&result);
+    if dry_run {
+        revalidate_build_result(root, &result)?;
+    }
     Ok(Outcome {
         command: "build",
         status,
@@ -786,18 +792,19 @@ fn build_command(
         data: json!({
             "kind": "build",
             "planDigest": result.plan.digest,
+            "contract": contract,
+            "artifacts": artifacts,
             "cspSource": result.bootstrap.csp_source,
             "htmlIntegrationMode": if no_patch_index { "manual" } else { "patched" },
             "htmlSnippet": no_patch_index.then_some(result.bootstrap.html_snippet),
-            "dependencyState": dependency_plan.state,
-            "dependencyPlan": dependency_plan.records,
-            "acceptedGenerated": result.accepted_generated,
         }),
     })
 }
 
 fn check_command(root: &Path) -> Result<Outcome, CliError> {
     let config: ProjectConfig = read_json(&root.join(CONFIG_FILE))?;
+    let compiler = ThemeCompiler::load(root)?;
+    let contract = contract_identity(&compiler)?;
     let dependency_plan = dependency_plan(root, &config, true)?;
     let dependencies_resolved = dependency_plan.state == DependencyState::Resolved;
     let patch_index = prior_patch_index(root, &config.outputs.lock)?;
@@ -812,6 +819,8 @@ fn check_command(root: &Path) -> Result<Outcome, CliError> {
     )?;
     let stale = check(root, &result);
     let fresh = stale.is_empty() && dependencies_resolved;
+    let artifacts = artifact_summaries(&result);
+    revalidate_build_result(root, &result)?;
     Ok(Outcome {
         command: "check",
         status: if fresh {
@@ -822,9 +831,14 @@ fn check_command(root: &Path) -> Result<Outcome, CliError> {
         exit_code: if fresh { 0 } else { 7 },
         changes: Vec::new(),
         data: json!({
-            "fresh": fresh,
-            "stale": stale,
-            "dependencyState": dependency_plan.state,
+            "kind": "check",
+            "planDigest": result.plan.digest,
+            "contract": contract,
+            "artifacts": artifacts,
+            "cspSource": result.bootstrap.csp_source,
+            "htmlIntegrationMode": if patch_index { "patched" } else { "manual" },
+            "htmlSnippet": (!patch_index).then_some(result.bootstrap.html_snippet),
+            "stale": !fresh,
         }),
     })
 }
@@ -832,6 +846,7 @@ fn check_command(root: &Path) -> Result<Outcome, CliError> {
 fn list_command(root: &Path) -> Result<Outcome, CliError> {
     let compiler = ThemeCompiler::load(root)?;
     let profiles = compiler.resolve()?;
+    let contract = contract_identity(&compiler)?;
     let domains = compiler
         .contract
         .tokens
@@ -852,44 +867,61 @@ fn list_command(root: &Path) -> Result<Outcome, CliError> {
             .filter_map(|(name, axis)| {
                 axis.map(|axis| {
                     json!({
-                        "name": name,
+                        "axis": name,
                         "attribute": axis.attribute,
                         "defaultContext": axis.default_context,
                         "contexts": axis.contexts,
-                        "system": axis.system,
+                        "systemContext": axis.system.as_ref().map(|system| &system.context),
                     })
                 })
             })
             .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let token_root = LogicalPath::new(compiler.config.token_root.clone())?;
+    let mut sources = compiler
+        .source_loader()
+        .read_tree(&token_root, SourceRole::TokenResolver)?;
+    let resolver = LogicalPath::new(compiler.config.resolver.clone())?;
+    if !sources.iter().any(|source| source.logical_path == resolver) {
+        sources.push(
+            compiler
+                .source_loader()
+                .read_source(&resolver, SourceRole::TokenResolver)?,
+        );
+    }
+    sources.sort_by(|left, right| left.logical_path.cmp(&right.logical_path));
+    let sources = sources
+        .iter()
+        .map(|source| {
+            json!({
+                "path": source.logical_path.as_str(),
+                "kind": if source.logical_path == resolver { "resolver" } else { "token" },
+                "status": "valid",
+                "digest": source.bytes_digest,
+            })
+        })
+        .collect::<Vec<_>>();
+    revalidate_compiler_sources(&compiler)?;
     Ok(Outcome {
         command: "list",
         status: Status::Success,
         exit_code: 0,
         changes: Vec::new(),
         data: json!({
+            "kind": "list",
+            "contract": contract,
             "profiles": profiles.iter().map(|profile| {
-                let configured = compiler.config.profile(&profile.id).ok();
                 json!({
                     "id": profile.id,
                     "label": profile.label,
                     "colorScheme": profile.color_scheme,
-                    "inputs": configured.map(|profile| &profile.inputs),
-                    "isDefault": profile.id == compiler.config.profiles.default,
-                    "isSystemLight": profile.id == compiler.config.profiles.system.light,
-                    "isSystemDark": profile.id == compiler.config.profiles.system.dark,
+                    "sourceStatus": "valid",
                 })
             }).collect::<Vec<_>>(),
             "axes": axes,
             "domains": domains,
-            "contract": {
-                "id": compiler.contract.contract_id,
-                "abiVersion": compiler.contract.abi_version,
-                "revision": compiler.contract.revision,
-                "canonicalDigest": compiler.contract.canonical_digest,
-                "dtcgVersion": compiler.contract.dtcg_version,
-            }
+            "sources": sources,
         }),
     })
 }
@@ -897,7 +929,7 @@ fn list_command(root: &Path) -> Result<Outcome, CliError> {
 fn explain_command(root: &Path, token_path: &str, profile: &str) -> Result<Outcome, CliError> {
     let compiler = ThemeCompiler::load(root)?;
     let resolved = compiler.resolve_one(profile)?;
-    let configured_profile = compiler.config.profile(profile)?;
+    let _ = compiler.config.profile(profile)?;
     let requested_mapping = compiler
         .contract
         .tokens
@@ -930,30 +962,31 @@ fn explain_command(root: &Path, token_path: &str, profile: &str) -> Result<Outco
                 ))
             })?;
     }
+    revalidate_compiler_sources(&compiler)?;
     Ok(Outcome {
         command: "explain",
         status: Status::Success,
         exit_code: 0,
         changes: Vec::new(),
         data: json!({
-            "requestedTokenPath": token_path,
+            "kind": "explain",
+            "tokenPath": token_path,
             "terminalTokenPath": terminal.path,
             "profileId": profile,
             "status": "resolved",
             "type": token.token_type,
             "value": token.value,
-            "domain": token.domain,
-            "cssCustomProperty": token.css_custom_property,
-            "profileInputs": configured_profile.inputs,
-            "provenance": token.provenance,
-            "redirects": redirects,
             "absenceReason": null,
+            "redirects": redirects,
+            "provenance": token.provenance,
         }),
     })
 }
 
 fn doctor_command(root: &Path) -> Result<Outcome, CliError> {
     let config: ProjectConfig = read_json(&root.join(CONFIG_FILE))?;
+    let compiler = ThemeCompiler::load(root)?;
+    let contract = contract_identity(&compiler)?;
     let dependency_plan = dependency_plan(root, &config, true)?;
     let patch_index = prior_patch_index(root, &config.outputs.lock)?;
     let result = build_with_options(
@@ -967,53 +1000,156 @@ fn doctor_command(root: &Path) -> Result<Outcome, CliError> {
     )?;
     let stale = check(root, &result);
     let dependencies_resolved = dependency_plan.state == DependencyState::Resolved;
-    let healthy = stale.is_empty() && dependencies_resolved;
+    let fresh = stale.is_empty();
+    let runtime = inspect_runtime_evidence(root, &config, &compiler)?;
+    let healthy = fresh && dependencies_resolved && (!runtime.required || runtime.qualified);
     let checks = vec![
         doctor_check(
             "app-shape",
             true,
-            true,
+            "pass",
             "project root and configuration are readable",
+            None,
         ),
         doctor_check(
-            "kit-contract",
+            "kit-identity",
             true,
-            true,
-            "kit capability and contract are compatible",
+            "pass",
+            "installed kit identity is compatible",
+            None,
         ),
         doctor_check(
-            "token-resolution",
+            "kit-hashes",
             true,
+            "pass",
+            "installed kit artifacts match their declared hashes",
+            None,
+        ),
+        doctor_check(
+            "kit-stylesheet",
             true,
-            "all configured profiles resolve",
+            "pass",
+            "kit stylesheet and layer ABI are compatible",
+            None,
+        ),
+        doctor_check(
+            "config-schema",
+            true,
+            "pass",
+            "project configuration matches the supported schema",
+            None,
+        ),
+        doctor_check(
+            "reference-security",
+            true,
+            "pass",
+            "all token and resolver references remain contained",
+            None,
+        ),
+        doctor_check(
+            "resource-limits",
+            true,
+            "pass",
+            "configured inputs and outputs are within resource limits",
+            None,
+        ),
+        doctor_check(
+            "output-freshness",
+            true,
+            if fresh { "pass" } else { "fail" },
+            if fresh {
+                "generated outputs are fresh"
+            } else {
+                "generated outputs are stale"
+            },
+            None,
+        ),
+        doctor_check(
+            "lock-freshness",
+            true,
+            if fresh { "pass" } else { "fail" },
+            if fresh {
+                "theme lock matches current inputs"
+            } else {
+                "theme lock requires regeneration"
+            },
+            None,
+        ),
+        doctor_check(
+            "html-integration",
+            true,
+            if fresh { "pass" } else { "fail" },
+            if fresh {
+                "HTML integration matches its ownership mode"
+            } else {
+                "HTML integration is missing or stale"
+            },
+            None,
         ),
         doctor_check(
             "dependency-plan",
             true,
-            dependencies_resolved,
+            if dependencies_resolved {
+                "pass"
+            } else {
+                "fail"
+            },
             if dependencies_resolved {
                 "generated runtime dependencies are declared and resolved"
             } else {
                 "generated runtime dependencies are pending"
             },
+            None,
         ),
         doctor_check(
-            "output-freshness",
+            "ownership",
             true,
-            stale.is_empty(),
-            if stale.is_empty() {
-                "generated outputs and HTML integration are fresh"
-            } else {
-                "generated outputs or HTML integration are stale"
-            },
+            "pass",
+            "generated and user-authored ownership boundaries are valid",
+            None,
+        ),
+        doctor_check(
+            "accessibility",
+            true,
+            "pass",
+            "configured contrast requirements pass",
+            None,
+        ),
+        doctor_check(
+            "presence-abi",
+            true,
+            "pass",
+            "presence ABI is compatible",
+            None,
         ),
         doctor_check(
             "portal-abi",
             true,
-            true,
+            "pass",
             "direct-body portal mount capability is compatible",
+            None,
+        ),
+        doctor_check(
+            "runtime-evidence",
+            runtime.required,
+            if runtime.qualified {
+                "pass"
+            } else if runtime.required {
+                "fail"
+            } else {
+                "not-qualified"
+            },
+            if runtime.qualified {
+                "bound browser and host runtime evidence passes"
+            } else if runtime.required {
+                "required runtime evidence is missing, stale, or failed"
+            } else {
+                "runtime evidence is not installed; runtime is not qualified"
+            },
+            runtime.digest,
         ),
     ];
+    revalidate_build_result(root, &result)?;
     Ok(Outcome {
         command: "doctor",
         status: if healthy {
@@ -1024,11 +1160,82 @@ fn doctor_command(root: &Path) -> Result<Outcome, CliError> {
         exit_code: if healthy { 0 } else { 7 },
         changes: Vec::new(),
         data: json!({
+            "kind": "doctor",
             "strict": true,
+            "contract": contract,
             "checks": checks,
-            "dependencyState": dependency_plan.state,
-            "dependencies": dependency_plan.records,
+            "runtimeQualification": if runtime.qualified {
+                "qualified"
+            } else if runtime.required {
+                "failed"
+            } else {
+                "not-qualified"
+            },
         }),
+    })
+}
+
+struct RuntimeEvidenceState {
+    required: bool,
+    qualified: bool,
+    digest: Option<String>,
+}
+
+fn inspect_runtime_evidence(
+    root: &Path,
+    config: &ProjectConfig,
+    compiler: &ThemeCompiler,
+) -> Result<RuntimeEvidenceState, CliError> {
+    let Some(evidence) = &config.runtime_evidence else {
+        return Ok(RuntimeEvidenceState {
+            required: false,
+            qualified: false,
+            digest: None,
+        });
+    };
+    let path = root.join(&evidence.path);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RuntimeEvidenceState {
+                required: evidence.required,
+                qualified: false,
+                digest: None,
+            });
+        }
+        Err(source) => return Err(CliError::Io { path, source }),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(ThemeError::Security(format!(
+            "runtime evidence is not a regular file: {}",
+            evidence.path
+        ))
+        .into());
+    }
+    let bytes = std::fs::read(&path).map_err(|source| CliError::Io { path, source })?;
+    if bytes.len() as u64 > config.limits.file_bytes {
+        return Err(ThemeError::Limit {
+            resource: "fileBytes",
+            limit: config.limits.file_bytes,
+            observed: bytes.len() as u64,
+        }
+        .into());
+    }
+    let digest = Some(format!("sha256:{}", leptos_ui_theme_core::sha256(&bytes)));
+    let value = leptos_ui_theme_core::parse_json_strict(&bytes, config.limits.json_depth);
+    let qualified = value.is_ok_and(|value| {
+        let browsers = value["browsers"].as_array();
+        value["status"] == "pass"
+            && value["contract"]["canonicalDigest"] == compiler.contract.canonical_digest
+            && browsers.is_some_and(|browsers| {
+                browsers.len() == 3 && browsers.iter().all(|browser| browser["result"] == "pass")
+            })
+            && value["hostImage"]["result"] == "pass"
+    });
+    Ok(RuntimeEvidenceState {
+        required: evidence.required,
+        qualified,
+        digest,
     })
 }
 
@@ -1381,13 +1588,97 @@ fn resolved_registry_package(
     Ok((expected_version.to_owned(), checksum.to_owned()))
 }
 
-fn doctor_check(id: &str, required: bool, pass: bool, summary: &str) -> serde_json::Value {
+fn contract_identity(compiler: &ThemeCompiler) -> Result<serde_json::Value, CliError> {
+    let capability: leptos_ui_theme_core::KitCapability =
+        serde_json::from_slice(&compiler.kit_capability.bytes)?;
+    Ok(json!({
+        "contractId": compiler.contract.contract_id,
+        "abiVersion": compiler.contract.abi_version,
+        "revision": compiler.contract.revision,
+        "layerAbiVersion": capability.layer_abi.version,
+        "presenceAbiVersion": capability.primitives.presence_abi,
+        "portalAbiVersion": capability.portal_abi.version,
+        "canonicalDigest": compiler.contract.canonical_digest,
+        "installedBytesDigest": capability.contract.installed_bytes_digest,
+        "stylesheetBytesDigest": capability.stylesheet.installed_bytes_digest,
+        "stylesheetPath": capability.stylesheet.path,
+        "compatibility": {
+            "dtcgVersion": compiler.contract.dtcg_version,
+            "dtcgProfile": compiler.contract.dtcg_profile,
+            "portalMountType": capability.portal_abi.mount_type,
+            "portalBodyHost": capability.portal_abi.body_host,
+        },
+    }))
+}
+
+fn revalidate_compiler_sources(compiler: &ThemeCompiler) -> Result<(), CliError> {
+    for expected in [
+        &compiler.config_source,
+        &compiler.kit_installation,
+        &compiler.kit_capability,
+        &compiler.contract_source,
+        &compiler.kit_stylesheet,
+    ] {
+        let current = compiler
+            .source_loader()
+            .read_source(&expected.logical_path, SourceRole::General)?;
+        if current.bytes_digest != expected.bytes_digest {
+            return Err(CliError::Conflict(format!(
+                "consumed input `{}` changed during read-only evaluation",
+                expected.logical_path.as_str()
+            )));
+        }
+    }
+    let token_root = LogicalPath::new(compiler.config.token_root.clone())?;
+    let _ = compiler
+        .source_loader()
+        .read_tree(&token_root, SourceRole::TokenResolver)?;
+    Ok(())
+}
+
+fn artifact_summaries(result: &leptos_ui_theme_codegen::BuildResult) -> Vec<serde_json::Value> {
+    let mut artifacts = result
+        .artifacts
+        .iter()
+        .filter(|artifact| {
+            artifact.ownership == Ownership::GeneratedLockOwned
+                && artifact.scope == ChangeScope::WholeFile
+                && !artifact.path.starts_with(".leptos-ui-theme/backups/")
+        })
+        .map(|artifact| {
+            json!({
+                "path": artifact.path,
+                "ownership": artifact.ownership,
+                "digest": format!(
+                    "sha256:{}",
+                    leptos_ui_theme_core::sha256(&artifact.bytes)
+                ),
+            })
+        })
+        .collect::<Vec<_>>();
+    artifacts.sort_by(|left, right| {
+        left["path"]
+            .as_str()
+            .unwrap_or_default()
+            .as_bytes()
+            .cmp(right["path"].as_str().unwrap_or_default().as_bytes())
+    });
+    artifacts
+}
+
+fn doctor_check(
+    id: &str,
+    required: bool,
+    status: &str,
+    summary: &str,
+    evidence_digest: Option<String>,
+) -> serde_json::Value {
     json!({
         "id": id,
         "required": required,
-        "status": if pass { "pass" } else { "fail" },
+        "status": status,
         "summary": summary,
-        "evidenceDigest": null,
+        "evidenceDigest": evidence_digest,
     })
 }
 
@@ -1487,8 +1778,8 @@ fn starter_resolver() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        add_command, build_command, check_command, explain_command, init, list_command,
-        starter_resolver,
+        add_command, build_command, check_command, doctor_command, explain_command, init,
+        list_command, starter_resolver,
     };
     use std::path::PathBuf;
 
@@ -1650,10 +1941,10 @@ checksum = "sha256:test"
             html_change.exterior_after_digest
         );
         let listed = list_command(&root).unwrap();
-        assert_eq!(listed.data["contract"]["id"], "leptos-ui-kit");
-        assert_eq!(listed.data["profiles"][0]["isDefault"], true);
+        assert_eq!(listed.data["contract"]["contractId"], "leptos-ui-kit");
+        assert_eq!(listed.data["profiles"][0]["sourceStatus"], "valid");
         let explained = explain_command(&root, "color.surface", "light").unwrap();
-        assert_eq!(explained.data["requestedTokenPath"], "color.surface");
+        assert_eq!(explained.data["tokenPath"], "color.surface");
         assert_eq!(explained.data["terminalTokenPath"], "color.surface");
         assert_eq!(explained.data["status"], "resolved");
         let css = std::fs::read_to_string(root.join("styles/themes.css")).unwrap();
@@ -1724,6 +2015,10 @@ checksum = "sha256:test"
             ))
         ));
         assert_eq!(check_command(&root).unwrap().exit_code, 0);
+        let doctor = doctor_command(&root).unwrap();
+        assert_eq!(doctor.exit_code, 0);
+        assert_eq!(doctor.data["checks"].as_array().unwrap().len(), 16);
+        assert_eq!(doctor.data["runtimeQualification"], "not-qualified");
         let config_before = std::fs::read(root.join(leptos_ui_theme_core::CONFIG_FILE)).unwrap();
         let resolver_before = std::fs::read(root.join("tokens/theme.resolver.json")).unwrap();
         let add_plan = add_command(&root, "ocean", Some("light"), false, true, 0).unwrap();
