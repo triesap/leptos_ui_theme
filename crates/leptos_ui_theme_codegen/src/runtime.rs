@@ -10,7 +10,10 @@ pub use controller::{
     ThemeController, ThemePreference, RuntimeIssue, provide_theme_controller,
     use_theme_controller,
 };
-pub use generated::{ThemeId, ThemeMetadata, THEMES, THEME_IDS, parse_theme_id};
+pub use generated::{
+    DEFAULT_THEME, SYSTEM_DARK_THEME, SYSTEM_LIGHT_THEME, THEMES, THEME_IDS,
+    ThemeColorScheme, ThemeId, ThemeMetadata, parse_theme_id,
+};
 pub use scope::{ThemeScope, ThemeScopeContext, use_theme_scope};
 "#
     .to_owned()
@@ -178,7 +181,6 @@ mod browser {
         BOOTSTRAP_ATTRIBUTE, BOOTSTRAP_ENABLED, BOOTSTRAP_OUTCOME_PROPERTY, STORAGE_KEY,
         SYSTEM_DARK_THEME, THEME_ATTRIBUTE,
     };
-    use leptos::__reexports::send_wrapper::SendWrapper;
     use leptos::wasm_bindgen::{JsCast, JsValue, closure::Closure};
     use leptos::web_sys::{Event, js_sys, window};
 
@@ -483,9 +485,11 @@ mod browser {
         if storage_listener.is_none() && media_listener.is_none() {
             return;
         }
-        let cleanup = SendWrapper::new((global, storage_listener, media_listener));
+        let cleanup = StoredValue::new_local((global, storage_listener, media_listener));
         on_cleanup(move || {
-            let (global, storage_listener, media_listener) = cleanup.take();
+            let Some((global, storage_listener, media_listener)) = cleanup.into_inner() else {
+                return;
+            };
             if let Some(listener) = storage_listener {
                 let _ = global.remove_event_listener_with_callback(
                     "storage",
@@ -516,7 +520,7 @@ use web_ui_primitives::leptos::PortalMount;
 
 #[derive(Clone)]
 pub struct ThemeScopeContext {
-    pub theme: Signal<Option<ThemeId>>,
+    pub effective_theme: Signal<Option<ThemeId>>,
     pub portal_mount: Option<PortalMount>,
 }
 
@@ -531,14 +535,25 @@ pub fn ThemeScope(
     #[prop(optional)] provide_portal_host: bool,
     children: Children,
 ) -> impl IntoView {
-    let portal_mount = create_portal_mount(provide_portal_host);
+    let parent = use_theme_scope();
+    let parent_theme = parent.as_ref().map(|scope| scope.effective_theme);
+    let effective_theme = Signal::derive(move || {
+        theme
+            .get()
+            .or_else(|| parent_theme.and_then(Signal::get))
+    });
+    let portal_mount = create_portal_mount(provide_portal_host).or_else(|| {
+        parent
+            .as_ref()
+            .and_then(|scope| scope.portal_mount.clone())
+    });
     provide_context(ThemeScopeContext {
-        theme,
+        effective_theme,
         portal_mount: portal_mount.clone(),
     });
-    sync_portal_theme(portal_mount);
+    sync_portal_theme(portal_mount, effective_theme);
     view! {
-        <div attr:data-ui-theme=move || theme.get().map(ThemeId::as_str)>
+        <div attr:data-ui-theme=move || effective_theme.get().map(ThemeId::as_str)>
             {children()}
         </div>
     }
@@ -551,7 +566,6 @@ fn create_portal_mount(_enabled: bool) -> Option<PortalMount> {
 
 #[cfg(target_arch = "wasm32")]
 fn create_portal_mount(enabled: bool) -> Option<PortalMount> {
-    use leptos::__reexports::send_wrapper::SendWrapper;
     let document = enabled
         .then(leptos::web_sys::window)
         .flatten()?
@@ -559,27 +573,32 @@ fn create_portal_mount(enabled: bool) -> Option<PortalMount> {
     let body = document.body()?;
     let host = document.create_element("div").ok()?;
     body.append_child(&host).ok()?;
-    let cleanup = SendWrapper::new((body, host.clone()));
+    let cleanup = StoredValue::new_local((body, host.clone()));
     on_cleanup(move || {
-        let (body, host) = cleanup.take();
-        let _ = body.remove_child(&host);
+        if let Some((body, host)) = cleanup.into_inner() {
+            let _ = body.remove_child(&host);
+        }
     });
     Some(host)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn sync_portal_theme(_portal_mount: Option<PortalMount>) {}
+fn sync_portal_theme(
+    _portal_mount: Option<PortalMount>,
+    _effective_theme: Signal<Option<ThemeId>>,
+) {
+}
 
 #[cfg(target_arch = "wasm32")]
-fn sync_portal_theme(portal_mount: Option<PortalMount>) {
+fn sync_portal_theme(
+    portal_mount: Option<PortalMount>,
+    effective_theme: Signal<Option<ThemeId>>,
+) {
     use super::generated::THEME_ATTRIBUTE;
     let Some(host) = portal_mount else {
         return;
     };
-    let Some(scope) = use_theme_scope() else {
-        return;
-    };
-    Effect::new(move |_| match scope.theme.get() {
+    Effect::new(move |_| match effective_theme.get() {
         Some(theme) => {
             let _ = host.set_attribute(THEME_ATTRIBUTE, theme.as_str());
         }
@@ -590,4 +609,48 @@ fn sync_portal_theme(portal_mount: Option<PortalMount>) {
 }
 "#
     .replace("data-ui-theme", &config.selectors.theme)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use leptos_ui_theme_core::ProjectConfig;
+
+    #[test]
+    fn generated_runtime_uses_only_public_leptos_apis() {
+        let config = ProjectConfig::default();
+        let controller = seeded_controller(&config, &[]);
+        let scope = seeded_scope(&config);
+
+        assert!(!controller.contains("leptos::__reexports"));
+        assert!(!scope.contains("leptos::__reexports"));
+        assert!(controller.contains("StoredValue::new_local"));
+        assert!(scope.contains("StoredValue::new_local"));
+    }
+
+    #[test]
+    fn generated_scope_propagates_effective_identity_and_portal_mount() {
+        let scope = seeded_scope(&ProjectConfig::default());
+
+        assert!(scope.contains("pub effective_theme: Signal<Option<ThemeId>>"));
+        assert!(scope.contains("parent_theme.and_then(Signal::get)"));
+        assert!(scope.contains("scope.portal_mount.clone()"));
+        assert!(scope.contains("cleanup.into_inner()"));
+    }
+
+    #[test]
+    fn generated_controller_covers_preference_adoption_and_listeners() {
+        let controller = seeded_controller(&ProjectConfig::default(), &[]);
+
+        assert!(controller.contains("pub enum ThemePreference"));
+        assert!(controller.contains("pub enum RuntimeIssue"));
+        assert!(controller.contains("\"storage\""));
+        assert!(controller.contains("\"matchMedia\""));
+        assert_eq!(
+            controller
+                .matches("let parsed_outcome = match outcome.as_str()")
+                .count(),
+            1
+        );
+    }
 }

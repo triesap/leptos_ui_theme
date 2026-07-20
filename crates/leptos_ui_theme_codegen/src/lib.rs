@@ -1614,7 +1614,9 @@ pub struct ThemeMetadata {
         output.push_str(&format!("    {},\n", theme_constant(&profile.id)));
     }
     output.push_str("];\n\n");
-    output.push_str("pub fn parse_theme_id(value: &str) -> Option<ThemeId> {\n    match value {\n");
+    output.push_str(
+        "#[must_use]\npub fn parse_theme_id(value: &str) -> Option<ThemeId> {\n    match value {\n",
+    );
     for profile in profiles {
         output.push_str(&format!(
             "        {:?} => Some({}),\n",
