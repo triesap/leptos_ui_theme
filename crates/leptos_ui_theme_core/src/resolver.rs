@@ -34,6 +34,7 @@ pub struct ThemeCompiler {
     pub config_path: PathBuf,
     pub config: ProjectConfig,
     pub contract_path: PathBuf,
+    pub kit_stylesheet_path: PathBuf,
     pub contract: KitTokenContract,
     loader: SourceLoader,
 }
@@ -64,6 +65,7 @@ impl ThemeCompiler {
         config.validate()?;
         let kit = discover_kit(&root, &config.kit, config.limits.clone())?;
         let contract_path = kit.contract_path;
+        let kit_stylesheet_path = kit.stylesheet_path;
         let contract = kit.contract;
         let loader = SourceLoader::new(&root, config.limits.clone())?;
         Ok(Self {
@@ -71,6 +73,7 @@ impl ThemeCompiler {
             config_path,
             config,
             contract_path,
+            kit_stylesheet_path,
             contract,
             loader,
         })

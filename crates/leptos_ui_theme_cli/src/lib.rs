@@ -3,13 +3,16 @@
 
 use clap::{Args, Parser, Subcommand};
 use leptos_ui_theme_codegen::{
-    ApplyCommand, CodegenError, GeneratedArtifact, apply, apply_artifacts, apply_artifacts_for,
-    build, check, seeded_controller, seeded_module, seeded_scope,
+    ApplyCommand, BuildOptions as CodegenBuildOptions, Change as PlannedChange, ChangeOperation,
+    ChangeScope, CodegenError, GeneratedArtifact, Ownership, apply, apply_artifacts,
+    apply_artifacts_for, build, build_with_options, check, seeded_controller, seeded_module,
+    seeded_scope,
 };
 use leptos_ui_theme_core::{CONFIG_FILE, Profile, ProjectConfig, ThemeCompiler, ThemeError};
 use serde::Serialize;
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Parser)]
@@ -33,8 +36,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    Init(WriteOptions),
-    Build(WriteOptions),
+    Init(HtmlWriteOptions),
+    Build(HtmlWriteOptions),
     Check,
     List,
     Explain {
@@ -62,9 +65,11 @@ enum Command {
 }
 
 #[derive(Clone, Debug, Args)]
-struct WriteOptions {
+struct HtmlWriteOptions {
     #[arg(long)]
     dry_run: bool,
+    #[arg(long)]
+    no_patch_index: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -93,6 +98,9 @@ impl CliError {
             Self::Core(ThemeError::Contract(_)) => 6,
             Self::Core(_) => 3,
             Self::Codegen(CodegenError::Conflict(_)) => 4,
+            Self::Codegen(CodegenError::Core(ThemeError::Security(_))) => 5,
+            Self::Codegen(CodegenError::Core(ThemeError::Contract(_))) => 6,
+            Self::Codegen(CodegenError::Core(_)) => 3,
             Self::Codegen(_) | Self::Json(_) | Self::Io { .. } => 70,
         }
     }
@@ -104,6 +112,8 @@ enum Status {
     Success,
     NoChange,
     Planned,
+    Warning,
+    Conflict,
     Error,
 }
 
@@ -111,7 +121,7 @@ enum Status {
 #[serde(rename_all = "camelCase")]
 struct Envelope {
     schema_version: &'static str,
-    command: String,
+    command: Option<String>,
     status: Status,
     exit_code: i32,
     diagnostics: Vec<Diagnostic>,
@@ -122,21 +132,51 @@ struct Envelope {
 #[derive(Debug, Serialize)]
 struct Diagnostic {
     code: String,
+    category: &'static str,
     severity: &'static str,
+    message: String,
+    locations: Vec<Location>,
+    redirects: Vec<Redirect>,
+    help: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct Location {
+    path: Option<String>,
+    pointer: Option<String>,
+    profile: Option<String>,
+    label: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct Redirect {
+    from: String,
+    to: String,
     message: String,
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct Change {
     path: String,
-    operation: &'static str,
+    scope: ChangeScope,
+    action: ChangeOperation,
+    ownership: Ownership,
+    before_digest: Option<String>,
+    after_digest: Option<String>,
+    container_before_digest: Option<String>,
+    container_after_digest: Option<String>,
+    exterior_before_digest: Option<String>,
+    exterior_after_digest: Option<String>,
+    backup_path: Option<String>,
+    accepted_generated_conflict: bool,
 }
 
 struct Outcome {
     command: &'static str,
     status: Status,
     exit_code: i32,
-    changes: Vec<String>,
+    changes: Vec<Change>,
     data: serde_json::Value,
 }
 
@@ -148,18 +188,11 @@ pub fn run(cli: Cli) -> i32 {
             if json_mode {
                 let envelope = Envelope {
                     schema_version: "1.0.0",
-                    command: outcome.command.into(),
+                    command: Some(outcome.command.into()),
                     status: outcome.status,
                     exit_code: outcome.exit_code,
                     diagnostics: Vec::new(),
-                    changes: outcome
-                        .changes
-                        .into_iter()
-                        .map(|path| Change {
-                            path,
-                            operation: "write",
-                        })
-                        .collect(),
+                    changes: outcome.changes,
                     data: outcome.data,
                 };
                 println!(
@@ -176,13 +209,21 @@ pub fn run(cli: Cli) -> i32 {
             if json_mode {
                 let envelope = Envelope {
                     schema_version: "1.0.0",
-                    command: command_name(&cli.command).into(),
-                    status: Status::Error,
+                    command: Some(command_name(&cli.command).into()),
+                    status: if exit_code == 4 {
+                        Status::Conflict
+                    } else {
+                        Status::Error
+                    },
                     exit_code,
                     diagnostics: vec![Diagnostic {
                         code: format!("LUT{exit_code:04}"),
+                        category: error_category(exit_code),
                         severity: "error",
                         message: error.to_string(),
+                        locations: Vec::new(),
+                        redirects: Vec::new(),
+                        help: error_help(exit_code).map(str::to_owned),
                     }],
                     changes: Vec::new(),
                     data: serde_json::Value::Null,
@@ -199,14 +240,70 @@ pub fn run(cli: Cli) -> i32 {
     }
 }
 
+pub fn run_from<I, T>(arguments: I) -> i32
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    let arguments = arguments.into_iter().map(Into::into).collect::<Vec<_>>();
+    let json_mode = arguments
+        .iter()
+        .filter_map(|argument| argument.to_str())
+        .any(|argument| argument == "--json");
+    match Cli::try_parse_from(arguments) {
+        Ok(cli) => run(cli),
+        Err(error)
+            if matches!(
+                error.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            ) =>
+        {
+            let _ = error.print();
+            0
+        }
+        Err(error) if json_mode => {
+            let envelope = Envelope {
+                schema_version: "1.0.0",
+                command: None,
+                status: Status::Error,
+                exit_code: 2,
+                diagnostics: vec![Diagnostic {
+                    code: "LUT2000".into(),
+                    category: "usage",
+                    severity: "error",
+                    message: error.to_string(),
+                    locations: Vec::new(),
+                    redirects: Vec::new(),
+                    help: Some("Run with --help to inspect the command syntax.".into()),
+                }],
+                changes: Vec::new(),
+                data: serde_json::Value::Null,
+            };
+            match serde_json::to_string(&envelope) {
+                Ok(value) => println!("{value}"),
+                Err(_) => return 70,
+            }
+            2
+        }
+        Err(error) => {
+            let _ = error.print();
+            2
+        }
+    }
+}
+
 fn execute(cli: &Cli) -> Result<Outcome, CliError> {
     let cwd = std::fs::canonicalize(&cli.cwd).map_err(|source| CliError::Io {
         path: cli.cwd.clone(),
         source,
     })?;
     match &cli.command {
-        Command::Init(options) => init(&cwd, options.dry_run),
-        Command::Build(options) => build_command(&discover(&cwd, false)?, options.dry_run),
+        Command::Init(options) => init(&cwd, options.dry_run, options.no_patch_index),
+        Command::Build(options) => build_command(
+            &discover(&cwd, false)?,
+            options.dry_run,
+            options.no_patch_index,
+        ),
         Command::Check => check_command(&discover(&cwd, false)?),
         Command::List => list_command(&discover(&cwd, false)?),
         Command::Explain {
@@ -250,7 +347,7 @@ fn discover(start: &Path, init: bool) -> Result<PathBuf, CliError> {
     }
 }
 
-fn init(start: &Path, dry_run: bool) -> Result<Outcome, CliError> {
+fn init(start: &Path, dry_run: bool, no_patch_index: bool) -> Result<Outcome, CliError> {
     let root = discover(start, true)?;
     if root.join(CONFIG_FILE).exists() {
         return Err(CliError::Conflict(format!("{CONFIG_FILE} already exists")));
@@ -287,6 +384,10 @@ fn init(start: &Path, dry_run: bool) -> Result<Outcome, CliError> {
             seeded_scope(&config).into_bytes(),
         ),
     ];
+    let mut changes = files
+        .iter()
+        .map(|(path, bytes)| create_change(path, bytes))
+        .collect::<Vec<_>>();
     if !dry_run {
         for (path, _) in &files {
             if root.join(path).exists() {
@@ -305,28 +406,60 @@ fn init(start: &Path, dry_run: bool) -> Result<Outcome, CliError> {
             })
             .collect::<Vec<_>>();
         apply_artifacts_for(&root, &artifacts, ApplyCommand::Init, None)?;
+        let result = build_with_options(
+            &root,
+            CodegenBuildOptions {
+                patch_index: !no_patch_index,
+            },
+        )?;
+        let applied = apply(&root, &result)?;
+        changes.extend(
+            result
+                .plan
+                .changes
+                .iter()
+                .filter(|change| applied.contains(&change.path))
+                .map(change_from_plan),
+        );
     }
     Ok(Outcome {
         command: "init",
         status: if dry_run {
             Status::Planned
         } else {
-            Status::Success
+            Status::Warning
         },
         exit_code: 0,
-        changes: files.into_iter().map(|(path, _)| path).collect(),
-        data: json!({"root": ".", "config": CONFIG_FILE}),
+        changes,
+        data: json!({
+            "root": ".",
+            "config": CONFIG_FILE,
+            "htmlMode": if no_patch_index { "manual" } else { "patched" },
+            "dependencies": dependency_requirements(),
+        }),
     })
 }
 
-fn build_command(root: &Path, dry_run: bool) -> Result<Outcome, CliError> {
-    let result = build(root)?;
+fn build_command(root: &Path, dry_run: bool, no_patch_index: bool) -> Result<Outcome, CliError> {
+    let result = build_with_options(
+        root,
+        CodegenBuildOptions {
+            patch_index: !no_patch_index,
+        },
+    )?;
     let stale = check(root, &result);
-    let changes = if dry_run {
-        stale
+    let changed_paths = if dry_run {
+        stale.clone()
     } else {
         apply(root, &result)?
     };
+    let changes = result
+        .plan
+        .changes
+        .iter()
+        .filter(|change| changed_paths.contains(&change.path))
+        .map(change_from_plan)
+        .collect::<Vec<_>>();
     let status = if dry_run && !changes.is_empty() {
         Status::Planned
     } else if changes.is_empty() {
@@ -345,7 +478,10 @@ fn build_command(root: &Path, dry_run: bool) -> Result<Outcome, CliError> {
                 "mode": result.bootstrap.mode,
                 "scriptDigest": result.bootstrap.script_digest,
                 "cspSource": result.bootstrap.csp_source,
-            }
+            },
+            "htmlMode": if no_patch_index { "manual" } else { "patched" },
+            "htmlSnippet": no_patch_index.then_some(result.bootstrap.html_snippet),
+            "dependencies": dependency_requirements(),
         }),
     })
 }
@@ -469,6 +605,32 @@ fn add_command(
         (config.resolver.clone(), pretty_json(&resolver)?),
         (source_path, b"{}\n".to_vec()),
     ];
+    let changes = files
+        .iter()
+        .map(|(path, bytes)| {
+            let before = std::fs::read(root.join(path)).ok();
+            Change {
+                path: path.clone(),
+                scope: ChangeScope::WholeFile,
+                action: if before.is_some() {
+                    ChangeOperation::Replace
+                } else {
+                    ChangeOperation::Create
+                },
+                ownership: Ownership::UserAuthored,
+                before_digest: before
+                    .as_ref()
+                    .map(|bytes| format!("sha256:{}", leptos_ui_theme_core::sha256(bytes))),
+                after_digest: Some(format!("sha256:{}", leptos_ui_theme_core::sha256(bytes))),
+                container_before_digest: None,
+                container_after_digest: None,
+                exterior_before_digest: None,
+                exterior_after_digest: None,
+                backup_path: None,
+                accepted_generated_conflict: false,
+            }
+        })
+        .collect();
     if !dry_run {
         let artifacts = files
             .iter()
@@ -484,7 +646,7 @@ fn add_command(
             Status::Success
         },
         exit_code: 0,
-        changes: files.into_iter().map(|(path, _)| path).collect(),
+        changes,
         data: json!({"profile": id}),
     })
 }
@@ -503,6 +665,88 @@ fn pretty_json(value: &impl Serialize) -> Result<Vec<u8>, CliError> {
     Ok(bytes)
 }
 
+fn dependency_requirements() -> serde_json::Value {
+    json!([
+        {
+            "package": "leptos",
+            "requirement": "=0.9.0-alpha",
+            "features": ["csr"],
+            "defaultFeatures": false,
+            "resolvedVersion": null,
+            "checksum": null
+        },
+        {
+            "package": "web_ui_primitives",
+            "requirement": ">=0.2.0,<0.3.0",
+            "features": ["leptos"],
+            "defaultFeatures": false,
+            "resolvedVersion": null,
+            "checksum": null
+        }
+    ])
+}
+
+fn create_change(path: &str, bytes: &[u8]) -> Change {
+    Change {
+        path: path.to_owned(),
+        scope: ChangeScope::WholeFile,
+        action: ChangeOperation::Create,
+        ownership: if path.ends_with(".rs") {
+            Ownership::SeededAppOwned
+        } else {
+            Ownership::UserAuthored
+        },
+        before_digest: None,
+        after_digest: Some(format!("sha256:{}", leptos_ui_theme_core::sha256(bytes))),
+        container_before_digest: None,
+        container_after_digest: None,
+        exterior_before_digest: None,
+        exterior_after_digest: None,
+        backup_path: None,
+        accepted_generated_conflict: false,
+    }
+}
+
+fn change_from_plan(change: &PlannedChange) -> Change {
+    Change {
+        path: change.path.clone(),
+        scope: change.scope,
+        action: change.operation,
+        ownership: change.ownership,
+        before_digest: change.before_digest.clone(),
+        after_digest: change.after_digest.clone(),
+        container_before_digest: None,
+        container_after_digest: None,
+        exterior_before_digest: None,
+        exterior_after_digest: None,
+        backup_path: None,
+        accepted_generated_conflict: false,
+    }
+}
+
+fn error_category(exit_code: i32) -> &'static str {
+    match exit_code {
+        2 => "usage",
+        3 => "validation",
+        4 => "conflict",
+        5 => "security",
+        6 => "contract",
+        7 => "check",
+        _ => "internal",
+    }
+}
+
+fn error_help(exit_code: i32) -> Option<&'static str> {
+    match exit_code {
+        3 => Some("Correct the project configuration or token sources and retry."),
+        4 => Some("Resolve local edits or the active transaction and retry."),
+        5 => Some("Use regular files and paths contained by the project root."),
+        6 => Some("Install a compatible leptos_ui_kit contract and lock."),
+        7 => Some("Run build, then repeat the check."),
+        _ => None,
+    }
+}
+
 fn print_human(outcome: &Outcome) {
     match outcome.status {
         Status::NoChange => println!("{}: no changes", outcome.command),
@@ -512,10 +756,12 @@ fn print_human(outcome: &Outcome) {
             outcome.changes.len()
         ),
         Status::Success => println!("{}: success", outcome.command),
+        Status::Warning => println!("{}: completed with warnings", outcome.command),
+        Status::Conflict => println!("{}: conflict", outcome.command),
         Status::Error => println!("{}: checks failed", outcome.command),
     }
-    for path in &outcome.changes {
-        println!("  write {path}");
+    for change in &outcome.changes {
+        println!("  {:?} {}", change.action, change.path);
     }
 }
 
@@ -567,7 +813,7 @@ mod tests {
             std::fs::remove_dir_all(&root).unwrap();
         }
         std::fs::create_dir_all(&root).unwrap();
-        init(&root, false).unwrap();
+        init(&root, false, false).unwrap();
         let contract_path = root.join("src/components/ui/_kit/token-contract.json");
         std::fs::create_dir_all(contract_path.parent().unwrap()).unwrap();
         let mut contract = serde_json::json!({
@@ -652,14 +898,14 @@ mod tests {
             "<!doctype html>\n<html>\n<head>\n<link data-trunk rel=\"css\" href=\"styles/kit.css\">\n</head>\n<body></body>\n</html>\n",
         )
         .unwrap();
-        let outcome = build_command(&root, false).unwrap();
+        let outcome = build_command(&root, false, false).unwrap();
         assert_eq!(outcome.changes.len(), 4);
         let css = std::fs::read_to_string(root.join("styles/themes.css")).unwrap();
         assert!(css.contains("@layer leptos-ui-kit.themes"));
         assert!(css.contains("--kit-color-surface: #ffffff"));
         let index = std::fs::read_to_string(root.join("index.html")).unwrap();
         assert!(index.contains("<!-- leptos-ui-theme:start -->"));
-        let second = build_command(&root, false).unwrap();
+        let second = build_command(&root, false, false).unwrap();
         assert!(second.changes.is_empty());
         std::fs::remove_dir_all(root).unwrap();
     }

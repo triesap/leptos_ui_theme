@@ -63,6 +63,17 @@ pub struct BootstrapMetadata {
     pub html_snippet: String,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct BuildOptions {
+    pub patch_index: bool,
+}
+
+impl Default for BuildOptions {
+    fn default() -> Self {
+        Self { patch_index: true }
+    }
+}
+
 impl GeneratedArtifact {
     #[must_use]
     pub fn generated(path: impl Into<String>, bytes: Vec<u8>) -> Self {
@@ -131,11 +142,15 @@ struct HtmlIntegrationLock {
     mode: &'static str,
     selected_index_path: String,
     snippet_digest: String,
-    region_digest: String,
-    container_digest: String,
+    region_digest: Option<String>,
+    container_digest: Option<String>,
 }
 
 pub fn build(root: &Path) -> Result<BuildResult, CodegenError> {
+    build_with_options(root, BuildOptions::default())
+}
+
+pub fn build_with_options(root: &Path, options: BuildOptions) -> Result<BuildResult, CodegenError> {
     let compiler = ThemeCompiler::load(root)?;
     let profiles = compiler.resolve()?;
     let mut axes = Vec::new();
@@ -176,6 +191,17 @@ pub fn build(root: &Path) -> Result<BuildResult, CodegenError> {
         })?
         .to_string_lossy()
         .into_owned();
+    let kit_stylesheet_relative = compiler
+        .kit_stylesheet_path
+        .strip_prefix(root)
+        .map_err(|_| {
+            CodegenError::Core(ThemeError::Security(
+                compiler.kit_stylesheet_path.display().to_string(),
+            ))
+        })?
+        .to_string_lossy()
+        .into_owned();
+    let kit_href = relative_asset(&index_relative, &kit_stylesheet_relative)?;
     let script = bootstrap_script(&compiler.config, &profiles)?;
     if compiler.config.bootstrap.mode == BootstrapMode::ExternalSync {
         let external = compiler.config.bootstrap.external.as_ref().ok_or_else(|| {
@@ -195,7 +221,7 @@ pub fn build(root: &Path) -> Result<BuildResult, CodegenError> {
         source,
     })?;
     let region = html_region(&compiler.config, &profiles, &index_relative, &script)?;
-    let patched = patch_index(&index_bytes, &region)?;
+    let patched = patch_index(&index_bytes, &region, &kit_href)?;
     let script_digest = (compiler.config.bootstrap.mode != BootstrapMode::Disabled)
         .then(|| format!("sha256:{}", sha256(script.as_bytes())));
     let csp_source = (compiler.config.bootstrap.mode == BootstrapMode::InlineCspHash)
@@ -207,7 +233,28 @@ pub fn build(root: &Path) -> Result<BuildResult, CodegenError> {
         html_snippet: region.clone(),
     };
     let patched_digest = format!("sha256:{}", sha256(&patched));
-    artifacts.push(GeneratedArtifact::html_region(index_relative, patched));
+    if options.patch_index {
+        artifacts.push(GeneratedArtifact::html_region(
+            index_relative.clone(),
+            patched,
+        ));
+    } else {
+        let text = std::str::from_utf8(&index_bytes).map_err(|_| {
+            CodegenError::Core(ThemeError::Config("index HTML must be UTF-8".into()))
+        })?;
+        if text.contains("<!-- leptos-ui-theme:start -->")
+            && normalize_region_line_endings(text) != normalize_region_line_endings(&region)
+            && index_bytes != patch_index(&index_bytes, &region, &kit_href)?
+        {
+            return Err(CodegenError::Core(ThemeError::Config(
+                "manual HTML region is stale".into(),
+            )));
+        }
+        artifacts.push(GeneratedArtifact::user_authored(
+            index_relative.clone(),
+            index_bytes.clone(),
+        ));
+    }
     let config_bytes = std::fs::read(&compiler.config_path).map_err(|source| CodegenError::Io {
         path: compiler.config_path.clone(),
         source,
@@ -237,7 +284,11 @@ pub fn build(root: &Path) -> Result<BuildResult, CodegenError> {
             csp_source,
         },
         html_integration: HtmlIntegrationLock {
-            mode: "patched",
+            mode: if options.patch_index {
+                "patched"
+            } else {
+                "manual"
+            },
             selected_index_path: selected_index
                 .strip_prefix(root)
                 .map_err(|_| {
@@ -246,8 +297,16 @@ pub fn build(root: &Path) -> Result<BuildResult, CodegenError> {
                 .to_string_lossy()
                 .into_owned(),
             snippet_digest: format!("sha256:{}", sha256(region.as_bytes())),
-            region_digest: format!("sha256:{}", sha256(region.as_bytes())),
-            container_digest: patched_digest,
+            region_digest: if options.patch_index {
+                Some(format!("sha256:{}", sha256(region.as_bytes())))
+            } else {
+                None
+            },
+            container_digest: if options.patch_index {
+                Some(patched_digest)
+            } else {
+                None
+            },
         },
         outputs: output_digests,
     };
@@ -878,7 +937,11 @@ fn html_region(
                 format!(" data-target-path=\"{}\"", html_escape(served_parent))
             };
             let public = external.public_path.clone().unwrap_or_else(|| {
-                format!("{}{}", config.html.public_base_path, external.served_path)
+                format!(
+                    "{}{}",
+                    config.html.public_base_path,
+                    percent_encode_path(&external.served_path)
+                )
             });
             lines.push(format!(
                 "<link data-trunk rel=\"copy-file\" href=\"{copy_href}\"{target}>"
@@ -926,7 +989,11 @@ fn select_index(root: &Path, config: &ProjectConfig) -> Result<PathBuf, CodegenE
     }
 }
 
-fn patch_index(index: &[u8], canonical_region: &str) -> Result<Vec<u8>, CodegenError> {
+fn patch_index(
+    index: &[u8],
+    canonical_region: &str,
+    kit_stylesheet_href: &str,
+) -> Result<Vec<u8>, CodegenError> {
     let text = std::str::from_utf8(index)
         .map_err(|_| CodegenError::Core(ThemeError::Config("index HTML must be UTF-8".into())))?;
     if text.contains('\0') || text.starts_with('\u{feff}') {
@@ -971,7 +1038,7 @@ fn patch_index(index: &[u8], canonical_region: &str) -> Result<Vec<u8>, CodegenE
             line.contains("<link")
                 && line.contains("data-trunk")
                 && line.contains("rel=\"css\"")
-                && !line.contains("leptos-ui-theme")
+                && line.contains(&format!("href=\"{}\"", html_escape(kit_stylesheet_href)))
         })
         .collect();
     if kit_lines.len() != 1 || !kit_lines[0].1.ends_with(newline) {
@@ -985,6 +1052,10 @@ fn patch_index(index: &[u8], canonical_region: &str) -> Result<Vec<u8>, CodegenE
     output.extend_from_slice(region.as_bytes());
     output.extend_from_slice(&index[insertion..]);
     Ok(output)
+}
+
+fn normalize_region_line_endings(value: &str) -> String {
+    value.replace("\r\n", "\n")
 }
 
 fn relative_asset(index_path: &str, target_path: &str) -> Result<String, CodegenError> {
@@ -1017,6 +1088,21 @@ fn html_escape(value: &str) -> String {
         .replace('"', "&quot;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+fn percent_encode_path(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte == b'/' || byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
+        {
+            output.push(byte as char);
+        } else {
+            output.push('%');
+            output.push(char::from(b"0123456789ABCDEF"[(byte >> 4) as usize]));
+            output.push(char::from(b"0123456789ABCDEF"[(byte & 0x0f) as usize]));
+        }
+    }
+    output
 }
 
 fn profile<'a>(
