@@ -1,0 +1,451 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://triesap.github.io/leptos_ui_theme/schema/0.1.0/lock.schema.json",
+  "title": "leptos_ui_theme lock",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "tool",
+    "dtcgVersion",
+    "kit",
+    "contract",
+    "config",
+    "inputs",
+    "profiles",
+    "dependencyState",
+    "dependencies",
+    "bootstrap",
+    "htmlIntegration",
+    "outputs"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "1.0.0"
+    },
+    "tool": {
+      "$ref": "#/$defs/tool"
+    },
+    "dtcgVersion": {
+      "const": "2025.10"
+    },
+    "kit": {
+      "$ref": "#/$defs/kit"
+    },
+    "contract": {
+      "$ref": "#/$defs/contract"
+    },
+    "config": {
+      "$ref": "#/$defs/input"
+    },
+    "inputs": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/input"
+      }
+    },
+    "profiles": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/profile"
+      }
+    },
+    "dependencyState": {
+      "enum": [
+        "pending",
+        "resolved"
+      ]
+    },
+    "dependencies": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "items": {
+        "$ref": "#/$defs/dependency"
+      }
+    },
+    "bootstrap": {
+      "$ref": "#/$defs/bootstrap"
+    },
+    "htmlIntegration": {
+      "$ref": "#/$defs/htmlIntegration"
+    },
+    "outputs": {
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/logicalPath"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/output"
+      }
+    }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "logicalPath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?/)(?!.*\\\\)(?!.*//).+$"
+    },
+    "registryChecksum": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "tool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "package",
+        "version",
+        "repository"
+      ],
+      "properties": {
+        "package": {
+          "const": "leptos_ui_theme_codegen"
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "repository": {
+          "const": "https://github.com/triesap/leptos_ui_theme"
+        }
+      }
+    },
+    "input": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "root",
+        "path",
+        "bytesDigest"
+      ],
+      "properties": {
+        "root": {
+          "enum": [
+            "app-config",
+            "workspace"
+          ]
+        },
+        "path": {
+          "$ref": "#/$defs/logicalPath"
+        },
+        "bytesDigest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "kit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "capabilityFingerprint",
+        "installation",
+        "capability",
+        "stylesheet"
+      ],
+      "properties": {
+        "capabilityFingerprint": {
+          "$ref": "#/$defs/digest"
+        },
+        "installation": {
+          "$ref": "#/$defs/input"
+        },
+        "capability": {
+          "$ref": "#/$defs/input"
+        },
+        "stylesheet": {
+          "$ref": "#/$defs/input"
+        }
+      }
+    },
+    "contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "contractId",
+        "abiVersion",
+        "revision",
+        "canonicalDigest",
+        "installedBytesDigest"
+      ],
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/logicalPath"
+        },
+        "contractId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "abiVersion": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "canonicalDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "installedBytesDigest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "semanticDigest"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
+        },
+        "semanticDigest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "dependency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "package",
+        "requirement",
+        "features",
+        "defaultFeatures",
+        "resolvedVersion",
+        "checksum"
+      ],
+      "properties": {
+        "package": {
+          "type": "string",
+          "minLength": 1
+        },
+        "requirement": {
+          "type": "string",
+          "minLength": 1
+        },
+        "features": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "defaultFeatures": {
+          "type": "boolean"
+        },
+        "resolvedVersion": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "checksum": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/registryChecksum"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "resolvedVersion": {
+                "type": "null"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "checksum": {
+                "type": "null"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "checksum": {
+                "$ref": "#/$defs/registryChecksum"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "bootstrap": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "scriptDigest",
+        "cspSource"
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "inline-csp-hash",
+            "inline-csp-nonce-template",
+            "external-sync",
+            "disabled"
+          ]
+        },
+        "scriptDigest": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/digest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cspSource": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^'sha256-[A-Za-z0-9+/]{43}='$"
+        }
+      }
+    },
+    "htmlIntegration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "selectedIndexPath",
+        "snippetDigest",
+        "regionDigest",
+        "containerDigest",
+        "exteriorDigest"
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "manual",
+            "patched"
+          ]
+        },
+        "selectedIndexPath": {
+          "$ref": "#/$defs/logicalPath"
+        },
+        "snippetDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "regionDigest": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/digest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "containerDigest": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/digest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "exteriorDigest": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/digest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "mode": {
+                "const": "manual"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "regionDigest": {
+                "type": "null"
+              },
+              "containerDigest": {
+                "type": "null"
+              },
+              "exteriorDigest": {
+                "type": "null"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "regionDigest": {
+                "$ref": "#/$defs/digest"
+              },
+              "containerDigest": {
+                "$ref": "#/$defs/digest"
+              },
+              "exteriorDigest": {
+                "$ref": "#/$defs/digest"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "output": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "digest",
+        "ownership",
+        "scope"
+      ],
+      "properties": {
+        "digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "ownership": {
+          "enum": [
+            "generated/lock-owned",
+            "seeded/app-owned",
+            "user-authored",
+            "external kit-owned"
+          ]
+        },
+        "scope": {
+          "enum": [
+            "whole-file",
+            "html-owned-region",
+            "directory"
+          ]
+        }
+      }
+    }
+  }
+}

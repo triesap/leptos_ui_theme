@@ -14,7 +14,7 @@ pub enum Ownership {
     SeededAppOwned,
     #[serde(rename = "user-authored")]
     UserAuthored,
-    #[serde(rename = "external-kit-owned")]
+    #[serde(rename = "external kit-owned")]
     ExternalKitOwned,
 }
 

@@ -21,6 +21,18 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// The immutable JSON command-envelope schema.
+pub const DIAGNOSTIC_ENVELOPE_SCHEMA: &str =
+    "https://triesap.github.io/leptos_ui_theme/schema/0.1.0/diagnostic-envelope.schema.json";
+/// Packaged draft 2020-12 JSON command-envelope schema bytes.
+pub const DIAGNOSTIC_ENVELOPE_SCHEMA_JSON: &str =
+    include_str!("../schemas/diagnostic-envelope.schema.json");
+/// The immutable runtime-qualification result schema.
+pub const RUNTIME_QUALIFICATION_RESULT_SCHEMA: &str = "https://triesap.github.io/leptos_ui_theme/schema/0.1.0/runtime-qualification-result.schema.json";
+/// Packaged draft 2020-12 runtime-qualification result schema bytes.
+pub const RUNTIME_QUALIFICATION_RESULT_SCHEMA_JSON: &str =
+    include_str!("../schemas/runtime-qualification-result.schema.json");
+
 #[derive(Debug, Parser)]
 #[command(
     name = "leptos_ui_theme",
@@ -223,11 +235,20 @@ struct DependencyPlan {
 #[serde(rename_all = "camelCase")]
 struct PriorThemeLock {
     html_integration: PriorHtmlIntegration,
+    #[serde(default)]
+    contract: Option<PriorContractIdentity>,
 }
 
 #[derive(Deserialize)]
 struct PriorHtmlIntegration {
     mode: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PriorContractIdentity {
+    canonical_digest: String,
+    installed_bytes_digest: String,
 }
 
 pub fn run(cli: Cli) -> i32 {
@@ -1591,6 +1612,22 @@ fn resolved_registry_package(
 fn contract_identity(compiler: &ThemeCompiler) -> Result<serde_json::Value, CliError> {
     let capability: leptos_ui_theme_core::KitCapability =
         serde_json::from_slice(&compiler.kit_capability.bytes)?;
+    let previous = read_prior_theme_lock(
+        &compiler.root,
+        &compiler.config.outputs.lock,
+        compiler.config.limits.file_bytes,
+    )?;
+    let compatibility = compiler.contract.compatibility_result(
+        previous
+            .as_ref()
+            .and_then(|lock| lock.contract.as_ref())
+            .map(|contract| contract.canonical_digest.as_str()),
+        previous
+            .as_ref()
+            .and_then(|lock| lock.contract.as_ref())
+            .map(|contract| contract.installed_bytes_digest.as_str()),
+        &capability.contract.installed_bytes_digest,
+    )?;
     Ok(json!({
         "contractId": compiler.contract.contract_id,
         "abiVersion": compiler.contract.abi_version,
@@ -1602,13 +1639,30 @@ fn contract_identity(compiler: &ThemeCompiler) -> Result<serde_json::Value, CliE
         "installedBytesDigest": capability.contract.installed_bytes_digest,
         "stylesheetBytesDigest": capability.stylesheet.installed_bytes_digest,
         "stylesheetPath": capability.stylesheet.path,
-        "compatibility": {
-            "dtcgVersion": compiler.contract.dtcg_version,
-            "dtcgProfile": compiler.contract.dtcg_profile,
-            "portalMountType": capability.portal_abi.mount_type,
-            "portalBodyHost": capability.portal_abi.body_host,
-        },
+        "compatibility": compatibility,
     }))
+}
+
+fn read_prior_theme_lock(
+    root: &Path,
+    relative: &str,
+    file_limit: u64,
+) -> Result<Option<PriorThemeLock>, CliError> {
+    let path = root.join(relative);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(CliError::Io { path, source }),
+    };
+    if bytes.len() as u64 > file_limit {
+        return Err(ThemeError::Limit {
+            resource: "fileBytes",
+            limit: file_limit,
+            observed: bytes.len() as u64,
+        }
+        .into());
+    }
+    serde_json::from_slice(&bytes).map(Some).map_err(Into::into)
 }
 
 fn revalidate_compiler_sources(compiler: &ThemeCompiler) -> Result<(), CliError> {
@@ -1784,6 +1838,24 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
+    fn cli_schema_assets_have_immutable_identities() {
+        for (bytes, identity) in [
+            (
+                super::DIAGNOSTIC_ENVELOPE_SCHEMA_JSON,
+                super::DIAGNOSTIC_ENVELOPE_SCHEMA,
+            ),
+            (
+                super::RUNTIME_QUALIFICATION_RESULT_SCHEMA_JSON,
+                super::RUNTIME_QUALIFICATION_RESULT_SCHEMA,
+            ),
+        ] {
+            let schema: serde_json::Value = serde_json::from_str(bytes).unwrap();
+            assert_eq!(schema["$id"], identity);
+            assert_eq!(schema["additionalProperties"], false);
+        }
+    }
+
+    #[test]
     fn starter_resolver_has_theme_modifier() {
         assert!(starter_resolver()["modifiers"]["theme"].is_object());
     }
@@ -1942,6 +2014,15 @@ checksum = "sha256:test"
         );
         let listed = list_command(&root).unwrap();
         assert_eq!(listed.data["contract"]["contractId"], "leptos-ui-kit");
+        assert_eq!(
+            listed.data["contract"]["compatibility"],
+            serde_json::json!({
+                "semantic": "compatible",
+                "revision": "exact",
+                "canonicalDigest": "exact",
+                "installedBytes": "exact"
+            })
+        );
         assert_eq!(listed.data["profiles"][0]["sourceStatus"], "valid");
         let explained = explain_command(&root, "color.surface", "light").unwrap();
         assert_eq!(explained.data["tokenPath"], "color.surface");

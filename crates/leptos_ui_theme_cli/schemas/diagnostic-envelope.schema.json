@@ -1,0 +1,331 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://triesap.github.io/leptos_ui_theme/schema/0.1.0/diagnostic-envelope.schema.json",
+  "title": "leptos_ui_theme command envelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "command",
+    "status",
+    "exitCode",
+    "diagnostics",
+    "changes",
+    "data"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "1.0.0"
+    },
+    "command": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "init",
+        "add",
+        "build",
+        "check",
+        "list",
+        "explain",
+        "doctor",
+        null
+      ]
+    },
+    "status": {
+      "enum": [
+        "success",
+        "no_change",
+        "planned",
+        "warning",
+        "conflict",
+        "error"
+      ]
+    },
+    "exitCode": {
+      "enum": [
+        0,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        70
+      ]
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/diagnostic"
+      }
+    },
+    "changes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/change"
+      }
+    },
+    "data": {
+      "type": [
+        "object",
+        "null"
+      ]
+    }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "logicalPath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?/)(?!.*\\\\)(?!.*//).+$"
+    },
+    "diagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "category",
+        "severity",
+        "message",
+        "locations",
+        "redirects",
+        "help"
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "minLength": 1
+        },
+        "category": {
+          "enum": [
+            "usage",
+            "validation",
+            "conflict",
+            "security",
+            "contract",
+            "check",
+            "internal"
+          ]
+        },
+        "severity": {
+          "enum": [
+            "error",
+            "warning",
+            "info"
+          ]
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1
+        },
+        "locations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/location"
+          }
+        },
+        "redirects": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/redirect"
+          }
+        },
+        "help": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "location": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "pointer",
+        "profile",
+        "label"
+      ],
+      "properties": {
+        "path": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/logicalPath"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "pointer": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^(?:/(?:[^~/]|~[01])*)*$"
+        },
+        "profile": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "anyOf": [
+        {
+          "required": [
+            "path"
+          ],
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "required": [
+            "pointer"
+          ],
+          "properties": {
+            "pointer": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "required": [
+            "profile"
+          ],
+          "properties": {
+            "profile": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "redirect": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "from",
+        "to",
+        "message"
+      ],
+      "properties": {
+        "from": {
+          "type": "string",
+          "minLength": 1
+        },
+        "to": {
+          "type": "string",
+          "minLength": 1
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "change": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "scope",
+        "action",
+        "ownership",
+        "beforeDigest",
+        "afterDigest",
+        "containerBeforeDigest",
+        "containerAfterDigest",
+        "exteriorBeforeDigest",
+        "exteriorAfterDigest",
+        "backupPath",
+        "acceptedGeneratedConflict"
+      ],
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/logicalPath"
+        },
+        "scope": {
+          "enum": [
+            "whole-file",
+            "html-owned-region",
+            "directory"
+          ]
+        },
+        "action": {
+          "enum": [
+            "create",
+            "replace",
+            "remove",
+            "create-directory"
+          ]
+        },
+        "ownership": {
+          "enum": [
+            "generated/lock-owned",
+            "seeded/app-owned",
+            "user-authored",
+            "external kit-owned"
+          ]
+        },
+        "beforeDigest": {
+          "$ref": "#/$defs/nullableDigest"
+        },
+        "afterDigest": {
+          "$ref": "#/$defs/nullableDigest"
+        },
+        "containerBeforeDigest": {
+          "$ref": "#/$defs/nullableDigest"
+        },
+        "containerAfterDigest": {
+          "$ref": "#/$defs/nullableDigest"
+        },
+        "exteriorBeforeDigest": {
+          "$ref": "#/$defs/nullableDigest"
+        },
+        "exteriorAfterDigest": {
+          "$ref": "#/$defs/nullableDigest"
+        },
+        "backupPath": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/logicalPath"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "acceptedGeneratedConflict": {
+          "type": "boolean"
+        }
+      }
+    },
+    "nullableDigest": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/digest"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  }
+}

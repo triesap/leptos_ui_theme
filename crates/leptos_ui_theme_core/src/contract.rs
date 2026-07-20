@@ -116,6 +116,38 @@ pub enum ContractCompatibility {
     NewerCompatible,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CompatibilitySemantic {
+    Compatible,
+    Incompatible,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CompatibilityRevision {
+    Exact,
+    NewerCompatible,
+    OlderCompatible,
+    Unsupported,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CompatibilityDigest {
+    Exact,
+    Drifted,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct CompatibilityResult {
+    pub semantic: CompatibilitySemantic,
+    pub revision: CompatibilityRevision,
+    pub canonical_digest: CompatibilityDigest,
+    pub installed_bytes: CompatibilityDigest,
+}
+
 impl KitTokenContract {
     pub fn load(path: &Path) -> Result<Self, ThemeError> {
         let value: serde_json::Value = read_json(path)?;
@@ -309,6 +341,37 @@ impl KitTokenContract {
             }
         }
         Ok(compatibility)
+    }
+
+    pub fn compatibility_result(
+        &self,
+        previous_canonical_digest: Option<&str>,
+        previous_installed_bytes_digest: Option<&str>,
+        installed_bytes_digest: &str,
+    ) -> Result<CompatibilityResult, ThemeError> {
+        let revision = match self.validate()? {
+            ContractCompatibility::Exact => CompatibilityRevision::Exact,
+            ContractCompatibility::OlderCompatible => CompatibilityRevision::OlderCompatible,
+            ContractCompatibility::NewerCompatible => CompatibilityRevision::NewerCompatible,
+        };
+        Ok(CompatibilityResult {
+            semantic: CompatibilitySemantic::Compatible,
+            revision,
+            canonical_digest: if previous_canonical_digest
+                .is_none_or(|digest| digest == self.canonical_digest)
+            {
+                CompatibilityDigest::Exact
+            } else {
+                CompatibilityDigest::Drifted
+            },
+            installed_bytes: if previous_installed_bytes_digest
+                .is_none_or(|digest| digest == installed_bytes_digest)
+            {
+                CompatibilityDigest::Exact
+            } else {
+                CompatibilityDigest::Drifted
+            },
+        })
     }
 
     pub fn terminal_mapping(&self, path: &str) -> Result<&TokenMapping, ThemeError> {

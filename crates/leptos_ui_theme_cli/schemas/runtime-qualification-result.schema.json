@@ -1,0 +1,491 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://triesap.github.io/leptos_ui_theme/schema/0.1.0/runtime-qualification-result.schema.json",
+  "title": "leptos_ui_theme runtime qualification result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schemaVersion",
+    "fixture",
+    "tool",
+    "packages",
+    "contract",
+    "projectConfigDigest",
+    "themeLockDigest",
+    "outputs",
+    "browsers",
+    "hostImage",
+    "status",
+    "canonicalDigest"
+  ],
+  "properties": {
+    "$schema": {
+      "const": "https://triesap.github.io/leptos_ui_theme/schema/0.1.0/runtime-qualification-result.schema.json"
+    },
+    "schemaVersion": {
+      "const": "1.0.0"
+    },
+    "fixture": {
+      "$ref": "#/$defs/fixture"
+    },
+    "tool": {
+      "$ref": "#/$defs/tool"
+    },
+    "packages": {
+      "type": "array",
+      "minItems": 6,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/package"
+      }
+    },
+    "contract": {
+      "$ref": "#/$defs/contract"
+    },
+    "projectConfigDigest": {
+      "$ref": "#/$defs/digest"
+    },
+    "themeLockDigest": {
+      "$ref": "#/$defs/digest"
+    },
+    "outputs": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/output"
+      }
+    },
+    "browsers": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "prefixItems": [
+        {
+          "$ref": "#/$defs/chromium"
+        },
+        {
+          "$ref": "#/$defs/firefox"
+        },
+        {
+          "$ref": "#/$defs/webkit"
+        }
+      ],
+      "items": false
+    },
+    "hostImage": {
+      "$ref": "#/$defs/hostImage"
+    },
+    "status": {
+      "$ref": "#/$defs/result"
+    },
+    "canonicalDigest": {
+      "$ref": "#/$defs/digest"
+    }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "registryChecksum": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "logicalPath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?/)(?!.*\\\\)(?!.*//).+$"
+    },
+    "result": {
+      "enum": [
+        "pass",
+        "fail"
+      ]
+    },
+    "fixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "version",
+        "result",
+        "manifestPath",
+        "manifestDigest",
+        "sourceDigest"
+      ],
+      "properties": {
+        "id": {
+          "const": "leptos-ui-theme-runtime-v1"
+        },
+        "version": {
+          "const": 1
+        },
+        "result": {
+          "$ref": "#/$defs/result"
+        },
+        "manifestPath": {
+          "$ref": "#/$defs/logicalPath"
+        },
+        "manifestDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "sourceDigest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "tool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "package",
+        "version"
+      ],
+      "properties": {
+        "package": {
+          "const": "leptos_ui_theme_cli"
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "package": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "package",
+        "version",
+        "checksum"
+      ],
+      "properties": {
+        "package": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "checksum": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/registryChecksum"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "compatibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "semantic",
+        "revision",
+        "canonicalDigest",
+        "installedBytes"
+      ],
+      "properties": {
+        "semantic": {
+          "enum": [
+            "compatible",
+            "incompatible"
+          ]
+        },
+        "revision": {
+          "enum": [
+            "exact",
+            "newer-compatible",
+            "older-compatible",
+            "unsupported"
+          ]
+        },
+        "canonicalDigest": {
+          "enum": [
+            "exact",
+            "drifted"
+          ]
+        },
+        "installedBytes": {
+          "enum": [
+            "exact",
+            "drifted"
+          ]
+        }
+      }
+    },
+    "contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contractId",
+        "abiVersion",
+        "revision",
+        "layerAbiVersion",
+        "presenceAbiVersion",
+        "portalAbiVersion",
+        "canonicalDigest",
+        "installedBytesDigest",
+        "stylesheetBytesDigest",
+        "stylesheetPath",
+        "compatibility"
+      ],
+      "properties": {
+        "contractId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "abiVersion": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "layerAbiVersion": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "presenceAbiVersion": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "portalAbiVersion": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "canonicalDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "installedBytesDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "stylesheetBytesDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "stylesheetPath": {
+          "$ref": "#/$defs/logicalPath"
+        },
+        "compatibility": {
+          "$ref": "#/$defs/compatibility"
+        }
+      }
+    },
+    "output": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "scope",
+        "digest",
+        "containerDigest",
+        "exteriorDigest"
+      ],
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/logicalPath"
+        },
+        "scope": {
+          "enum": [
+            "whole-file",
+            "html-owned-region"
+          ]
+        },
+        "digest": {
+          "$ref": "#/$defs/nullableDigest"
+        },
+        "containerDigest": {
+          "$ref": "#/$defs/nullableDigest"
+        },
+        "exteriorDigest": {
+          "$ref": "#/$defs/nullableDigest"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "scope": {
+                "const": "whole-file"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "digest": {
+                "$ref": "#/$defs/digest"
+              },
+              "containerDigest": {
+                "type": "null"
+              },
+              "exteriorDigest": {
+                "type": "null"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "digest": {
+                "$ref": "#/$defs/digest"
+              },
+              "containerDigest": {
+                "$ref": "#/$defs/digest"
+              },
+              "exteriorDigest": {
+                "$ref": "#/$defs/digest"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "browser": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "engine",
+        "version",
+        "revision",
+        "result",
+        "manifestPath",
+        "manifestDigest"
+      ],
+      "properties": {
+        "engine": {
+          "enum": [
+            "chromium",
+            "firefox",
+            "webkit"
+          ]
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "revision": {
+          "type": "string",
+          "minLength": 1
+        },
+        "result": {
+          "$ref": "#/$defs/result"
+        },
+        "manifestPath": {
+          "$ref": "#/$defs/logicalPath"
+        },
+        "manifestDigest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "chromium": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/browser"
+        },
+        {
+          "properties": {
+            "engine": {
+              "const": "chromium"
+            }
+          }
+        }
+      ]
+    },
+    "firefox": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/browser"
+        },
+        {
+          "properties": {
+            "engine": {
+              "const": "firefox"
+            }
+          }
+        }
+      ]
+    },
+    "webkit": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/browser"
+        },
+        {
+          "properties": {
+            "engine": {
+              "const": "webkit"
+            }
+          }
+        }
+      ]
+    },
+    "hostImage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operatingSystem",
+        "architecture",
+        "imageId",
+        "imageManifestPath",
+        "imageDigest",
+        "result",
+        "manifestPath",
+        "manifestDigest",
+        "provenancePath",
+        "provenanceDigest"
+      ],
+      "properties": {
+        "operatingSystem": {
+          "type": "string",
+          "minLength": 1
+        },
+        "architecture": {
+          "type": "string",
+          "minLength": 1
+        },
+        "imageId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "imageManifestPath": {
+          "$ref": "#/$defs/logicalPath"
+        },
+        "imageDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "result": {
+          "$ref": "#/$defs/result"
+        },
+        "manifestPath": {
+          "$ref": "#/$defs/logicalPath"
+        },
+        "manifestDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "provenancePath": {
+          "$ref": "#/$defs/logicalPath"
+        },
+        "provenanceDigest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "nullableDigest": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/digest"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  }
+}

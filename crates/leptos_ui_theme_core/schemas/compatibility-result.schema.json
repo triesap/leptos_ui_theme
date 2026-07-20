@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://triesap.github.io/leptos_ui_theme/schema/0.1.0/compatibility-result.schema.json",
+  "title": "leptos_ui_theme compatibility result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "semantic",
+    "revision",
+    "canonicalDigest",
+    "installedBytes"
+  ],
+  "properties": {
+    "semantic": {
+      "enum": [
+        "compatible",
+        "incompatible"
+      ]
+    },
+    "revision": {
+      "enum": [
+        "exact",
+        "newer-compatible",
+        "older-compatible",
+        "unsupported"
+      ]
+    },
+    "canonicalDigest": {
+      "enum": [
+        "exact",
+        "drifted"
+      ]
+    },
+    "installedBytes": {
+      "enum": [
+        "exact",
+        "drifted"
+      ]
+    }
+  }
+}

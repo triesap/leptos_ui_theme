@@ -20,6 +20,7 @@ pub use color::{
     serialize_color_modern, validate_color_syntax, validate_contrast,
 };
 pub use contract::{
+    CompatibilityDigest, CompatibilityResult, CompatibilityRevision, CompatibilitySemantic,
     ContractCompatibility, ContrastCheck, ContrastKind, Deprecation, KitTokenContract, TokenDomain,
     TokenMapping, canonical_contract_digest,
 };
@@ -65,6 +66,12 @@ pub const PROJECT_SCHEMA: &str =
     "https://triesap.github.io/leptos_ui_theme/schema/0.1.0/project.schema.json";
 /// The immutable draft 2020-12 project configuration schema.
 pub const PROJECT_SCHEMA_JSON: &str = include_str!("../schemas/project.schema.json");
+/// The immutable compatibility-result schema.
+pub const COMPATIBILITY_RESULT_SCHEMA: &str =
+    "https://triesap.github.io/leptos_ui_theme/schema/0.1.0/compatibility-result.schema.json";
+/// Packaged draft 2020-12 compatibility-result schema bytes.
+pub const COMPATIBILITY_RESULT_SCHEMA_JSON: &str =
+    include_str!("../schemas/compatibility-result.schema.json");
 
 /// Errors emitted before any output is written.
 #[derive(Debug, thiserror::Error)]
@@ -143,7 +150,10 @@ pub fn sha256(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{LogicalPath, ProjectConfig, sha256};
+    use super::{
+        COMPATIBILITY_RESULT_SCHEMA, COMPATIBILITY_RESULT_SCHEMA_JSON, LogicalPath, ProjectConfig,
+        sha256,
+    };
 
     #[test]
     fn default_config_is_valid() {
@@ -164,5 +174,13 @@ mod tests {
         let mut config = ProjectConfig::default();
         config.kit.lock_paths = vec!["../shared/kit.lock.json".into()];
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn compatibility_schema_has_the_immutable_identity() {
+        let schema: serde_json::Value =
+            serde_json::from_str(COMPATIBILITY_RESULT_SCHEMA_JSON).unwrap();
+        assert_eq!(schema["$id"], COMPATIBILITY_RESULT_SCHEMA);
+        assert_eq!(schema["additionalProperties"], false);
     }
 }

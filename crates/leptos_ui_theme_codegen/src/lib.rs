@@ -15,6 +15,12 @@ pub use transaction::{
     recover,
 };
 
+/// The immutable theme-lock schema.
+pub const LOCK_SCHEMA: &str =
+    "https://triesap.github.io/leptos_ui_theme/schema/0.1.0/lock.schema.json";
+/// Packaged draft 2020-12 theme-lock schema bytes.
+pub const LOCK_SCHEMA_JSON: &str = include_str!("../schemas/lock.schema.json");
+
 use html5ever::{
     ParseOpts, parse_document, tendril::TendrilSink, tokenizer::TokenizerOpts,
     tree_builder::TreeBuilderOpts,
@@ -2459,6 +2465,16 @@ mod tests {
     fn numbers_are_stable() {
         assert_eq!(format_css_number(-0.0).unwrap(), "0");
         assert_eq!(format_css_number(1.25).unwrap(), "1.25");
+    }
+
+    #[test]
+    fn lock_schema_has_the_immutable_identity() {
+        let schema: serde_json::Value = serde_json::from_str(super::LOCK_SCHEMA_JSON).unwrap();
+        assert_eq!(schema["$id"], super::LOCK_SCHEMA);
+        assert_eq!(
+            schema["$defs"]["output"]["properties"]["ownership"]["enum"][3],
+            "external kit-owned"
+        );
     }
 
     #[test]
