@@ -1,7 +1,19 @@
-use crate::{PROJECT_SCHEMA, ThemeError};
+use crate::{PROJECT_SCHEMA, ThemeError, validate_relative_path};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Component, Path};
+
+pub const COMPILED_LIMITS: Limits = Limits {
+    max_file_bytes: 16_777_216,
+    max_files: 4_096,
+    max_json_depth: 256,
+    max_tokens: 100_000,
+    max_references: 500_000,
+    max_reference_depth: 256,
+    max_resolver_nodes: 500_000,
+    max_profiles: 256,
+    max_output_bytes: 67_108_864,
+    max_diagnostics: 10_000,
+};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -250,6 +262,7 @@ impl ProjectConfig {
         if self.dtcg_version != "2025.10" {
             return Err(ThemeError::Config("dtcgVersion must be 2025.10".into()));
         }
+        self.limits.validate()?;
         for attribute in [
             &self.selectors.theme,
             &self.selectors.density,
@@ -436,34 +449,7 @@ impl ProjectConfig {
 }
 
 pub fn validate_theme_id(value: &str) -> Result<(), ThemeError> {
-    let bytes = value.as_bytes();
-    let valid = !bytes.is_empty()
-        && bytes.len() <= 63
-        && bytes[0].is_ascii_lowercase()
-        && bytes[bytes.len() - 1].is_ascii_alphanumeric()
-        && bytes
-            .iter()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
-        && !value.contains("--");
-    if valid {
-        Ok(())
-    } else {
-        Err(ThemeError::Config(format!("invalid theme ID `{value}`")))
-    }
-}
-
-pub fn validate_relative_path(value: &str) -> Result<(), ThemeError> {
-    let path = Path::new(value);
-    if value.is_empty()
-        || value.contains('\\')
-        || path.is_absolute()
-        || path
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return Err(ThemeError::Security(value.into()));
-    }
-    Ok(())
+    crate::ThemeId::new(value).map(|_| ())
 }
 
 fn validate_attribute(value: &str) -> Result<(), ThemeError> {
@@ -480,5 +466,69 @@ fn validate_attribute(value: &str) -> Result<(), ThemeError> {
         Err(ThemeError::Config(format!(
             "invalid selector attribute `{value}`"
         )))
+    }
+}
+
+impl Limits {
+    pub fn validate(&self) -> Result<(), ThemeError> {
+        for (name, value, compiled) in [
+            (
+                "maxFileBytes",
+                self.max_file_bytes,
+                COMPILED_LIMITS.max_file_bytes,
+            ),
+            (
+                "maxFiles",
+                u64::from(self.max_files),
+                u64::from(COMPILED_LIMITS.max_files),
+            ),
+            (
+                "maxJsonDepth",
+                u64::from(self.max_json_depth),
+                u64::from(COMPILED_LIMITS.max_json_depth),
+            ),
+            (
+                "maxTokens",
+                u64::from(self.max_tokens),
+                u64::from(COMPILED_LIMITS.max_tokens),
+            ),
+            (
+                "maxReferences",
+                u64::from(self.max_references),
+                u64::from(COMPILED_LIMITS.max_references),
+            ),
+            (
+                "maxReferenceDepth",
+                u64::from(self.max_reference_depth),
+                u64::from(COMPILED_LIMITS.max_reference_depth),
+            ),
+            (
+                "maxResolverNodes",
+                u64::from(self.max_resolver_nodes),
+                u64::from(COMPILED_LIMITS.max_resolver_nodes),
+            ),
+            (
+                "maxProfiles",
+                u64::from(self.max_profiles),
+                u64::from(COMPILED_LIMITS.max_profiles),
+            ),
+            (
+                "maxOutputBytes",
+                self.max_output_bytes,
+                COMPILED_LIMITS.max_output_bytes,
+            ),
+            (
+                "maxDiagnostics",
+                u64::from(self.max_diagnostics),
+                u64::from(COMPILED_LIMITS.max_diagnostics),
+            ),
+        ] {
+            if value == 0 || value > compiled {
+                return Err(ThemeError::Config(format!(
+                    "limits.{name} must be within 1..={compiled}"
+                )));
+            }
+        }
+        Ok(())
     }
 }

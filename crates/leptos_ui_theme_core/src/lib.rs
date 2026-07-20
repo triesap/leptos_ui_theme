@@ -3,8 +3,11 @@
 
 mod color;
 mod contract;
+mod diagnostic;
+mod identity;
 mod kit;
 mod model;
+mod path;
 mod resolver;
 
 pub use color::{Srgb, parse_color, validate_contrast};
@@ -12,12 +15,18 @@ pub use contract::{
     ContractCompatibility, ContrastCheck, ContrastKind, Deprecation, KitTokenContract, TokenDomain,
     TokenMapping, canonical_contract_digest,
 };
+pub use diagnostic::{
+    Diagnostic, DiagnosticCode, ErrorCategory, JsonPointer, RelatedLocation, Severity,
+    SourceLocation,
+};
+pub use identity::{AbiVersion, ContractId, ContractRevision, Sha256Digest, ThemeId, TokenPath};
 pub use kit::{KitCapability, KitLock, VerifiedKit, discover_kit};
 pub use model::{
     AxesConfig, AxisConfig, BootstrapConfig, BootstrapMode, ColorScheme, ExternalBootstrap,
     HtmlConfig, KitConfig, Limits, Outputs, Profile, Profiles, ProjectConfig, SeededOutputs,
     Selectors, SystemProfile, validate_theme_id,
 };
+pub use path::{LogicalPath, validate_relative_path};
 pub use resolver::{ResolvedProfile, ResolvedToken, ThemeCompiler};
 
 use sha2::{Digest, Sha256};
@@ -54,6 +63,32 @@ pub enum ThemeError {
     Resolution(String),
     #[error("unsafe path: {0}")]
     Security(String),
+}
+
+impl ThemeError {
+    #[must_use]
+    pub fn category(&self) -> ErrorCategory {
+        match self {
+            Self::Io { .. } => ErrorCategory::Internal,
+            Self::Json { .. } => ErrorCategory::Dtcg,
+            Self::Config(_) => ErrorCategory::Config,
+            Self::Contract(_) => ErrorCategory::Contract,
+            Self::Resolution(_) => ErrorCategory::Validation,
+            Self::Security(_) => ErrorCategory::Security,
+        }
+    }
+
+    #[must_use]
+    pub fn diagnostic_code(&self) -> &'static str {
+        match self {
+            Self::Io { .. } => "LUT0070",
+            Self::Json { .. } => "LUT0301",
+            Self::Config(_) => "LUT0300",
+            Self::Contract(_) => "LUT0600",
+            Self::Resolution(_) => "LUT0302",
+            Self::Security(_) => "LUT0500",
+        }
+    }
 }
 
 pub(crate) fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, ThemeError> {
