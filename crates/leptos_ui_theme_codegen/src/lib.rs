@@ -1441,7 +1441,7 @@ pub struct ThemeMetadata {
         ));
     }
     output.push('\n');
-    output.push_str("pub const THEME_IDS: &[ThemeId] = &[\n");
+    output.push_str("#[rustfmt::skip]\npub const THEME_IDS: &[ThemeId] = &[\n");
     for profile in profiles {
         output.push_str(&format!("    {},\n", theme_constant(&profile.id)));
     }
@@ -1781,7 +1781,7 @@ fn profile<'a>(
 mod tests {
     use super::{
         CssMode, GeneratedArtifact, apply_artifacts, bootstrap_script, csp_source, generate_css,
-        serialize_css,
+        generate_rust, serialize_css,
     };
     use leptos_ui_theme_core::{
         ColorScheme, ProjectConfig, ResolvedProfile, ResolvedToken, TokenDomain, format_css_number,
@@ -2000,6 +2000,28 @@ mod tests {
         assert!(source.starts_with("'sha256-"));
         assert!(source.ends_with('\''));
         assert_eq!(source.len(), "'sha256-'".len() + 44);
+    }
+
+    #[test]
+    fn generated_profile_inventory_preserves_generator_owned_formatting() {
+        let config = ProjectConfig::default();
+        let profiles = config
+            .profiles
+            .named
+            .iter()
+            .map(|profile| ResolvedProfile {
+                id: profile.id.clone(),
+                label: profile.label.clone(),
+                color_scheme: profile.color_scheme,
+                values: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+
+        let rust = generate_rust(&config, &profiles);
+
+        assert!(rust.contains(
+            "#[rustfmt::skip]\npub const THEME_IDS: &[ThemeId] = &[\n    THEME_LIGHT,\n    THEME_DARK,\n];"
+        ));
     }
 
     #[test]
