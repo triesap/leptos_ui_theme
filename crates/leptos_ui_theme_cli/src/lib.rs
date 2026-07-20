@@ -283,9 +283,13 @@ fn init(start: &Path, dry_run: bool) -> Result<Outcome, CliError> {
         }
         let artifacts = files
             .iter()
-            .map(|(path, bytes)| GeneratedArtifact {
-                path: path.clone(),
-                bytes: bytes.clone(),
+            .enumerate()
+            .map(|(index, (path, bytes))| {
+                if index < 4 {
+                    GeneratedArtifact::user_authored(path.clone(), bytes.clone())
+                } else {
+                    GeneratedArtifact::seeded(path.clone(), bytes.clone())
+                }
             })
             .collect::<Vec<_>>();
         apply_artifacts(&root, &artifacts)?;
@@ -449,10 +453,7 @@ fn add_command(
     if !dry_run {
         let artifacts = files
             .iter()
-            .map(|(path, bytes)| GeneratedArtifact {
-                path: path.clone(),
-                bytes: bytes.clone(),
-            })
+            .map(|(path, bytes)| GeneratedArtifact::user_authored(path.clone(), bytes.clone()))
             .collect::<Vec<_>>();
         apply_artifacts(root, &artifacts)?;
     }

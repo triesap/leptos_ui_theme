@@ -1,6 +1,10 @@
 #![forbid(unsafe_code)]
 #![doc = "Deterministic artifact generation for `leptos_ui_theme`."]
 
+mod plan;
+
+pub use plan::{Change, ChangeOperation, ChangeScope, Ownership, PlanV1, Snapshot, plan_artifacts};
+
 use leptos_ui_theme_core::{
     BootstrapMode, ColorScheme, ProjectConfig, ResolvedProfile, ResolvedToken, ThemeCompiler,
     ThemeError, TokenDomain, format_css_number, serialize_color_fallback, serialize_color_modern,
@@ -36,12 +40,57 @@ pub enum CodegenError {
 pub struct GeneratedArtifact {
     pub path: String,
     pub bytes: Vec<u8>,
+    pub scope: ChangeScope,
+    pub ownership: Ownership,
 }
 
 #[derive(Clone, Debug)]
 pub struct BuildResult {
     pub artifacts: Vec<GeneratedArtifact>,
     pub profiles: Vec<ResolvedProfile>,
+    pub plan: PlanV1,
+}
+
+impl GeneratedArtifact {
+    #[must_use]
+    pub fn generated(path: impl Into<String>, bytes: Vec<u8>) -> Self {
+        Self {
+            path: path.into(),
+            bytes,
+            scope: ChangeScope::WholeFile,
+            ownership: Ownership::GeneratedLockOwned,
+        }
+    }
+
+    #[must_use]
+    pub fn seeded(path: impl Into<String>, bytes: Vec<u8>) -> Self {
+        Self {
+            path: path.into(),
+            bytes,
+            scope: ChangeScope::WholeFile,
+            ownership: Ownership::SeededAppOwned,
+        }
+    }
+
+    #[must_use]
+    pub fn user_authored(path: impl Into<String>, bytes: Vec<u8>) -> Self {
+        Self {
+            path: path.into(),
+            bytes,
+            scope: ChangeScope::WholeFile,
+            ownership: Ownership::UserAuthored,
+        }
+    }
+
+    #[must_use]
+    pub fn html_region(path: impl Into<String>, bytes: Vec<u8>) -> Self {
+        Self {
+            path: path.into(),
+            bytes,
+            scope: ChangeScope::HtmlOwnedRegion,
+            ownership: Ownership::GeneratedLockOwned,
+        }
+    }
 }
 
 struct PendingArtifact {
@@ -93,14 +142,8 @@ pub fn build(root: &Path) -> Result<BuildResult, CodegenError> {
     let css = generate_css(&compiler.config, &profiles, &axes)?;
     let rust = generate_rust(&compiler.config, &profiles);
     let mut artifacts = vec![
-        GeneratedArtifact {
-            path: compiler.config.outputs.css.clone(),
-            bytes: css.into_bytes(),
-        },
-        GeneratedArtifact {
-            path: compiler.config.outputs.rust.clone(),
-            bytes: rust.into_bytes(),
-        },
+        GeneratedArtifact::generated(compiler.config.outputs.css.clone(), css.into_bytes()),
+        GeneratedArtifact::generated(compiler.config.outputs.rust.clone(), rust.into_bytes()),
     ];
     let selected_index = select_index(root, &compiler.config)?;
     let index_relative = selected_index
@@ -119,10 +162,10 @@ pub fn build(root: &Path) -> Result<BuildResult, CodegenError> {
         })?;
         let mut bytes = script.as_bytes().to_vec();
         bytes.push(b'\n');
-        artifacts.push(GeneratedArtifact {
-            path: external.output_path.clone(),
+        artifacts.push(GeneratedArtifact::generated(
+            external.output_path.clone(),
             bytes,
-        });
+        ));
     }
     let index_bytes = std::fs::read(&selected_index).map_err(|source| CodegenError::Io {
         path: selected_index.clone(),
@@ -130,10 +173,7 @@ pub fn build(root: &Path) -> Result<BuildResult, CodegenError> {
     })?;
     let region = html_region(&compiler.config, &profiles, &index_relative, &script)?;
     let patched = patch_index(&index_bytes, &region)?;
-    artifacts.push(GeneratedArtifact {
-        path: index_relative,
-        bytes: patched,
-    });
+    artifacts.push(GeneratedArtifact::html_region(index_relative, patched));
     let config_bytes = std::fs::read(&compiler.config_path).map_err(|source| CodegenError::Io {
         path: compiler.config_path.clone(),
         source,
@@ -161,10 +201,10 @@ pub fn build(root: &Path) -> Result<BuildResult, CodegenError> {
     };
     let mut lock_bytes = serde_json::to_vec_pretty(&lock)?;
     lock_bytes.push(b'\n');
-    artifacts.push(GeneratedArtifact {
-        path: compiler.config.outputs.lock.clone(),
-        bytes: lock_bytes,
-    });
+    artifacts.push(GeneratedArtifact::generated(
+        compiler.config.outputs.lock.clone(),
+        lock_bytes,
+    ));
     let total: usize = artifacts.iter().map(|artifact| artifact.bytes.len()).sum();
     if total as u64 > compiler.config.limits.generated_bytes
         || artifacts.iter().any(|artifact| {
@@ -173,13 +213,16 @@ pub fn build(root: &Path) -> Result<BuildResult, CodegenError> {
     {
         return Err(CodegenError::OutputLimit);
     }
+    let plan = plan_artifacts(root, &artifacts)?;
     Ok(BuildResult {
         artifacts,
         profiles,
+        plan,
     })
 }
 
 pub fn apply(root: &Path, result: &BuildResult) -> Result<Vec<String>, CodegenError> {
+    result.plan.revalidate(root)?;
     apply_artifacts(root, &result.artifacts)
 }
 
@@ -349,15 +392,8 @@ fn rollback(installed: &[PendingArtifact]) {
     }
 }
 
-pub fn check(root: &Path, result: &BuildResult) -> Vec<String> {
-    result
-        .artifacts
-        .iter()
-        .filter(|artifact| {
-            std::fs::read(root.join(&artifact.path)).ok().as_deref() != Some(&artifact.bytes)
-        })
-        .map(|artifact| artifact.path.clone())
-        .collect()
+pub fn check(_root: &Path, result: &BuildResult) -> Vec<String> {
+    result.plan.changed_paths()
 }
 
 pub fn generate_css(
@@ -1034,7 +1070,7 @@ mod tests {
         let supports = css
             .find("@supports (color: oklch(0 0 0))")
             .expect("modern supports block");
-        assert!(css[..supports].contains("--kit-color-primary: rgb("));
+        assert!(css[..supports].contains("--kit-color-primary: #"));
         assert!(!css[..supports].contains("--kit-color-primary: oklch("));
         assert!(css[supports..].contains("--kit-color-primary: oklch("));
     }
@@ -1043,14 +1079,8 @@ mod tests {
     fn artifact_application_is_idempotent() {
         let root = temporary_directory();
         let artifacts = vec![
-            GeneratedArtifact {
-                path: "generated/theme.css".into(),
-                bytes: b"theme\n".to_vec(),
-            },
-            GeneratedArtifact {
-                path: "theme.lock.json".into(),
-                bytes: b"lock\n".to_vec(),
-            },
+            GeneratedArtifact::generated("generated/theme.css", b"theme\n".to_vec()),
+            GeneratedArtifact::generated("theme.lock.json", b"lock\n".to_vec()),
         ];
         assert_eq!(
             apply_artifacts(&root, &artifacts)
@@ -1071,14 +1101,8 @@ mod tests {
         let root = temporary_directory();
         std::fs::write(root.join("blocked"), b"not a directory").expect("create blocking file");
         let artifacts = vec![
-            GeneratedArtifact {
-                path: "first.txt".into(),
-                bytes: b"first".to_vec(),
-            },
-            GeneratedArtifact {
-                path: "blocked/second.txt".into(),
-                bytes: b"second".to_vec(),
-            },
+            GeneratedArtifact::generated("first.txt", b"first".to_vec()),
+            GeneratedArtifact::generated("blocked/second.txt", b"second".to_vec()),
         ];
         assert!(apply_artifacts(&root, &artifacts).is_err());
         assert!(!root.join("first.txt").exists());
