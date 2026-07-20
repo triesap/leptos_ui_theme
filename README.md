@@ -1,12 +1,13 @@
 # leptos_ui_theme
 
-`leptos_ui_theme` is a source-first design-token compiler and CLI for Leptos
-applications built with `leptos_ui_kit`. It validates local DTCG 2025.10 token
-and resolver files against an installed kit contract, then generates
-deterministic CSS, Rust theme metadata, first-paint bootstrap code, HTML
-integration, and a lock file.
+`leptos_ui_theme` is a design-token compiler and CLI for Leptos applications
+built with `leptos_ui_kit`. It validates local DTCG 2025.10 token and resolver
+files against the installed UI kit, then generates CSS, Rust theme metadata,
+first-paint code, HTML integration, and a project lock file.
 
-Install the CLI and initialize it from an application directory:
+## Quick start
+
+Run these commands from the application directory:
 
 ```text
 leptos_ui_theme init
@@ -16,30 +17,17 @@ leptos_ui_theme check
 leptos_ui_theme doctor --strict
 ```
 
-`build` is deterministic and idempotent. `check`, `list`, `explain`, and
-`doctor --strict` inspect the project without writing. The tool never edits
-kit-owned files or application dependencies.
+`build` produces the same output for the same inputs and is safe to repeat.
+`check`, `list`, `explain`, and `doctor --strict` inspect the project without
+writing. The CLI does not edit kit-owned files or application dependencies.
 
 ## Leptos render modes
 
-Generated theme source is render-mode neutral. Final applications select CSR,
-hydration, or SSR without the theme dependency plan forcing CSR. The `leptos`
-and `web_ui_primitives` declarations must select the same one delivery feature
-(`csr`, `hydrate`, or `ssr`); a shared-library consumer selects none.
-
-The first-paint compiler owns one canonical bootstrap script semantics with
-two security projections: an exact hash-authorized CSR snippet and a
-per-response nonce template for SSR. Hydration must attach to deterministic
-server component state before adopting the browser bootstrap outcome. Stored
-theme selection may change document colors before hydration, but it must not
-rewrite the component DOM being hydrated. The generated controller therefore
-starts from the deterministic system/light server state and adopts storage,
-the first-paint transfer record, document attributes, and browser listeners in
-a post-hydration effect.
-
-Runtime issue state describes the latest completed browser operation. A
-successful retry clears a stale prior issue; apply and persistence are both
-attempted, and a persistence error takes precedence when both fail.
+Generated theme code supports CSR, hydration, and SSR. The `leptos` and
+`web_ui_primitives` dependencies must select the same delivery feature: `csr`,
+`hydrate`, or `ssr`. Shared libraries select no delivery feature. Browser theme
+preferences are applied after hydration so the server and browser start from
+the same rendered state.
 
 ## Contributing
 
