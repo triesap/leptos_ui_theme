@@ -81,6 +81,33 @@ pub enum TokenDomain {
     Structural,
 }
 
+#[cfg(test)]
+mod domain_tests {
+    use super::TokenDomain;
+
+    #[test]
+    fn token_domain_is_the_closed_v1_vocabulary() {
+        let names = [
+            "theme",
+            "density",
+            "motion",
+            "contrast",
+            "typography",
+            "structural",
+        ];
+        for name in names {
+            let domain: TokenDomain = serde_json::from_str(&format!("\"{name}\"")).unwrap();
+            assert_eq!(
+                serde_json::to_string(&domain).unwrap(),
+                format!("\"{name}\"")
+            );
+        }
+        for unknown in ["brand", "system", "future"] {
+            assert!(serde_json::from_str::<TokenDomain>(&format!("\"{unknown}\"")).is_err());
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ContractCompatibility {

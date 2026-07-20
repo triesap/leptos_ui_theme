@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 #![doc = "Core models, validation, and token resolution for `leptos_ui_theme`."]
 
+mod budget;
 mod color;
 mod contract;
 mod diagnostic;
@@ -12,6 +13,7 @@ mod path;
 mod resolver;
 mod source;
 
+pub use budget::{LimitKind, ResourceBudget};
 pub use color::{
     NormalizedColor, Oklch, Srgb, format_css_number, normalize_color, parse_color,
     serialize_color_fallback, serialize_color_modern, validate_contrast,
@@ -21,14 +23,18 @@ pub use contract::{
     TokenMapping, canonical_contract_digest,
 };
 pub use diagnostic::{
-    Diagnostic, DiagnosticCode, ErrorCategory, JsonPointer, RelatedLocation, Severity,
+    Diagnostic, DiagnosticCode, DiagnosticCollector, DiagnosticLocation, DiagnosticRedirect,
+    ErrorCategory, JsonPointer, ProvenanceEntry, ProvenanceOperation, RelatedLocation, Severity,
     SourceLocation,
 };
 pub use dtcg::{
     DtcgType, alias_target as dtcg_alias_target, expand_group_extends, validate_extensions,
     validate_reserved_members, validate_token_value,
 };
-pub use identity::{AbiVersion, ContractId, ContractRevision, Sha256Digest, ThemeId, TokenPath};
+pub use identity::{
+    AbiVersion, ContractId, ContractRevision, FileIdentity, IdentityPlatform, Sha256Digest,
+    ThemeId, TokenPath,
+};
 pub use kit::{
     INSTALLED_KIT_CAPABILITY_SCHEMA, InstalledKitCapability, InstalledKitCapabilityRecord,
     KitCapability, VerifiedKit, discover_kit,
@@ -55,6 +61,7 @@ pub const PROJECT_SCHEMA: &str =
 
 /// Errors emitted before any output is written.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ThemeError {
     #[error("cannot read {path}: {source}")]
     Io {
@@ -76,6 +83,12 @@ pub enum ThemeError {
     Resolution(String),
     #[error("unsafe path: {0}")]
     Security(String),
+    #[error("resource limit `{resource}` exceeded: observed {observed}, limit {limit}")]
+    Limit {
+        resource: &'static str,
+        limit: u64,
+        observed: u64,
+    },
 }
 
 impl ThemeError {
@@ -83,10 +96,10 @@ impl ThemeError {
     pub fn category(&self) -> ErrorCategory {
         match self {
             Self::Io { .. } => ErrorCategory::Internal,
-            Self::Json { .. } => ErrorCategory::Dtcg,
-            Self::Config(_) => ErrorCategory::Config,
+            Self::Json { .. } | Self::Config(_) | Self::Resolution(_) | Self::Limit { .. } => {
+                ErrorCategory::Validation
+            }
             Self::Contract(_) => ErrorCategory::Contract,
-            Self::Resolution(_) => ErrorCategory::Validation,
             Self::Security(_) => ErrorCategory::Security,
         }
     }
@@ -100,6 +113,7 @@ impl ThemeError {
             Self::Contract(_) => "LUT0600",
             Self::Resolution(_) => "LUT0302",
             Self::Security(_) => "LUT0500",
+            Self::Limit { .. } => "LUT0303",
         }
     }
 }

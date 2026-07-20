@@ -1,4 +1,5 @@
 use crate::ThemeError;
+use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 
@@ -130,7 +131,7 @@ impl<'de> Deserialize<'de> for ContractId {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct AbiVersion(u32);
 
@@ -149,7 +150,16 @@ impl AbiVersion {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+impl<'de> Deserialize<'de> for AbiVersion {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(u32::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct ContractRevision(u32);
 
@@ -167,6 +177,15 @@ impl ContractRevision {
     #[must_use]
     pub fn get(self) -> u32 {
         self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for ContractRevision {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(u32::deserialize(deserializer)?).map_err(serde::de::Error::custom)
     }
 }
 
@@ -214,5 +233,119 @@ impl<'de> Deserialize<'de> for Sha256Digest {
     {
         let value = String::deserialize(deserializer)?;
         Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IdentityPlatform {
+    Unix,
+    Windows,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct FileIdentity {
+    platform: IdentityPlatform,
+    volume_id: String,
+    file_id: String,
+}
+
+impl FileIdentity {
+    pub fn new(
+        platform: IdentityPlatform,
+        volume_id: impl Into<String>,
+        file_id: impl Into<String>,
+    ) -> Result<Self, ThemeError> {
+        let volume_id = volume_id.into();
+        let file_id = file_id.into();
+        if !valid_identity_hex(&volume_id) || !valid_identity_hex(&file_id) {
+            return Err(ThemeError::Security("invalid opened-file identity".into()));
+        }
+        Ok(Self {
+            platform,
+            volume_id,
+            file_id,
+        })
+    }
+
+    #[must_use]
+    pub fn platform(&self) -> IdentityPlatform {
+        self.platform
+    }
+
+    #[must_use]
+    pub fn volume_id(&self) -> &str {
+        &self.volume_id
+    }
+
+    #[must_use]
+    pub fn file_id(&self) -> &str {
+        &self.file_id
+    }
+}
+
+impl Serialize for FileIdentity {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("FileIdentity", 3)?;
+        state.serialize_field("platform", &self.platform)?;
+        state.serialize_field("volumeId", &self.volume_id)?;
+        state.serialize_field("fileId", &self.file_id)?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for FileIdentity {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields, rename_all = "camelCase")]
+        struct Wire {
+            platform: IdentityPlatform,
+            volume_id: String,
+            file_id: String,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        Self::new(wire.platform, wire.volume_id, wire.file_id).map_err(serde::de::Error::custom)
+    }
+}
+
+fn valid_identity_hex(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 32
+        && (value == "0" || !value.starts_with('0'))
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn positive_identities_reject_zero_during_deserialization() {
+        assert!(serde_json::from_str::<AbiVersion>("0").is_err());
+        assert!(serde_json::from_str::<ContractRevision>("0").is_err());
+    }
+
+    #[test]
+    fn file_identity_uses_the_closed_wire_shape() {
+        let identity = FileIdentity::new(IdentityPlatform::Unix, "1", "abcdef").unwrap();
+        assert_eq!(
+            serde_json::to_string(&identity).unwrap(),
+            r#"{"platform":"unix","volumeId":"1","fileId":"abcdef"}"#
+        );
+        assert!(
+            serde_json::from_str::<FileIdentity>(
+                r#"{"platform":"unix","volumeId":"01","fileId":"2"}"#
+            )
+            .is_err()
+        );
     }
 }

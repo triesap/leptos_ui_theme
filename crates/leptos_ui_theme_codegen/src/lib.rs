@@ -26,6 +26,7 @@ use std::time::Duration;
 pub const HTML_INSERTION_ANCHOR: &str = "<!-- leptos-ui-theme:anchor -->";
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum CodegenError {
     #[error(transparent)]
     Core(#[from] ThemeError),

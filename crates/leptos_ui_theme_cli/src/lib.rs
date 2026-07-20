@@ -94,6 +94,7 @@ struct BuildWriteOptions {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum CliError {
     #[error("{0}")]
     Usage(String),
