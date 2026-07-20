@@ -2122,8 +2122,7 @@ fn validate_parsed_document(text: &str) -> Result<(), CodegenError> {
             "index HTML is outside the strict parser profile".into(),
         )));
     }
-    let mut elements = Vec::new();
-    collect_elements(&dom.document, &mut elements);
+    let elements = collect_elements(&dom.document);
     for forbidden in ["template", "svg", "math"] {
         if elements
             .iter()
@@ -2175,14 +2174,17 @@ fn validate_parsed_document(text: &str) -> Result<(), CodegenError> {
     Ok(())
 }
 
-fn collect_elements(node: &Handle, output: &mut Vec<Handle>) {
-    if matches!(node.data, NodeData::Element { .. }) {
-        output.push(node.clone());
+fn collect_elements(root: &Handle) -> Vec<Handle> {
+    let mut output = Vec::new();
+    let mut pending = vec![root.clone()];
+    while let Some(node) = pending.pop() {
+        if matches!(node.data, NodeData::Element { .. }) {
+            output.push(node.clone());
+        }
+        let children = node.children.borrow();
+        pending.extend(children.iter().rev().cloned());
     }
-    let children = node.children.borrow().clone();
-    for child in children {
-        collect_elements(&child, output);
-    }
+    output
 }
 
 fn element_name(node: &Handle) -> Option<&str> {
@@ -2640,6 +2642,40 @@ mod tests {
                 0o644
             );
         }
+        std::fs::remove_dir_all(root).expect("remove temporary directory");
+    }
+
+    #[test]
+    fn artifact_planning_is_byte_deterministic() {
+        let root = temporary_directory();
+        let artifacts = vec![
+            GeneratedArtifact::generated("generated/theme.css", b"theme\n".to_vec()),
+            GeneratedArtifact::generated("theme.lock.json", b"lock\n".to_vec()),
+        ];
+        let first = super::plan_artifacts(&root, &artifacts).expect("first plan");
+        let second = super::plan_artifacts(&root, &artifacts).expect("second plan");
+
+        assert_eq!(first, second);
+        std::fs::remove_dir_all(root).expect("remove temporary directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_planning_rejects_hardlinked_targets() {
+        let root = temporary_directory();
+        std::fs::write(root.join("outside.txt"), b"shared\n").expect("write shared inode");
+        std::fs::hard_link(root.join("outside.txt"), root.join("generated.txt"))
+            .expect("create hard link");
+        let artifacts = [GeneratedArtifact::generated(
+            "generated.txt",
+            b"replacement\n".to_vec(),
+        )];
+
+        assert!(super::plan_artifacts(&root, &artifacts).is_err());
+        assert_eq!(
+            std::fs::read(root.join("outside.txt")).expect("read shared inode"),
+            b"shared\n"
+        );
         std::fs::remove_dir_all(root).expect("remove temporary directory");
     }
 

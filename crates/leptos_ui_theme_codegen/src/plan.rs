@@ -1,5 +1,7 @@
 use crate::{CodegenError, GeneratedArtifact};
-use leptos_ui_theme_core::{LogicalPath, ThemeError, sha256};
+use leptos_ui_theme_core::{
+    COMPILED_LIMITS, LogicalPath, SourceLoader, SourceRole, ThemeError, sha256,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -134,8 +136,9 @@ impl PlanV1 {
     }
 
     pub fn revalidate(&self, root: &Path) -> Result<(), CodegenError> {
+        let loader = SourceLoader::new(root, COMPILED_LIMITS)?;
         for snapshot in &self.snapshots {
-            let current = snapshot_path(root, &snapshot.path)?;
+            let current = snapshot_path(root, &loader, &snapshot.path)?;
             if current != *snapshot {
                 return Err(CodegenError::Conflict(snapshot.path.clone()));
             }
@@ -168,6 +171,7 @@ pub fn plan_manifest(
     artifacts: &[GeneratedArtifact],
     manifest: &ArtifactManifest,
 ) -> Result<PlanV1, CodegenError> {
+    let loader = SourceLoader::new(root, COMPILED_LIMITS)?;
     let payloads = artifacts
         .iter()
         .map(|artifact| ((artifact.path.as_str(), artifact.scope), artifact))
@@ -181,7 +185,7 @@ pub fn plan_manifest(
     let mut snapshots = Vec::with_capacity(manifest.entries.len());
     let mut changes = Vec::new();
     for entry in &manifest.entries {
-        let snapshot = snapshot_path(root, &entry.path)?;
+        let snapshot = snapshot_path(root, &loader, &entry.path)?;
         match entry.state {
             DesiredArtifactState::Present => {
                 let artifact = payloads
@@ -219,7 +223,7 @@ pub fn plan_manifest(
                                 artifact.path
                             )));
                         }
-                        let current = read_snapshot_bytes(root, &artifact.path)?;
+                        let current = read_snapshot_bytes(&loader, &artifact.path)?;
                         let html = html_change(&current, &artifact.bytes)?;
                         (
                             html.operation,
@@ -440,14 +444,18 @@ fn hash_html_exterior(prefix: &[u8], suffix: &[u8]) -> String {
     format!("sha256:{}", sha256(&domain))
 }
 
-fn read_snapshot_bytes(root: &Path, relative: &str) -> Result<Vec<u8>, CodegenError> {
-    std::fs::read(root.join(relative)).map_err(|source| CodegenError::Io {
-        path: PathBuf::from(relative),
-        source,
-    })
+fn read_snapshot_bytes(loader: &SourceLoader, relative: &str) -> Result<Vec<u8>, CodegenError> {
+    let logical = LogicalPath::new(relative.to_owned()).map_err(CodegenError::Core)?;
+    loader
+        .read_bytes_for(&logical, SourceRole::ExistingGenerated)
+        .map_err(CodegenError::Core)
 }
 
-fn snapshot_path(root: &Path, relative: &str) -> Result<Snapshot, CodegenError> {
+fn snapshot_path(
+    root: &Path,
+    loader: &SourceLoader,
+    relative: &str,
+) -> Result<Snapshot, CodegenError> {
     let logical = LogicalPath::new(relative.to_owned()).map_err(CodegenError::Core)?;
     let path = root.join(logical.to_path_buf());
     let metadata = match std::fs::symlink_metadata(&path) {
@@ -472,10 +480,9 @@ fn snapshot_path(root: &Path, relative: &str) -> Result<Snapshot, CodegenError> 
             "planned target is not a regular file: `{relative}`"
         ))));
     }
-    let bytes = std::fs::read(&path).map_err(|source| CodegenError::Io {
-        path: PathBuf::from(relative),
-        source,
-    })?;
+    let bytes = loader
+        .read_bytes_for(&logical, SourceRole::ExistingGenerated)
+        .map_err(CodegenError::Core)?;
     Ok(Snapshot {
         path: relative.into(),
         exists: true,
