@@ -1,13 +1,11 @@
 # leptos_ui_theme
 
-`leptos_ui_theme` is a design-token compiler and CLI for Leptos applications
-built with `leptos_ui_kit`. It validates local DTCG 2025.10 token and resolver
-files against the installed UI kit, then generates CSS, Rust theme metadata,
-first-paint code, HTML integration, and a project lock file.
+`leptos_ui_theme` compiles DTCG 2025.10 design tokens for Leptos applications
+using `leptos_ui_kit`. It validates tokens against the installed kit and
+generates CSS, Rust theme data, startup theme code, HTML changes, and a lock
+file.
 
-## Quick start
-
-Run these commands from the application directory:
+## Usage
 
 ```text
 leptos_ui_theme init
@@ -17,22 +15,15 @@ leptos_ui_theme check
 leptos_ui_theme doctor --strict
 ```
 
-`build` produces the same output for the same inputs and is safe to repeat.
-`check`, `list`, `explain`, and `doctor --strict` inspect the project without
-writing. The CLI does not edit kit-owned files or application dependencies.
+Run these commands from the application directory. `build` is repeatable for
+the same inputs. `check`, `list`, `explain`, and `doctor --strict` inspect
+without writing. The CLI does not change kit files or dependencies.
 
-## Leptos render modes
+## Render modes
 
-Generated theme code supports CSR, hydration, and SSR. The `leptos` and
-`web_ui_primitives` dependencies must select the same delivery feature: `csr`,
-`hydrate`, or `ssr`. Shared libraries select no delivery feature. Browser theme
-preferences are applied after hydration so the server and browser start from
-the same rendered state.
+Generated code supports client-side rendering (`csr`), hydration (`hydrate`),
+and server-side rendering (`ssr`). Applications must enable the same render
+feature for `leptos` and `web_ui_primitives`. Shared libraries enable none.
 
-## Contributing
-
-See `CONTRIBUTING.md`.
-
-## License
-
-MIT OR Apache-2.0. See `LICENSE-MIT` and `LICENSE-APACHE`.
+See [CONTRIBUTING.md](CONTRIBUTING.md). Licensed under MIT OR Apache-2.0; see
+[LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
