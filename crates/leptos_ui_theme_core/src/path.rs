@@ -1,4 +1,4 @@
-use crate::ThemeError;
+use crate::{JsonPointer, ThemeError};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use std::path::PathBuf;
@@ -26,6 +26,46 @@ impl LogicalPath {
     #[must_use]
     pub fn to_path_buf(&self) -> PathBuf {
         PathBuf::from(&self.0)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalReference {
+    pub document: LogicalPath,
+    pub pointer: JsonPointer,
+}
+
+impl LocalReference {
+    pub fn parse(referrer: &LogicalPath, reference: &str) -> Result<Self, ThemeError> {
+        let (document, fragment) = reference
+            .split_once('#')
+            .map_or((reference, ""), |parts| parts);
+        if fragment.contains('#')
+            || document.contains(['\\', '?', '#', '%'])
+            || document.starts_with('/')
+            || document.starts_with("//")
+            || document
+                .split('/')
+                .next()
+                .is_some_and(|first| first.contains(':'))
+        {
+            return Err(ThemeError::Security(format!(
+                "unsafe local reference `{reference}`"
+            )));
+        }
+
+        let document = if document.is_empty() {
+            referrer.clone()
+        } else {
+            resolve_document(referrer, document, reference)?
+        };
+        let decoded = decode_uri_fragment(fragment)?;
+        let pointer = JsonPointer::new(decoded).map_err(|_| {
+            ThemeError::Resolution(format!(
+                "local reference has an invalid JSON Pointer: `{reference}`"
+            ))
+        })?;
+        Ok(Self { document, pointer })
     }
 }
 
@@ -116,6 +156,72 @@ fn matches_device_number(value: &str, prefix: &str) -> bool {
     )
 }
 
+fn resolve_document(
+    referrer: &LogicalPath,
+    document: &str,
+    reference: &str,
+) -> Result<LogicalPath, ThemeError> {
+    let mut components = referrer
+        .as_str()
+        .split('/')
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    components.pop();
+    for component in document.split('/') {
+        match component {
+            "" | "." => {
+                return Err(ThemeError::Security(format!(
+                    "local reference is not lexically normalized: `{reference}`"
+                )));
+            }
+            ".." => {
+                if components.pop().is_none() {
+                    return Err(ThemeError::Security(format!(
+                        "local reference escapes its root: `{reference}`"
+                    )));
+                }
+            }
+            component => components.push(component.to_owned()),
+        }
+    }
+    LogicalPath::new(components.join("/"))
+}
+
+fn decode_uri_fragment(value: &str) -> Result<String, ThemeError> {
+    let bytes = value.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            output.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        if index + 2 >= bytes.len() {
+            return Err(ThemeError::Resolution(
+                "local reference has incomplete percent encoding".into(),
+            ));
+        }
+        let high = hex_digit(bytes[index + 1])?;
+        let low = hex_digit(bytes[index + 2])?;
+        output.push((high << 4) | low);
+        index += 3;
+    }
+    String::from_utf8(output)
+        .map_err(|_| ThemeError::Resolution("local reference fragment is not UTF-8".into()))
+}
+
+fn hex_digit(value: u8) -> Result<u8, ThemeError> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        b'A'..=b'F' => Ok(value - b'A' + 10),
+        _ => Err(ThemeError::Resolution(
+            "local reference has invalid percent encoding".into(),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,5 +260,44 @@ mod tests {
         assert_eq!(exact.len(), 4_096);
         assert!(LogicalPath::new(&exact).is_ok());
         assert!(LogicalPath::new(format!("{exact}d")).is_err());
+    }
+
+    #[test]
+    fn local_references_are_referrer_relative_and_decode_fragments_once() {
+        let referrer = LogicalPath::new("config/resolver.json").unwrap();
+        let reference =
+            LocalReference::parse(&referrer, "../tokens/base..tone.json#/%24root/value").unwrap();
+        assert_eq!(reference.document.as_str(), "tokens/base..tone.json");
+        assert_eq!(reference.pointer.as_str(), "/$root/value");
+
+        let same = LocalReference::parse(&referrer, "#").unwrap();
+        assert_eq!(same.document, referrer);
+        assert_eq!(same.pointer.as_str(), "");
+    }
+
+    #[test]
+    fn local_references_reject_ambiguous_or_escaping_forms() {
+        let referrer = LogicalPath::new("resolver.json").unwrap();
+        for reference in [
+            "../outside.json",
+            "/absolute.json",
+            "C:relative.json",
+            "//server/share.json",
+            "a\\b.json",
+            "a%2fb.json",
+            "a.json?query",
+            "a.json##/x",
+            "./a.json",
+            "a//b.json",
+            "a.json#not-a-pointer",
+            "a.json#/%zz",
+            "a.json#/%ff",
+            "a.json#/bad~2escape",
+        ] {
+            assert!(
+                LocalReference::parse(&referrer, reference).is_err(),
+                "{reference}"
+            );
+        }
     }
 }

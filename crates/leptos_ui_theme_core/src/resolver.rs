@@ -1,9 +1,9 @@
 use crate::contract::{KitTokenContract, TokenDomain};
 use crate::model::{ColorScheme, Profile, ProjectConfig};
 use crate::{
-    COMPILED_LIMITS, CONFIG_FILE, DtcgType, LogicalPath, SourceLoader, ThemeError, discover_kit,
-    dtcg_alias_target, expand_group_extends, validate_contrast, validate_reserved_members,
-    validate_token_value,
+    COMPILED_LIMITS, CONFIG_FILE, DtcgType, LocalReference, LogicalPath, OpenedSource,
+    SourceLoader, SourceRole, ThemeError, discover_kit_with_loader, dtcg_alias_target,
+    expand_group_extends, validate_contrast, validate_reserved_members, validate_token_value,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -30,17 +30,17 @@ pub struct ResolvedProfile {
     pub values: Vec<ResolvedToken>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ThemeCompiler {
     pub workspace_root: PathBuf,
     pub root: PathBuf,
-    pub config_path: PathBuf,
+    pub config_source: OpenedSource,
     pub config: ProjectConfig,
-    pub kit_installation_path: PathBuf,
-    pub kit_capability_path: PathBuf,
+    pub kit_installation: OpenedSource,
+    pub kit_capability: OpenedSource,
     pub kit_capability_fingerprint: String,
-    pub contract_path: PathBuf,
-    pub kit_stylesheet_path: PathBuf,
+    pub contract_source: OpenedSource,
+    pub kit_stylesheet: OpenedSource,
     pub contract: KitTokenContract,
     loader: SourceLoader,
 }
@@ -81,28 +81,36 @@ impl ThemeCompiler {
             ));
         }
         let config_logical = LogicalPath::new(CONFIG_FILE)?;
-        let config_path = loader.resolve_file(&config_logical)?;
+        let initial_config = loader.read_source(&config_logical, SourceRole::General)?;
         let config: ProjectConfig = loader.read_json(&config_logical)?;
         config.validate()?;
-        let workspace_loader = SourceLoader::new(workspace_loader.root(), config.limits.clone())?;
-        let loader = SourceLoader::new(loader.root(), config.limits.clone())?;
-        let kit = discover_kit(workspace_loader.root(), &config.kit, config.limits.clone())?;
-        let kit_installation_path = kit.installation_path;
-        let kit_capability_path = kit.capability_path;
+        let workspace_loader = workspace_loader.relimit(config.limits.clone())?;
+        let loader = loader.relimit(config.limits.clone())?;
+        let config_source = loader.read_source(&config_logical, SourceRole::General)?;
+        if config_source.identity != initial_config.identity
+            || config_source.bytes_digest != initial_config.bytes_digest
+        {
+            return Err(ThemeError::Security(
+                "project configuration changed during initialization".into(),
+            ));
+        }
+        let kit = discover_kit_with_loader(&workspace_loader, &config.kit)?;
+        let kit_installation = kit.installation;
+        let kit_capability = kit.capability_source;
         let kit_capability_fingerprint = kit.capability_fingerprint;
-        let contract_path = kit.contract_path;
-        let kit_stylesheet_path = kit.stylesheet_path;
+        let contract_source = kit.contract_source;
+        let kit_stylesheet = kit.stylesheet_source;
         let contract = kit.contract;
         Ok(Self {
             workspace_root: workspace_loader.root().to_path_buf(),
             root: loader.root().to_path_buf(),
-            config_path,
+            config_source,
             config,
-            kit_installation_path,
-            kit_capability_path,
+            kit_installation,
+            kit_capability,
             kit_capability_fingerprint,
-            contract_path,
-            kit_stylesheet_path,
+            contract_source,
+            kit_stylesheet,
             contract,
             loader,
         })
@@ -110,7 +118,9 @@ impl ThemeCompiler {
 
     pub fn resolve(&self) -> Result<Vec<ResolvedProfile>, ThemeError> {
         let resolver_logical = LogicalPath::new(self.config.resolver.clone())?;
-        let resolver: ResolverDocument = self.loader.read_json(&resolver_logical)?;
+        let resolver: ResolverDocument = self
+            .loader
+            .read_json_for(&resolver_logical, SourceRole::TokenResolver)?;
         validate_resolver(&resolver, &self.config)?;
         self.config
             .profiles
@@ -133,7 +143,9 @@ impl ThemeCompiler {
         contexts: &[String],
     ) -> Result<Vec<ResolvedProfile>, ThemeError> {
         let resolver_logical = LogicalPath::new(self.config.resolver.clone())?;
-        let resolver: ResolverDocument = self.loader.read_json(&resolver_logical)?;
+        let resolver: ResolverDocument = self
+            .loader
+            .read_json_for(&resolver_logical, SourceRole::TokenResolver)?;
         validate_resolver(&resolver, &self.config)?;
         let base = self.config.profile(&self.config.profiles.default)?;
         contexts
@@ -156,6 +168,11 @@ impl ThemeCompiler {
                 self.resolve_profile(&profile, &resolver, &resolver_logical, Some(domain))
             })
             .collect()
+    }
+
+    #[must_use]
+    pub fn source_loader(&self) -> &SourceLoader {
+        &self.loader
     }
 
     fn resolve_profile(
@@ -352,28 +369,10 @@ fn apply_sources(
             .get("$ref")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| ThemeError::Resolution("resolver source lacks $ref".into()))?;
-        let (file_reference, pointer) = reference
-            .split_once('#')
-            .map_or((reference, None), |(file, pointer)| (file, Some(pointer)));
-        if file_reference.is_empty()
-            || Path::new(file_reference).is_absolute()
-            || file_reference.contains("..")
-            || file_reference.contains('\\')
-            || file_reference.contains(':')
-            || pointer.is_some_and(|pointer| pointer.contains('#'))
-        {
-            return Err(ThemeError::Security(format!(
-                "unsafe resolver reference `{reference}`"
-            )));
-        }
-        let base = Path::new(resolver_path.as_str())
-            .parent()
-            .unwrap_or_else(|| Path::new(""));
-        let joined = base.join(file_reference);
-        let joined = joined.to_str().ok_or_else(|| {
-            ThemeError::Security(format!("resolver reference is not UTF-8: `{reference}`"))
-        })?;
-        let logical = LogicalPath::new(joined.to_owned())?;
+        let LocalReference {
+            document: logical,
+            pointer,
+        } = LocalReference::parse(resolver_path, reference)?;
         let token_root = LogicalPath::new(config.token_root.clone())?;
         if logical.as_str() != token_root.as_str()
             && !logical
@@ -384,23 +383,17 @@ fn apply_sources(
                 "resolver reference escapes the token root: `{reference}`"
             )));
         }
-        let value: serde_json::Value = loader.read_json(&logical)?;
+        let value: serde_json::Value = loader.read_json_for(&logical, SourceRole::TokenResolver)?;
         let value = expand_group_extends(&value)?;
-        let value = match pointer {
-            Some("") | None => &value,
-            Some(pointer) => {
-                let pointer = decode_uri_fragment(pointer)?;
-                if !pointer.starts_with('/') {
-                    return Err(ThemeError::Resolution(format!(
-                        "JSON Pointer fragment must be empty or start with `/`: `#{pointer}`"
-                    )));
-                }
-                value.pointer(&pointer).ok_or_else(|| {
-                    ThemeError::Resolution(format!(
-                        "unknown JSON Pointer `#{pointer}` in `{file_reference}`"
-                    ))
-                })?
-            }
+        let value = if pointer.as_str().is_empty() {
+            &value
+        } else {
+            value.pointer(pointer.as_str()).ok_or_else(|| {
+                ThemeError::Resolution(format!(
+                    "unknown JSON Pointer `#{}` in `{logical}`",
+                    pointer.as_str()
+                ))
+            })?
         };
         let mut flattened = BTreeMap::new();
         flatten_tokens(value, None, "", Path::new(logical.as_str()), &mut flattened)?;
@@ -414,41 +407,6 @@ fn apply_sources(
         raw.extend(flattened);
     }
     Ok(())
-}
-
-fn decode_uri_fragment(value: &str) -> Result<String, ThemeError> {
-    let bytes = value.as_bytes();
-    let mut output = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] != b'%' {
-            output.push(bytes[index]);
-            index += 1;
-            continue;
-        }
-        if index + 2 >= bytes.len() {
-            return Err(ThemeError::Resolution(
-                "JSON Pointer fragment has incomplete percent encoding".into(),
-            ));
-        }
-        let high = hex_digit(bytes[index + 1])?;
-        let low = hex_digit(bytes[index + 2])?;
-        output.push((high << 4) | low);
-        index += 3;
-    }
-    String::from_utf8(output)
-        .map_err(|_| ThemeError::Resolution("JSON Pointer fragment is not UTF-8".into()))
-}
-
-fn hex_digit(value: u8) -> Result<u8, ThemeError> {
-    match value {
-        b'0'..=b'9' => Ok(value - b'0'),
-        b'a'..=b'f' => Ok(value - b'a' + 10),
-        b'A'..=b'F' => Ok(value - b'A' + 10),
-        _ => Err(ThemeError::Resolution(
-            "JSON Pointer fragment has invalid percent encoding".into(),
-        )),
-    }
 }
 
 fn flatten_tokens(

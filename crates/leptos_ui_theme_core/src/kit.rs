@@ -1,7 +1,10 @@
 use crate::model::KitConfig;
-use crate::{KitTokenContract, Limits, LogicalPath, SourceLoader, ThemeError, sha256};
+use crate::{
+    KitTokenContract, Limits, LogicalPath, OpenedSource, SourceLoader, SourceRole, ThemeError,
+    sha256,
+};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 const LAYER_ORDER: [&str; 3] = [
     "leptos-ui-kit.tokens",
@@ -13,10 +16,10 @@ pub const INSTALLED_KIT_CAPABILITY_SCHEMA: &str =
 
 #[derive(Clone, Debug)]
 pub struct VerifiedKit {
-    pub installation_path: PathBuf,
-    pub contract_path: PathBuf,
-    pub capability_path: PathBuf,
-    pub stylesheet_path: PathBuf,
+    pub installation: OpenedSource,
+    pub contract_source: OpenedSource,
+    pub capability_source: OpenedSource,
+    pub stylesheet_source: OpenedSource,
     pub capability_fingerprint: String,
     pub capability: KitCapability,
     pub contract: KitTokenContract,
@@ -131,10 +134,17 @@ pub fn discover_kit(
     limits: Limits,
 ) -> Result<VerifiedKit, ThemeError> {
     let loader = SourceLoader::new(root, limits)?;
+    discover_kit_with_loader(&loader, config)
+}
+
+pub fn discover_kit_with_loader(
+    loader: &SourceLoader,
+    config: &KitConfig,
+) -> Result<VerifiedKit, ThemeError> {
     let mut candidates = Vec::new();
     let mut failures = Vec::new();
     for lock_path in &config.lock_paths {
-        match verify_candidate(&loader, lock_path, config.contract_path.as_deref()) {
+        match verify_candidate(loader, lock_path, config.contract_path.as_deref()) {
             Ok(candidate) => candidates.push(candidate),
             Err(error) => failures.push(format!("{lock_path}: {error}")),
         }
@@ -180,11 +190,12 @@ fn verify_candidate(
     verify_digest(loader, &stylesheet_logical, &record.stylesheet_bytes_digest)?;
     let capability: KitCapability = loader.read_json(&capability_logical)?;
     verify_capability(&capability, record, &capability_logical)?;
-    let contract_path = loader.resolve_file(&contract_logical)?;
-    let capability_path = loader.resolve_file(&capability_logical)?;
-    let stylesheet_path = loader.resolve_file(&stylesheet_logical)?;
-    let installation_path = loader.resolve_file(&installation_logical)?;
-    let contract = KitTokenContract::load(&contract_path)?;
+    let contract_source = loader.read_source(&contract_logical, SourceRole::General)?;
+    let capability_source = loader.read_source(&capability_logical, SourceRole::General)?;
+    let stylesheet_source = loader.read_source(&stylesheet_logical, SourceRole::General)?;
+    let installation = loader.read_source(&installation_logical, SourceRole::General)?;
+    let contract_value = loader.read_json(&contract_logical)?;
+    let contract = KitTokenContract::from_value(contract_value)?;
     if contract.contract_id != record.contract_id
         || contract.abi_version != record.contract_abi_version
         || contract.revision != record.contract_revision
@@ -197,10 +208,10 @@ fn verify_candidate(
         ));
     }
     Ok(VerifiedKit {
-        installation_path,
-        contract_path,
-        capability_path,
-        stylesheet_path,
+        installation,
+        contract_source,
+        capability_source,
+        stylesheet_source,
         capability_fingerprint: capability_fingerprint(&capability)?,
         capability,
         contract,

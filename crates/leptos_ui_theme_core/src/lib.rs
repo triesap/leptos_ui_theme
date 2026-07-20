@@ -38,7 +38,7 @@ pub use identity::{
 };
 pub use kit::{
     INSTALLED_KIT_CAPABILITY_SCHEMA, InstalledKitCapability, InstalledKitCapabilityRecord,
-    KitCapability, VerifiedKit, discover_kit,
+    KitCapability, VerifiedKit, discover_kit, discover_kit_with_loader,
 };
 pub use model::{
     AxesConfig, AxisConfig, BootstrapConfig, BootstrapMode, COMPILED_LIMITS, ColorScheme,
@@ -46,9 +46,9 @@ pub use model::{
     RuntimeEvidenceConfig, SeededOutputs, SelectionAxis, Selectors, SystemProfile,
     validate_theme_id,
 };
-pub use path::{LogicalPath, validate_relative_path};
+pub use path::{LocalReference, LogicalPath, validate_relative_path};
 pub use resolver::{ResolvedProfile, ResolvedToken, ThemeCompiler};
-pub use source::SourceLoader;
+pub use source::{OpenedSource, SourceLoader, SourceRole};
 
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};

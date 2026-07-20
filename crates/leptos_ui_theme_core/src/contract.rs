@@ -119,9 +119,19 @@ pub enum ContractCompatibility {
 impl KitTokenContract {
     pub fn load(path: &Path) -> Result<Self, ThemeError> {
         let value: serde_json::Value = read_json(path)?;
+        Self::from_value(value).map_err(|error| match error {
+            ThemeError::Json { source, .. } => ThemeError::Json {
+                path: path.to_path_buf(),
+                source,
+            },
+            other => other,
+        })
+    }
+
+    pub fn from_value(value: serde_json::Value) -> Result<Self, ThemeError> {
         let contract: Self =
             serde_json::from_value(value.clone()).map_err(|source| ThemeError::Json {
-                path: path.to_path_buf(),
+                path: Path::new("token-contract.json").to_path_buf(),
                 source,
             })?;
         contract.validate()?;

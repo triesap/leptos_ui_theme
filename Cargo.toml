@@ -20,6 +20,8 @@ unsafe_code = "forbid"
 
 [workspace.dependencies]
 clap = { version = "4.5.50", features = ["derive"] }
+cap-fs-ext = "4.0.2"
+cap-std = "4.0.2"
 fs2 = "0.4.3"
 getrandom = "0.3.4"
 indexmap = { version = "2.14.0", features = ["serde"] }

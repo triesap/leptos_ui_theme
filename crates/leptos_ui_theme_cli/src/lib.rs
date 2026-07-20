@@ -9,7 +9,8 @@ use leptos_ui_theme_codegen::{
     default_dependency_records, plan_artifacts, seeded_controller, seeded_module, seeded_scope,
 };
 use leptos_ui_theme_core::{
-    CONFIG_FILE, KitConfig, Profile, ProjectConfig, ThemeCompiler, ThemeError, discover_kit,
+    CONFIG_FILE, KitConfig, LogicalPath, Profile, ProjectConfig, SourceLoader, SourceRole,
+    ThemeCompiler, ThemeError, discover_kit,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -606,12 +607,12 @@ fn write_scratch_file(root: &Path, relative: &str, bytes: &[u8]) -> Result<(), C
 fn copy_init_inputs(root: &Path, scratch: &Path, config: &ProjectConfig) -> Result<(), CliError> {
     let verified = discover_kit(root, &config.kit, config.limits.clone())?;
     for source in [
-        &verified.installation_path,
-        &verified.contract_path,
-        &verified.capability_path,
-        &verified.stylesheet_path,
+        &verified.installation,
+        &verified.contract_source,
+        &verified.capability_source,
+        &verified.stylesheet_source,
     ] {
-        copy_init_input(root, scratch, source)?;
+        write_scratch_file(scratch, source.logical_path.as_str(), source.bytes.as_ref())?;
     }
     let capability_path = config
         .kit
@@ -625,10 +626,7 @@ fn copy_init_inputs(root: &Path, scratch: &Path, config: &ProjectConfig) -> Resu
             discover_kit(root, &candidate_config, config.limits.clone()).is_ok()
         })
         .ok_or_else(|| ThemeError::Contract("valid kit capability path disappeared".into()))?;
-    if !verified
-        .installation_path
-        .ends_with(Path::new(capability_path))
-    {
+    if verified.installation.logical_path.as_str() != capability_path {
         return Err(ThemeError::Contract(
             "selected installed kit capability path changed during initialization".into(),
         )
@@ -646,33 +644,15 @@ fn copy_init_inputs(root: &Path, scratch: &Path, config: &ProjectConfig) -> Resu
                 .flat_map(|paths| paths.iter()),
         )
         .collect::<Vec<_>>();
+    let loader = SourceLoader::new(root, config.limits.clone())?;
     for relative in index_paths {
-        let source = root.join(relative);
-        if source.is_file() {
-            copy_init_input(root, scratch, &source)?;
+        if root.join(relative).is_file() {
+            let logical = LogicalPath::new(relative.clone())?;
+            let source = loader.read_source(&logical, SourceRole::General)?;
+            write_scratch_file(scratch, relative, source.bytes.as_ref())?;
         }
     }
     Ok(())
-}
-
-fn copy_init_input(root: &Path, scratch: &Path, source: &Path) -> Result<(), CliError> {
-    let relative = source.strip_prefix(root).map_err(|_| {
-        ThemeError::Security(format!(
-            "initialization input is outside the project: {}",
-            source.display()
-        ))
-    })?;
-    let relative = relative.to_str().ok_or_else(|| {
-        ThemeError::Security(format!(
-            "initialization input is not UTF-8: {}",
-            source.display()
-        ))
-    })?;
-    let bytes = std::fs::read(source).map_err(|source_error| CliError::Io {
-        path: source.to_path_buf(),
-        source: source_error,
-    })?;
-    write_scratch_file(scratch, relative, &bytes)
 }
 
 fn build_command(

@@ -13,9 +13,9 @@ pub use transaction::{
 };
 
 use leptos_ui_theme_core::{
-    BootstrapMode, CONFIG_FILE, ColorScheme, LogicalPath, ProjectConfig, ResolvedProfile,
-    ResolvedToken, ThemeCompiler, ThemeError, TokenDomain, format_css_number,
-    serialize_color_fallback, serialize_color_modern, sha256,
+    BootstrapMode, CONFIG_FILE, ColorScheme, LogicalPath, OpenedSource, ProjectConfig,
+    ResolvedProfile, ResolvedToken, SourceRole, ThemeCompiler, ThemeError, TokenDomain,
+    format_css_number, serialize_color_fallback, serialize_color_modern, sha256,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -447,15 +447,8 @@ pub fn build_with_workspace(
         ));
         (index_bytes != expected).then_some(index_relative.clone())
     };
-    let config_bytes = std::fs::read(&compiler.config_path).map_err(|source| CodegenError::Io {
-        path: compiler.config_path.clone(),
-        source,
-    })?;
-    let contract_bytes =
-        std::fs::read(&compiler.contract_path).map_err(|source| CodegenError::Io {
-            path: compiler.contract_path.clone(),
-            source,
-        })?;
+    let config_bytes = &compiler.config_source.bytes;
+    let contract_bytes = &compiler.contract_source.bytes;
     let output_digests = artifacts
         .iter()
         .filter(|artifact| artifact.ownership == Ownership::GeneratedLockOwned)
@@ -470,27 +463,11 @@ pub fn build_with_workspace(
             )
         })
         .collect();
-    let input_digests = collect_input_digests(&root, &compiler.config)?;
-    let installation_input = input_lock(
-        InputRoot::Workspace,
-        &compiler.workspace_root,
-        &compiler.kit_installation_path,
-    )?;
-    let capability_input = input_lock(
-        InputRoot::Workspace,
-        &compiler.workspace_root,
-        &compiler.kit_capability_path,
-    )?;
-    let contract_input = input_lock(
-        InputRoot::Workspace,
-        &compiler.workspace_root,
-        &compiler.contract_path,
-    )?;
-    let stylesheet_input = input_lock(
-        InputRoot::Workspace,
-        &compiler.workspace_root,
-        &compiler.kit_stylesheet_path,
-    )?;
+    let input_digests = collect_input_digests(&compiler)?;
+    let installation_input = input_lock(InputRoot::Workspace, &compiler.kit_installation);
+    let capability_input = input_lock(InputRoot::Workspace, &compiler.kit_capability);
+    let contract_input = input_lock(InputRoot::Workspace, &compiler.contract_source);
+    let stylesheet_input = input_lock(InputRoot::Workspace, &compiler.kit_stylesheet);
     let profile_digests = profiles
         .iter()
         .map(|profile| {
@@ -521,12 +498,12 @@ pub fn build_with_workspace(
             abi_version: compiler.contract.abi_version,
             revision: compiler.contract.revision,
             canonical_digest: compiler.contract.canonical_digest.clone(),
-            installed_bytes_digest: format!("sha256:{}", sha256(&contract_bytes)),
+            installed_bytes_digest: format!("sha256:{}", sha256(contract_bytes)),
         },
         config: InputLock {
             root: InputRoot::AppConfig,
             path: CONFIG_FILE.into(),
-            bytes_digest: format!("sha256:{}", sha256(&config_bytes)),
+            bytes_digest: format!("sha256:{}", sha256(config_bytes)),
         },
         inputs: input_digests,
         profiles: profile_digests,
@@ -569,12 +546,13 @@ pub fn build_with_workspace(
     lock_bytes.push(b'\n');
     protect_workspace_inputs(
         &root,
+        &compiler.workspace_root,
         &artifacts,
         &[
-            &compiler.kit_installation_path,
-            &compiler.kit_capability_path,
-            &compiler.contract_path,
-            &compiler.kit_stylesheet_path,
+            &compiler.kit_installation,
+            &compiler.kit_capability,
+            &compiler.contract_source,
+            &compiler.kit_stylesheet,
         ],
     )?;
     let (backup_artifacts, accepted_generated) = protect_generated_ownership(
@@ -635,8 +613,9 @@ pub fn build_with_workspace(
 
 fn protect_workspace_inputs(
     config_root: &Path,
+    workspace_root: &Path,
     artifacts: &[GeneratedArtifact],
-    inputs: &[&PathBuf],
+    inputs: &[&OpenedSource],
 ) -> Result<(), CodegenError> {
     for artifact in artifacts {
         let target = config_root.join(
@@ -644,7 +623,10 @@ fn protect_workspace_inputs(
                 .map_err(CodegenError::Core)?
                 .to_path_buf(),
         );
-        if inputs.iter().any(|input| target == input.as_path()) {
+        if inputs
+            .iter()
+            .any(|input| target == workspace_root.join(input.logical_path.to_path_buf()))
+        {
             return Err(CodegenError::Core(ThemeError::Security(format!(
                 "generated output overlaps workspace input `{}`",
                 artifact.path
@@ -802,129 +784,36 @@ fn protect_generated_ownership(
     Ok((backups, accepted))
 }
 
-fn collect_input_digests(
-    root: &Path,
-    config: &ProjectConfig,
-) -> Result<Vec<InputLock>, CodegenError> {
-    let root = std::fs::canonicalize(root).map_err(|source| CodegenError::Io {
-        path: root.to_path_buf(),
-        source,
-    })?;
-
-    fn visit(
-        root: &Path,
-        directory: &Path,
-        config: &ProjectConfig,
-        inputs: &mut BTreeMap<String, String>,
-    ) -> Result<(), CodegenError> {
-        let mut entries = std::fs::read_dir(directory)
-            .map_err(|source| CodegenError::Io {
-                path: directory.to_path_buf(),
-                source,
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|source| CodegenError::Io {
-                path: directory.to_path_buf(),
-                source,
-            })?;
-        entries.sort_by_key(std::fs::DirEntry::file_name);
-        for entry in entries {
-            let path = entry.path();
-            let metadata = std::fs::symlink_metadata(&path).map_err(|source| CodegenError::Io {
-                path: path.clone(),
-                source,
-            })?;
-            if metadata.file_type().is_symlink() {
-                return Err(CodegenError::Core(ThemeError::Security(format!(
-                    "token input contains a symlink: {}",
-                    path.display()
-                ))));
-            }
-            if metadata.is_dir() {
-                visit(root, &path, config, inputs)?;
-            } else if metadata.is_file() {
-                if metadata.len() > config.limits.file_bytes {
-                    return Err(CodegenError::Core(ThemeError::Config(format!(
-                        "input `{}` exceeds the configured file limit",
-                        path.display()
-                    ))));
-                }
-                let relative = path
-                    .strip_prefix(root)
-                    .map_err(|_| {
-                        CodegenError::Core(ThemeError::Security(path.display().to_string()))
-                    })?
-                    .to_str()
-                    .ok_or_else(|| {
-                        CodegenError::Core(ThemeError::Security("input path is not UTF-8".into()))
-                    })?
-                    .replace('\\', "/");
-                LogicalPath::new(relative.clone()).map_err(CodegenError::Core)?;
-                let bytes = std::fs::read(&path).map_err(|source| CodegenError::Io {
-                    path: path.clone(),
-                    source,
-                })?;
-                inputs.insert(relative, format!("sha256:{}", sha256(&bytes)));
-                if inputs.len() > config.limits.source_files as usize {
-                    return Err(CodegenError::Core(ThemeError::Config(
-                        "input inventory exceeds the configured source-file limit".into(),
-                    )));
-                }
-            } else {
-                return Err(CodegenError::Core(ThemeError::Security(format!(
-                    "token input is not a regular file or directory: {}",
-                    path.display()
-                ))));
-            }
-        }
-        Ok(())
-    }
-
-    let mut inputs = BTreeMap::new();
-    let token_root = root.join(&config.token_root);
-    visit(&root, &token_root, config, &mut inputs)?;
-    if !inputs.contains_key(&config.resolver) {
-        let resolver = root.join(&config.resolver);
-        let bytes = std::fs::read(&resolver).map_err(|source| CodegenError::Io {
-            path: resolver,
-            source,
-        })?;
-        inputs.insert(
-            config.resolver.clone(),
-            format!("sha256:{}", sha256(&bytes)),
+fn collect_input_digests(compiler: &ThemeCompiler) -> Result<Vec<InputLock>, CodegenError> {
+    let token_root = LogicalPath::new(compiler.config.token_root.clone())?;
+    let mut inputs = compiler
+        .source_loader()
+        .read_tree(&token_root, SourceRole::TokenResolver)?;
+    let resolver = LogicalPath::new(compiler.config.resolver.clone())?;
+    if !inputs.iter().any(|source| source.logical_path == resolver) {
+        inputs.push(
+            compiler
+                .source_loader()
+                .read_source(&resolver, SourceRole::TokenResolver)?,
         );
     }
+    inputs.sort_by(|left, right| left.logical_path.cmp(&right.logical_path));
     Ok(inputs
         .into_iter()
-        .map(|(path, bytes_digest)| InputLock {
+        .map(|source| InputLock {
             root: InputRoot::AppConfig,
-            path,
-            bytes_digest,
+            path: source.logical_path.as_str().to_owned(),
+            bytes_digest: source.bytes_digest,
         })
         .collect())
 }
 
-fn input_lock(kind: InputRoot, root: &Path, path: &Path) -> Result<InputLock, CodegenError> {
-    let relative = path
-        .strip_prefix(root)
-        .map_err(|_| CodegenError::Core(ThemeError::Security(path.display().to_string())))?
-        .to_str()
-        .ok_or_else(|| {
-            CodegenError::Core(ThemeError::Security(
-                "input provenance path is not UTF-8".into(),
-            ))
-        })?
-        .replace('\\', "/");
-    LogicalPath::new(relative.clone()).map_err(CodegenError::Core)?;
-    let bytes = std::fs::read(path).map_err(|source| CodegenError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    Ok(InputLock {
+fn input_lock(kind: InputRoot, source: &OpenedSource) -> InputLock {
+    InputLock {
         root: kind,
-        path: relative,
-        bytes_digest: format!("sha256:{}", sha256(&bytes)),
-    })
+        path: source.logical_path.as_str().to_owned(),
+        bytes_digest: source.bytes_digest.clone(),
+    }
 }
 
 fn generated_metadata(compiler: &ThemeCompiler) -> String {

@@ -13,6 +13,8 @@ description = "Core models and compiler logic for leptos_ui_theme"
 workspace = true
 
 [dependencies]
+cap-fs-ext.workspace = true
+cap-std.workspace = true
 indexmap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
