@@ -100,6 +100,7 @@ pub struct ConsumedInput {
 #[derive(Clone, Debug)]
 pub struct BootstrapMetadata {
     pub mode: BootstrapMode,
+    pub script: Option<String>,
     pub script_digest: Option<String>,
     pub csp_source: Option<String>,
     pub html_snippet: String,
@@ -545,6 +546,7 @@ pub fn build_with_workspace(
         .then(|| csp_source(script.as_bytes()));
     let bootstrap = BootstrapMetadata {
         mode: compiler.config.bootstrap.mode,
+        script: (compiler.config.bootstrap.mode != BootstrapMode::Disabled).then(|| script.clone()),
         script_digest: script_digest.clone(),
         csp_source: csp_source.clone(),
         html_snippet: region.clone(),
