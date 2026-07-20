@@ -15,8 +15,9 @@ mod source;
 
 pub use budget::{LimitKind, ResourceBudget};
 pub use color::{
-    NormalizedColor, Oklch, Srgb, format_css_number, normalize_color, parse_color,
-    serialize_color_fallback, serialize_color_modern, validate_contrast,
+    ColorSpace, ContrastAlternativeReport, ContrastReport, NormalizedColor, Oklch, Srgb,
+    contrast_reports, format_css_number, normalize_color, parse_color, serialize_color_fallback,
+    serialize_color_modern, validate_color_syntax, validate_contrast,
 };
 pub use contract::{
     ContractCompatibility, ContrastCheck, ContrastKind, Deprecation, KitTokenContract, TokenDomain,

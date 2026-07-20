@@ -1,7 +1,11 @@
 use crate::{ContrastCheck, ContrastKind, KitTokenContract, ResolvedToken, ThemeError};
+use serde::Serialize;
 use std::collections::BTreeMap;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+const COLOR_TOLERANCE: f64 = 0.02;
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Srgb {
     pub red: f64,
     pub green: f64,
@@ -9,17 +13,53 @@ pub struct Srgb {
     pub alpha: f64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Oklch {
     pub lightness: f64,
     pub chroma: f64,
     pub hue: f64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ColorSpace {
+    Srgb,
+    SrgbLinear,
+    DisplayP3,
+    Oklab,
+    Oklch,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NormalizedColor {
+    pub source_space: ColorSpace,
     pub srgb: Srgb,
     pub oklch: Oklch,
+    pub gamut_mapped: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContrastAlternativeReport {
+    pub stack: Vec<String>,
+    pub effective_background: Srgb,
+    pub effective_foreground: Srgb,
+    pub ratio: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContrastReport {
+    pub id: String,
+    pub foreground: String,
+    pub background: String,
+    pub kind: ContrastKind,
+    pub minimum: f64,
+    pub alternatives: Vec<ContrastAlternativeReport>,
+    pub least_favorable_ratio: f64,
+    pub passed: bool,
 }
 
 impl Srgb {
@@ -65,24 +105,26 @@ pub fn normalize_color(value: &serde_json::Value) -> Result<NormalizedColor, The
     if let Some(value) = value.as_str() {
         let srgb = parse_hex(value)?;
         return Ok(NormalizedColor {
+            source_space: ColorSpace::Srgb,
             oklch: linear_srgb_to_oklch(
                 decode_srgb(srgb.red),
                 decode_srgb(srgb.green),
                 decode_srgb(srgb.blue),
             ),
             srgb,
+            gamut_mapped: false,
         });
     }
     let object = value
         .as_object()
         .ok_or_else(|| ThemeError::Resolution("color must be a string or object".into()))?;
     if object.len() < 2
-        || object.len() > 3
+        || object.len() > 4
         || !object.contains_key("colorSpace")
         || !object.contains_key("components")
         || object
             .keys()
-            .any(|name| !matches!(name.as_str(), "colorSpace" | "components" | "alpha"))
+            .any(|name| !matches!(name.as_str(), "colorSpace" | "components" | "alpha" | "hex"))
     {
         return Err(ThemeError::Resolution(
             "color has missing or unknown members".into(),
@@ -100,6 +142,11 @@ pub fn normalize_color(value: &serde_json::Value) -> Result<NormalizedColor, The
     let components: Vec<f64> = components
         .iter()
         .map(|component| {
+            if component.as_str() == Some("none") {
+                return Err(ThemeError::Resolution(
+                    "color with a missing `none` component is not serializable".into(),
+                ));
+            }
             component
                 .as_f64()
                 .filter(|component| component.is_finite())
@@ -119,8 +166,21 @@ pub fn normalize_color(value: &serde_json::Value) -> Result<NormalizedColor, The
     if !(0.0..=1.0).contains(&alpha) {
         return Err(ThemeError::Resolution("color alpha is outside 0..1".into()));
     }
-    let (linear, oklch) = match space {
-        "srgb" => {
+    let source_space = match space {
+        "srgb" => ColorSpace::Srgb,
+        "srgb-linear" => ColorSpace::SrgbLinear,
+        "display-p3" => ColorSpace::DisplayP3,
+        "oklab" => ColorSpace::Oklab,
+        "oklch" => ColorSpace::Oklch,
+        _ => {
+            return Err(ThemeError::Resolution(format!(
+                "unsupported color space `{space}`"
+            )));
+        }
+    };
+    let (linear, oklch) = match source_space {
+        ColorSpace::Srgb => {
+            validate_unit_components(&components, "sRGB")?;
             let linear = (
                 decode_srgb(components[0]),
                 decode_srgb(components[1]),
@@ -128,22 +188,26 @@ pub fn normalize_color(value: &serde_json::Value) -> Result<NormalizedColor, The
             );
             (linear, linear_srgb_to_oklch(linear.0, linear.1, linear.2))
         }
-        "srgb-linear" => {
+        ColorSpace::SrgbLinear => {
+            validate_unit_components(&components, "linear sRGB")?;
             let linear = (components[0], components[1], components[2]);
             (linear, linear_srgb_to_oklch(linear.0, linear.1, linear.2))
         }
-        "display-p3" => {
+        ColorSpace::DisplayP3 => {
+            validate_unit_components(&components, "Display P3")?;
             let linear = display_p3_to_linear_srgb(components[0], components[1], components[2]);
             (linear, linear_srgb_to_oklch(linear.0, linear.1, linear.2))
         }
-        "oklab" => {
+        ColorSpace::Oklab => {
+            validate_lightness(components[0], "OKLab")?;
             let linear = oklab_to_linear_srgb(components[0], components[1], components[2]);
             (
                 linear,
                 oklab_to_oklch(components[0], components[1], components[2]),
             )
         }
-        "oklch" => {
+        ColorSpace::Oklch => {
+            validate_lightness(components[0], "OKLCH")?;
             if components[1] < 0.0 {
                 return Err(ThemeError::Resolution(
                     "OKLCH chroma cannot be negative".into(),
@@ -159,11 +223,6 @@ pub fn normalize_color(value: &serde_json::Value) -> Result<NormalizedColor, The
                 oklch,
             )
         }
-        _ => {
-            return Err(ThemeError::Resolution(format!(
-                "unsupported color space `{space}`"
-            )));
-        }
     };
     let unbounded = Srgb {
         red: encode_srgb(linear.0),
@@ -171,7 +230,8 @@ pub fn normalize_color(value: &serde_json::Value) -> Result<NormalizedColor, The
         blue: encode_srgb(linear.2),
         alpha,
     };
-    let srgb = if in_gamut(unbounded) {
+    let gamut_mapped = !in_gamut(unbounded);
+    let srgb = if !gamut_mapped {
         Srgb {
             red: unbounded.red.clamp(0.0, 1.0),
             green: unbounded.green.clamp(0.0, 1.0),
@@ -181,7 +241,77 @@ pub fn normalize_color(value: &serde_json::Value) -> Result<NormalizedColor, The
     } else {
         gamut_map(oklch, alpha)
     };
-    Ok(NormalizedColor { srgb, oklch })
+    if let Some(author_hex) = object.get("hex") {
+        let author_hex = author_hex
+            .as_str()
+            .ok_or_else(|| ThemeError::Resolution("color hex fallback must be a string".into()))?;
+        let author = parse_hex(author_hex)?;
+        if (author.alpha - alpha).abs() > 1.0 / 255.0
+            || delta_e_between_srgb(srgb, author) > COLOR_TOLERANCE
+        {
+            return Err(ThemeError::Resolution(
+                "author hex fallback does not agree with the normalized color".into(),
+            ));
+        }
+    }
+    Ok(NormalizedColor {
+        source_space,
+        srgb,
+        oklch,
+        gamut_mapped,
+    })
+}
+
+pub fn validate_color_syntax(value: &serde_json::Value) -> Result<(), ThemeError> {
+    if value.is_string() {
+        parse_color(value)?;
+        return Ok(());
+    }
+    let object = value
+        .as_object()
+        .ok_or_else(|| ThemeError::Resolution("color must be a string or object".into()))?;
+    if object.len() < 2
+        || object.len() > 4
+        || !object.contains_key("colorSpace")
+        || !object.contains_key("components")
+        || object
+            .keys()
+            .any(|name| !matches!(name.as_str(), "colorSpace" | "components" | "alpha" | "hex"))
+    {
+        return Err(ThemeError::Resolution(
+            "color has missing or unknown members".into(),
+        ));
+    }
+    let components = object
+        .get("components")
+        .and_then(serde_json::Value::as_array)
+        .filter(|components| components.len() == 3)
+        .ok_or_else(|| ThemeError::Resolution("color needs three components".into()))?;
+    for component in components {
+        if component.as_str() == Some("none") {
+            continue;
+        }
+        component
+            .as_f64()
+            .filter(|component| component.is_finite())
+            .ok_or_else(|| ThemeError::Resolution("invalid color component".into()))?;
+    }
+    if components
+        .iter()
+        .all(|component| component.as_str() != Some("none"))
+    {
+        normalize_color(value)?;
+    } else {
+        validate_color_metadata(object)?;
+        validate_raw_component_ranges(
+            object
+                .get("colorSpace")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| ThemeError::Resolution("colorSpace is missing".into()))?,
+            components,
+        )?;
+    }
+    Ok(())
 }
 
 pub fn format_css_number(value: f64) -> Result<String, ThemeError> {
@@ -241,20 +371,41 @@ pub fn validate_contrast(
     contract: &KitTokenContract,
     values: &[ResolvedToken],
 ) -> Result<(), ThemeError> {
+    let reports = contrast_reports(contract, values)?;
+    if let Some(report) = reports.iter().find(|report| !report.passed) {
+        return Err(ThemeError::Resolution(format!(
+            "contrast check `{}` failed: {:.6} < {:.6}",
+            report.id, report.least_favorable_ratio, report.minimum
+        )));
+    }
+    Ok(())
+}
+
+pub fn contrast_reports(
+    contract: &KitTokenContract,
+    values: &[ResolvedToken],
+) -> Result<Vec<ContrastReport>, ThemeError> {
     let colors: BTreeMap<&str, Srgb> = values
         .iter()
         .filter(|token| token.token_type == "color" && token.alias_of.is_none())
         .map(|token| Ok((token.path.as_str(), parse_color(&token.value)?)))
         .collect::<Result<_, ThemeError>>()?;
-    for check in &contract.contrast_checks {
-        validate_check(check, &colors)?;
-    }
-    Ok(())
+    contract
+        .contrast_checks
+        .iter()
+        .map(|check| evaluate_check(contract, check, &colors))
+        .collect()
 }
 
-fn validate_check(check: &ContrastCheck, colors: &BTreeMap<&str, Srgb>) -> Result<(), ThemeError> {
-    let foreground = color(colors, &check.foreground)?;
-    let background = color(colors, &check.background)?;
+fn evaluate_check(
+    contract: &KitTokenContract,
+    check: &ContrastCheck,
+    colors: &BTreeMap<&str, Srgb>,
+) -> Result<ContrastReport, ThemeError> {
+    let foreground_path = contract.terminal_mapping(&check.foreground)?.path.as_str();
+    let background_path = contract.terminal_mapping(&check.background)?.path.as_str();
+    let foreground = color(colors, foreground_path)?;
+    let background = color(colors, background_path)?;
     let alternatives: Vec<Vec<String>> = if background.opaque() {
         if check.composite_on.is_some() {
             return Err(ThemeError::Contract(format!(
@@ -276,6 +427,7 @@ fn validate_check(check: &ContrastCheck, colors: &BTreeMap<&str, Srgb>) -> Resul
             })?
     };
     let mut least = f64::INFINITY;
+    let mut reports = Vec::with_capacity(alternatives.len());
     for stack in alternatives {
         let effective_background = if stack.is_empty() {
             background
@@ -283,7 +435,7 @@ fn validate_check(check: &ContrastCheck, colors: &BTreeMap<&str, Srgb>) -> Resul
             let mut reversed = stack.iter().rev();
             let farthest = reversed
                 .next()
-                .map(|path| color(colors, path))
+                .map(|path| terminal_color(contract, colors, path))
                 .transpose()?
                 .ok_or_else(|| ThemeError::Contract("empty compositing stack".into()))?;
             if !farthest.opaque() {
@@ -294,7 +446,7 @@ fn validate_check(check: &ContrastCheck, colors: &BTreeMap<&str, Srgb>) -> Resul
             }
             let mut base = farthest;
             for path in reversed {
-                base = color(colors, path)?.source_over(base)?;
+                base = terminal_color(contract, colors, path)?.source_over(base)?;
             }
             background.source_over(base)?
         };
@@ -308,20 +460,28 @@ fn validate_check(check: &ContrastCheck, colors: &BTreeMap<&str, Srgb>) -> Resul
         let second = effective_background.luminance();
         let ratio = (first.max(second) + 0.05) / (first.min(second) + 0.05);
         least = least.min(ratio);
+        reports.push(ContrastAlternativeReport {
+            stack,
+            effective_background,
+            effective_foreground,
+            ratio,
+        });
     }
     let floor: f64 = match check.kind {
         ContrastKind::Text => 4.5,
         ContrastKind::LargeText | ContrastKind::NonText | ContrastKind::FocusIndicator => 3.0,
     };
     let minimum = floor.max(check.minimum);
-    if least + 1e-9 < minimum {
-        Err(ThemeError::Resolution(format!(
-            "contrast check `{}` failed: {least:.3} < {minimum:.3}",
-            check.id
-        )))
-    } else {
-        Ok(())
-    }
+    Ok(ContrastReport {
+        id: check.id.clone(),
+        foreground: check.foreground.clone(),
+        background: check.background.clone(),
+        kind: check.kind,
+        minimum,
+        alternatives: reports,
+        least_favorable_ratio: least,
+        passed: least >= minimum,
+    })
 }
 
 fn color(colors: &BTreeMap<&str, Srgb>, path: &str) -> Result<Srgb, ThemeError> {
@@ -329,6 +489,114 @@ fn color(colors: &BTreeMap<&str, Srgb>, path: &str) -> Result<Srgb, ThemeError> 
         .get(path)
         .copied()
         .ok_or_else(|| ThemeError::Resolution(format!("unknown contrast color `{path}`")))
+}
+
+fn terminal_color(
+    contract: &KitTokenContract,
+    colors: &BTreeMap<&str, Srgb>,
+    path: &str,
+) -> Result<Srgb, ThemeError> {
+    color(colors, &contract.terminal_mapping(path)?.path)
+}
+
+fn validate_unit_components(components: &[f64], space: &str) -> Result<(), ThemeError> {
+    if components
+        .iter()
+        .any(|component| !(0.0..=1.0).contains(component))
+    {
+        return Err(ThemeError::Resolution(format!(
+            "{space} components must be within 0..1"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_lightness(lightness: f64, space: &str) -> Result<(), ThemeError> {
+    if !(0.0..=1.0).contains(&lightness) {
+        return Err(ThemeError::Resolution(format!(
+            "{space} lightness must be within 0..1"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_color_metadata(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), ThemeError> {
+    let space = object
+        .get("colorSpace")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ThemeError::Resolution("colorSpace is missing".into()))?;
+    if !matches!(
+        space,
+        "srgb" | "srgb-linear" | "display-p3" | "oklab" | "oklch"
+    ) {
+        return Err(ThemeError::Resolution(format!(
+            "unsupported color space `{space}`"
+        )));
+    }
+    let alpha = object
+        .get("alpha")
+        .map(|value| {
+            value
+                .as_f64()
+                .filter(|value| value.is_finite())
+                .ok_or_else(|| ThemeError::Resolution("invalid color alpha".into()))
+        })
+        .transpose()?
+        .unwrap_or(1.0);
+    if !(0.0..=1.0).contains(&alpha) {
+        return Err(ThemeError::Resolution("color alpha is outside 0..1".into()));
+    }
+    if let Some(hex) = object.get("hex") {
+        parse_hex(
+            hex.as_str()
+                .ok_or_else(|| ThemeError::Resolution("color hex must be a string".into()))?,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_raw_component_ranges(
+    space: &str,
+    components: &[serde_json::Value],
+) -> Result<(), ThemeError> {
+    let number = |index: usize| components[index].as_f64();
+    match space {
+        "srgb" | "srgb-linear" | "display-p3" => {
+            for component in components {
+                if component
+                    .as_f64()
+                    .is_some_and(|value| !(0.0..=1.0).contains(&value))
+                {
+                    return Err(ThemeError::Resolution(format!(
+                        "{space} components must be within 0..1"
+                    )));
+                }
+            }
+        }
+        "oklab" => {
+            if number(0).is_some_and(|value| !(0.0..=1.0).contains(&value)) {
+                return Err(ThemeError::Resolution(
+                    "OKLab lightness must be within 0..1".into(),
+                ));
+            }
+        }
+        "oklch" => {
+            if number(0).is_some_and(|value| !(0.0..=1.0).contains(&value)) {
+                return Err(ThemeError::Resolution(
+                    "OKLCH lightness must be within 0..1".into(),
+                ));
+            }
+            if number(1).is_some_and(|value| value < 0.0) {
+                return Err(ThemeError::Resolution(
+                    "OKLCH chroma cannot be negative".into(),
+                ));
+            }
+        }
+        _ => unreachable!("metadata validation closes the color-space vocabulary"),
+    }
+    Ok(())
 }
 
 fn parse_hex(value: &str) -> Result<Srgb, ThemeError> {
@@ -384,13 +652,14 @@ fn display_p3_to_linear_srgb(red: f64, green: f64, blue: f64) -> (f64, f64, f64)
     let r = decode_srgb(red);
     let g = decode_srgb(green);
     let b = decode_srgb(blue);
-    let x = 0.48657095 * r + 0.26566769 * g + 0.19821729 * b;
-    let y = 0.22897456 * r + 0.69173852 * g + 0.07928691 * b;
-    let z = 0.0 * r + 0.04511338 * g + 1.04394437 * b;
+    let x =
+        0.486_570_948_648_216_2 * r + 0.265_667_693_169_093_06 * g + 0.198_217_285_234_362_5 * b;
+    let y = 0.228_974_564_069_748_8 * r + 0.691_738_521_836_506_4 * g + 0.079_286_914_093_745 * b;
+    let z = 0.045_113_381_858_902_64 * g + 1.043_944_368_900_976 * b;
     (
-        3.2406 * x - 1.5372 * y - 0.4986 * z,
-        -0.9689 * x + 1.8758 * y + 0.0415 * z,
-        0.0557 * x - 0.2040 * y + 1.0570 * z,
+        3.240_969_941_904_522_6 * x - 1.537_383_177_570_094 * y - 0.498_610_760_293_003_4 * z,
+        -0.969_243_636_280_879_6 * x + 1.875_967_501_507_720_2 * y + 0.041_555_057_407_175_59 * z,
+        0.055_630_079_696_993_66 * x - 0.203_976_958_888_976_52 * y + 1.056_971_514_242_878_6 * z,
     )
 }
 
@@ -454,7 +723,6 @@ fn in_gamut(color: Srgb) -> bool {
 }
 
 fn gamut_map(color: Oklch, alpha: f64) -> Srgb {
-    const JND: f64 = 0.02;
     const EPSILON: f64 = 0.0001;
     if color.lightness >= 1.0 {
         return Srgb {
@@ -481,17 +749,18 @@ fn gamut_map(color: Oklch, alpha: f64) -> Srgb {
         let chroma = (minimum + maximum) / 2.0;
         let candidate = Oklch { chroma, ..color };
         let unbounded = unbounded_srgb(candidate, alpha);
-        if minimum_in_gamut && maximum - minimum < EPSILON {
-            return clipped;
-        }
-        if in_gamut(unbounded) {
-            minimum = chroma;
-            continue;
+        if minimum_in_gamut && in_gamut(unbounded) {
+            return Srgb {
+                red: unbounded.red.clamp(0.0, 1.0),
+                green: unbounded.green.clamp(0.0, 1.0),
+                blue: unbounded.blue.clamp(0.0, 1.0),
+                alpha,
+            };
         }
         clipped = clip_oklch(candidate, alpha);
         let difference = delta_e_ok(candidate, clipped);
-        if difference < JND {
-            if JND - difference < EPSILON {
+        if difference < COLOR_TOLERANCE {
+            if COLOR_TOLERANCE - difference < EPSILON {
                 return clipped;
             }
             minimum_in_gamut = false;
@@ -538,9 +807,25 @@ fn delta_e_ok(source: Oklch, mapped: Srgb) -> f64 {
     .sqrt()
 }
 
+fn delta_e_between_srgb(first: Srgb, second: Srgb) -> f64 {
+    let first = linear_srgb_to_oklch(
+        decode_srgb(first.red),
+        decode_srgb(first.green),
+        decode_srgb(first.blue),
+    );
+    delta_e_ok(first, second)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_color;
+    use super::{
+        ColorSpace, contrast_reports, format_css_number, normalize_color, parse_color,
+        serialize_color_fallback, serialize_color_modern, validate_color_syntax,
+    };
+    use crate::{
+        ContrastCheck, ContrastKind, KitTokenContract, ResolvedToken, TokenDomain, TokenMapping,
+    };
+    use std::collections::BTreeMap;
 
     #[test]
     fn parses_hex_and_oklch() {
@@ -548,5 +833,157 @@ mod tests {
         let color = serde_json::json!({"colorSpace":"oklch","components":[1.0,0.0,0.0]});
         let parsed = parse_color(&color).unwrap();
         assert!(parsed.red > 0.99 && parsed.green > 0.99 && parsed.blue > 0.99);
+    }
+
+    #[test]
+    fn normalizes_every_supported_space_and_rejects_ranges() {
+        let cases = [
+            ("srgb", serde_json::json!([0.25, 0.5, 0.75])),
+            ("srgb-linear", serde_json::json!([0.25, 0.5, 0.75])),
+            ("display-p3", serde_json::json!([0.25, 0.5, 0.75])),
+            ("oklab", serde_json::json!([0.5, 0.1, -0.1])),
+            ("oklch", serde_json::json!([0.5, 0.2, 420.0])),
+        ];
+        for (space, components) in cases {
+            let value = serde_json::json!({
+                "colorSpace": space,
+                "components": components,
+                "alpha": 0.5
+            });
+            let normalized = normalize_color(&value).unwrap();
+            assert_eq!(normalized.srgb.alpha, 0.5);
+        }
+        let invalid = serde_json::json!({
+            "colorSpace": "srgb",
+            "components": [1.01, 0, 0]
+        });
+        assert!(normalize_color(&invalid).is_err());
+        let invalid = serde_json::json!({
+            "colorSpace": "oklch",
+            "components": [1.01, 0, 0]
+        });
+        assert!(normalize_color(&invalid).is_err());
+    }
+
+    #[test]
+    fn preserves_missing_components_at_the_raw_boundary_only() {
+        let value = serde_json::json!({
+            "colorSpace": "oklch",
+            "components": [0.5, "none", 30]
+        });
+        validate_color_syntax(&value).unwrap();
+        assert!(normalize_color(&value).is_err());
+    }
+
+    #[test]
+    fn author_fallback_must_agree_with_normalized_color() {
+        let matching = serde_json::json!({
+            "colorSpace": "srgb",
+            "components": [1, 0, 0],
+            "hex": "#ff0000"
+        });
+        assert_eq!(
+            normalize_color(&matching).unwrap().source_space,
+            ColorSpace::Srgb
+        );
+        let mismatch = serde_json::json!({
+            "colorSpace": "srgb",
+            "components": [1, 0, 0],
+            "hex": "#0000ff"
+        });
+        assert!(normalize_color(&mismatch).is_err());
+    }
+
+    #[test]
+    fn serialization_is_canonical_and_shared() {
+        let value = serde_json::json!({
+            "colorSpace": "display-p3",
+            "components": [1, 0, 0],
+            "alpha": 0.5
+        });
+        let normalized = normalize_color(&value).unwrap();
+        assert!(normalized.gamut_mapped);
+        assert_eq!(serialize_color_fallback(&value).unwrap().len(), 9);
+        assert!(
+            serialize_color_modern(&value)
+                .unwrap()
+                .starts_with("oklch(")
+        );
+        assert_eq!(format_css_number(-0.0).unwrap(), "0");
+        assert_eq!(format_css_number(0.500_000_4).unwrap(), "0.5");
+    }
+
+    #[test]
+    fn contrast_reports_preserve_alternatives_and_gate_on_the_least_ratio() {
+        let paths = [
+            "color.foreground",
+            "color.background",
+            "color.surface-light",
+            "color.surface-dark",
+        ];
+        let tokens = paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| TokenMapping {
+                path: (*path).into(),
+                token_type: "color".into(),
+                css_custom_property: format!("--kit-color-test-{index}"),
+                domain: TokenDomain::Theme,
+                required: true,
+                order: index as u32,
+                theme_override: true,
+                default: Some(serde_json::Value::Null),
+                description: None,
+                deprecation: None,
+            })
+            .collect();
+        let contract = KitTokenContract {
+            schema: String::new(),
+            schema_version: String::new(),
+            contract_id: String::new(),
+            abi_version: 1,
+            revision: 2,
+            dtcg_version: String::new(),
+            dtcg_profile: String::new(),
+            canonical_digest: String::new(),
+            tokens,
+            contrast_checks: vec![ContrastCheck {
+                id: "body-text".into(),
+                foreground: paths[0].into(),
+                background: paths[1].into(),
+                kind: ContrastKind::Text,
+                minimum: 1.0,
+                composite_on: Some(vec![vec![paths[2].into()], vec![paths[3].into()]]),
+                description: None,
+            }],
+            extensions: BTreeMap::new(),
+        };
+        let colors = ["#00000080", "#ffffff80", "#ffffff", "#000000"];
+        let values = paths
+            .iter()
+            .zip(colors)
+            .map(|(path, value)| ResolvedToken {
+                path: (*path).into(),
+                token_type: "color".into(),
+                css_custom_property: String::new(),
+                domain: TokenDomain::Theme,
+                value: value.into(),
+                provenance: Vec::new(),
+                alias_of: None,
+            })
+            .collect::<Vec<_>>();
+        let reports = contrast_reports(&contract, &values).unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].alternatives.len(), 2);
+        assert_eq!(reports[0].minimum, 4.5);
+        assert_eq!(
+            reports[0].least_favorable_ratio,
+            reports[0]
+                .alternatives
+                .iter()
+                .map(|alternative| alternative.ratio)
+                .reduce(f64::min)
+                .unwrap()
+        );
     }
 }

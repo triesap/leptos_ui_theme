@@ -1,6 +1,6 @@
 use crate::{
     JsonPointer, Limits, LogicalPath, ProvenanceEntry, ProvenanceOperation, ThemeError, TokenPath,
-    parse_color,
+    validate_color_syntax,
 };
 use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -685,7 +685,7 @@ pub fn validate_token_value(token_type: DtcgType, value: &Value) -> Result<(), T
     }
     match token_type {
         DtcgType::Color => {
-            parse_color(value)?;
+            validate_color_syntax(value)?;
         }
         DtcgType::Dimension => validate_unit_value(value, &["px", "rem"], false)?,
         DtcgType::Duration => validate_unit_value(value, &["ms", "s"], true)?,
