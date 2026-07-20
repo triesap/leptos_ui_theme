@@ -37,8 +37,8 @@ pub use identity::{
     ThemeId, TokenPath,
 };
 pub use kit::{
-    INSTALLED_KIT_CAPABILITY_SCHEMA, InstalledKitCapability, InstalledKitCapabilityRecord,
-    KitCapability, VerifiedKit, discover_kit, discover_kit_with_loader,
+    InstalledKitCapability, InstalledKitCapabilityRecord, KIT_LOCK_SCHEMA_VERSION, KitCapability,
+    VerifiedKit, discover_kit, discover_kit_with_loader,
 };
 pub use model::{
     AxesConfig, AxisConfig, BootstrapConfig, BootstrapMode, COMPILED_LIMITS, ColorScheme,

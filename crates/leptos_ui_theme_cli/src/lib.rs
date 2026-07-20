@@ -1496,8 +1496,16 @@ checksum = "sha256:test"
         let capability_bytes = serde_json::to_vec_pretty(&capability).unwrap();
         std::fs::write(&capability_path, &capability_bytes).unwrap();
         let installed_capability = serde_json::json!({
-            "$schema": leptos_ui_theme_core::INSTALLED_KIT_CAPABILITY_SCHEMA,
-            "schemaVersion": "1.0.0",
+            "schemaVersion": leptos_ui_theme_core::KIT_LOCK_SCHEMA_VERSION,
+            "kitVersion": leptos_ui_theme_core::KIT_LOCK_SCHEMA_VERSION,
+            "project": {
+                "configHash": format!("sha256:{}", "0".repeat(64)),
+                "crateRoot": ".",
+                "kind": "single-crate-trunk-csr"
+            },
+            "items": {},
+            "filesByPath": {},
+            "styleBlocksById": {},
             "themeIntegration": {
             "producerPackage": "leptos_ui_kit_cli",
             "producerVersion": "0.2.0",

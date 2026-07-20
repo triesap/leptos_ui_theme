@@ -4,6 +4,7 @@ use crate::{
     sha256,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 const LAYER_ORDER: [&str; 3] = [
@@ -11,8 +12,7 @@ const LAYER_ORDER: [&str; 3] = [
     "leptos-ui-kit.themes",
     "leptos-ui-kit.components",
 ];
-pub const INSTALLED_KIT_CAPABILITY_SCHEMA: &str =
-    "https://triesap.github.io/leptos_ui_theme/schema/0.1.0/installed-kit-capability.schema.json";
+pub const KIT_LOCK_SCHEMA_VERSION: &str = "0.9.0-alpha";
 
 #[derive(Clone, Debug)]
 pub struct VerifiedKit {
@@ -28,9 +28,12 @@ pub struct VerifiedKit {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct InstalledKitCapability {
-    #[serde(rename = "$schema")]
-    pub schema: String,
     pub schema_version: String,
+    pub kit_version: String,
+    pub project: serde_json::Value,
+    pub items: BTreeMap<String, serde_json::Value>,
+    pub files_by_path: BTreeMap<String, String>,
+    pub style_blocks_by_id: BTreeMap<String, String>,
     pub theme_integration: InstalledKitCapabilityRecord,
 }
 
@@ -168,11 +171,11 @@ fn verify_candidate(
 ) -> Result<VerifiedKit, ThemeError> {
     let installation_logical = LogicalPath::new(installation_relative.to_owned())?;
     let installation: InstalledKitCapability = loader.read_json(&installation_logical)?;
-    if installation.schema != INSTALLED_KIT_CAPABILITY_SCHEMA
-        || installation.schema_version != "1.0.0"
+    if installation.schema_version != KIT_LOCK_SCHEMA_VERSION
+        || installation.kit_version != KIT_LOCK_SCHEMA_VERSION
     {
         return Err(ThemeError::Contract(
-            "unsupported installed kit capability schema".into(),
+            "unsupported installed kit lock schema".into(),
         ));
     }
     let record = &installation.theme_integration;
