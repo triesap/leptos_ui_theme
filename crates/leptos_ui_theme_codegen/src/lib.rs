@@ -1835,7 +1835,7 @@ pub struct ThemeMetadata {
         ));
     }
     output.push('\n');
-    output.push_str("pub const THEME_IDS: &[ThemeId] = &[\n");
+    output.push_str("#[rustfmt::skip]\npub const THEME_IDS: &[ThemeId] = &[\n");
     for profile in profiles {
         output.push_str(&format!("    {},\n", theme_constant(&profile.id)));
     }
@@ -2504,7 +2504,7 @@ mod tests {
         ArtifactManifest, ArtifactManifestEntry, ChangeOperation, ChangeScope, ConsumedInput,
         ConsumedInputRoot, CssMode, DependencyState, DesiredArtifactState, GeneratedArtifact,
         Ownership, ResolvedAxis, apply_artifacts, apply_transaction, bootstrap_script, csp_source,
-        default_dependency_records, generate_css, html_exterior_digest,
+        default_dependency_records, generate_css, generate_rust, html_exterior_digest,
         html_exterior_digest_for_index, owned_html_region, patch_index, plan_manifest,
         relative_workspace_asset, remove_owned_html_region, serialize_css,
         validate_dependency_records, verify_consumed_inputs,
@@ -2602,6 +2602,29 @@ mod tests {
         assert!(css[..supports].contains("--kit-color-primary: #"));
         assert!(!css[..supports].contains("--kit-color-primary: oklch("));
         assert!(css[supports..].contains("--kit-color-primary: oklch("));
+    }
+
+    #[test]
+    fn generated_theme_inventory_is_rustfmt_stable_for_consumers() {
+        let config = ProjectConfig::default();
+        let profiles = config
+            .profiles
+            .named
+            .iter()
+            .map(|profile| ResolvedProfile {
+                id: profile.id.clone(),
+                label: profile.label.clone(),
+                color_scheme: profile.color_scheme,
+                inputs: profile.inputs.clone(),
+                values: Vec::new(),
+                semantic_digest: String::new(),
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            generate_rust(&config, &profiles)
+                .contains("#[rustfmt::skip]\npub const THEME_IDS: &[ThemeId] = &[")
+        );
     }
 
     #[test]
