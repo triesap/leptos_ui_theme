@@ -133,10 +133,10 @@ pub fn discover_kit(
     let loader = SourceLoader::new(root, limits)?;
     let mut candidates = Vec::new();
     let mut failures = Vec::new();
-    for capability_path in &config.capability_paths {
-        match verify_candidate(&loader, capability_path, config.contract_path.as_deref()) {
+    for lock_path in &config.lock_paths {
+        match verify_candidate(&loader, lock_path, config.contract_path.as_deref()) {
             Ok(candidate) => candidates.push(candidate),
-            Err(error) => failures.push(format!("{capability_path}: {error}")),
+            Err(error) => failures.push(format!("{lock_path}: {error}")),
         }
     }
     match candidates.len() {

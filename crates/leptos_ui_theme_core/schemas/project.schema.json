@@ -1,0 +1,688 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://triesap.github.io/leptos_ui_theme/schema/0.1.0/project.schema.json",
+  "title": "leptos_ui_theme project configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schemaVersion",
+    "dtcgVersion",
+    "kit",
+    "selectors",
+    "storageKey",
+    "tokenRoot",
+    "resolver",
+    "profiles",
+    "outputs",
+    "bootstrap",
+    "html",
+    "limits"
+  ],
+  "properties": {
+    "$schema": {
+      "const": "https://triesap.github.io/leptos_ui_theme/schema/0.1.0/project.schema.json"
+    },
+    "schemaVersion": {
+      "const": "1.0.0"
+    },
+    "dtcgVersion": {
+      "const": "2025.10"
+    },
+    "kit": {
+      "$ref": "#/$defs/kit"
+    },
+    "selectors": {
+      "$ref": "#/$defs/selectors"
+    },
+    "storageKey": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 255
+    },
+    "tokenRoot": {
+      "$ref": "#/$defs/logicalPath"
+    },
+    "resolver": {
+      "$ref": "#/$defs/logicalPath"
+    },
+    "profiles": {
+      "$ref": "#/$defs/profiles"
+    },
+    "axes": {
+      "$ref": "#/$defs/axes"
+    },
+    "outputs": {
+      "$ref": "#/$defs/outputs"
+    },
+    "bootstrap": {
+      "$ref": "#/$defs/bootstrap"
+    },
+    "html": {
+      "$ref": "#/$defs/html"
+    },
+    "runtimeEvidence": {
+      "$ref": "#/$defs/runtimeEvidence"
+    },
+    "limits": {
+      "$ref": "#/$defs/limits"
+    }
+  },
+  "$defs": {
+    "logicalPath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)(?!.*\\\\).+$"
+    },
+    "themeId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 63,
+      "pattern": "^(?!system$)[a-z](?:(?:[a-z0-9]|-(?!-))*[a-z0-9])?$"
+    },
+    "selector": {
+      "type": "string",
+      "minLength": 6,
+      "maxLength": 63,
+      "pattern": "^data-[a-z][a-z0-9]*(?:-[a-z0-9]+)*$",
+      "not": {
+        "enum": [
+          "data-leptos-ui-theme-bootstrap",
+          "data-leptos-ui-theme-bootstrap-outcome"
+        ]
+      }
+    },
+    "kit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contractPath",
+        "lockPaths"
+      ],
+      "properties": {
+        "contractPath": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/logicalPath"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "lockPaths": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/logicalPath"
+          }
+        }
+      }
+    },
+    "selectors": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "theme",
+        "density",
+        "motion",
+        "contrast"
+      ],
+      "properties": {
+        "theme": {
+          "$ref": "#/$defs/selector"
+        },
+        "density": {
+          "$ref": "#/$defs/selector"
+        },
+        "motion": {
+          "$ref": "#/$defs/selector"
+        },
+        "contrast": {
+          "$ref": "#/$defs/selector"
+        }
+      }
+    },
+    "profiles": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "default",
+        "system",
+        "named"
+      ],
+      "properties": {
+        "default": {
+          "$ref": "#/$defs/themeId"
+        },
+        "system": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "light",
+            "dark"
+          ],
+          "properties": {
+            "light": {
+              "$ref": "#/$defs/themeId"
+            },
+            "dark": {
+              "$ref": "#/$defs/themeId"
+            }
+          }
+        },
+        "named": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1024,
+          "items": {
+            "$ref": "#/$defs/profile"
+          }
+        }
+      }
+    },
+    "profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "label",
+        "colorScheme",
+        "inputs"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/themeId"
+        },
+        "label": {
+          "oneOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 255
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "colorScheme": {
+          "enum": [
+            "light",
+            "dark"
+          ]
+        },
+        "inputs": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255
+          },
+          "additionalProperties": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255
+          },
+          "required": [
+            "theme"
+          ]
+        }
+      }
+    },
+    "axis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "attribute",
+        "defaultContext",
+        "contexts",
+        "system"
+      ],
+      "properties": {
+        "attribute": {
+          "$ref": "#/$defs/selector"
+        },
+        "defaultContext": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255
+        },
+        "contexts": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1024,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255
+          }
+        },
+        "system": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/systemAxis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "systemAxis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "query",
+        "context"
+      ],
+      "properties": {
+        "query": {
+          "enum": [
+            "(prefers-reduced-motion: reduce)",
+            "(prefers-contrast: more)"
+          ]
+        },
+        "context": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255
+        }
+      }
+    },
+    "axes": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "density": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/axis"
+            },
+            {
+              "properties": {
+                "system": {
+                  "type": "null"
+                }
+              }
+            }
+          ]
+        },
+        "motion": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/axis"
+            },
+            {
+              "properties": {
+                "system": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "properties": {
+                        "query": {
+                          "const": "(prefers-reduced-motion: reduce)"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        },
+        "contrast": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/axis"
+            },
+            {
+              "properties": {
+                "system": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "properties": {
+                        "query": {
+                          "const": "(prefers-contrast: more)"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "outputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "css",
+        "rust",
+        "lock",
+        "seeded"
+      ],
+      "properties": {
+        "css": {
+          "$ref": "#/$defs/logicalPath"
+        },
+        "rust": {
+          "$ref": "#/$defs/logicalPath"
+        },
+        "lock": {
+          "$ref": "#/$defs/logicalPath"
+        },
+        "seeded": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "module",
+            "controller",
+            "scope"
+          ],
+          "properties": {
+            "module": {
+              "$ref": "#/$defs/logicalPath"
+            },
+            "controller": {
+              "$ref": "#/$defs/logicalPath"
+            },
+            "scope": {
+              "$ref": "#/$defs/logicalPath"
+            }
+          }
+        }
+      }
+    },
+    "bootstrap": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "external"
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "inline-csp-hash",
+            "inline-csp-nonce-template",
+            "external-sync",
+            "disabled"
+          ]
+        },
+        "external": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/externalBootstrap"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "mode": {
+                "const": "external-sync"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "external": {
+                "$ref": "#/$defs/externalBootstrap"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "external": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "externalBootstrap": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "outputPath",
+        "servedPath",
+        "publicPath"
+      ],
+      "properties": {
+        "outputPath": {
+          "$ref": "#/$defs/logicalPath"
+        },
+        "servedPath": {
+          "$ref": "#/$defs/logicalPath"
+        },
+        "publicPath": {
+          "oneOf": [
+            {
+              "type": "string",
+              "pattern": "^/"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "html": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "indexPath",
+        "indexCandidates",
+        "publicBasePath"
+      ],
+      "properties": {
+        "indexPath": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/logicalPath"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "indexCandidates": {
+          "oneOf": [
+            {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 16,
+              "uniqueItems": true,
+              "items": {
+                "$ref": "#/$defs/logicalPath"
+              }
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "publicBasePath": {
+          "type": "string",
+          "pattern": "^/(?:(?:[A-Za-z0-9._~-]|%[0-9A-F]{2})+/)*$"
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "indexPath": {
+              "$ref": "#/$defs/logicalPath"
+            },
+            "indexCandidates": {
+              "type": "null"
+            }
+          }
+        },
+        {
+          "properties": {
+            "indexPath": {
+              "type": "null"
+            },
+            "indexCandidates": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 16
+            }
+          }
+        }
+      ]
+    },
+    "runtimeEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "required"
+      ],
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/logicalPath"
+        },
+        "required": {
+          "type": "boolean"
+        }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "fileBytes": {
+          "$ref": "#/$defs/u16m"
+        },
+        "files": {
+          "$ref": "#/$defs/u8192"
+        },
+        "aggregateInputBytes": {
+          "$ref": "#/$defs/u512m"
+        },
+        "sourceFiles": {
+          "$ref": "#/$defs/u4096"
+        },
+        "journalEntries": {
+          "$ref": "#/$defs/u1024"
+        },
+        "evidenceManifests": {
+          "$ref": "#/$defs/u4096"
+        },
+        "retainedBackups": {
+          "$ref": "#/$defs/u1024"
+        },
+        "retainedBackupBytes": {
+          "$ref": "#/$defs/u512m"
+        },
+        "jsonDepth": {
+          "$ref": "#/$defs/u256"
+        },
+        "tokens": {
+          "$ref": "#/$defs/u200k"
+        },
+        "referenceEdges": {
+          "$ref": "#/$defs/u1m"
+        },
+        "referenceDepth": {
+          "$ref": "#/$defs/u256"
+        },
+        "resolverNodes": {
+          "$ref": "#/$defs/u100k"
+        },
+        "profiles": {
+          "$ref": "#/$defs/u1024"
+        },
+        "resolverContexts": {
+          "$ref": "#/$defs/u1024"
+        },
+        "generatedBytes": {
+          "$ref": "#/$defs/u128m"
+        },
+        "generatedArtifactBytes": {
+          "$ref": "#/$defs/u16m"
+        },
+        "diagnostics": {
+          "$ref": "#/$defs/u10k"
+        }
+      }
+    },
+    "u256": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 256
+    },
+    "u1024": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1024
+    },
+    "u4096": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4096
+    },
+    "u8192": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 8192
+    },
+    "u10k": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 10000
+    },
+    "u100k": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100000
+    },
+    "u200k": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 200000
+    },
+    "u1m": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1000000
+    },
+    "u16m": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 16777216
+    },
+    "u128m": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 134217728
+    },
+    "u512m": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 536870912
+    }
+  }
+}

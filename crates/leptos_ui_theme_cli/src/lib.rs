@@ -615,12 +615,12 @@ fn copy_init_inputs(root: &Path, scratch: &Path, config: &ProjectConfig) -> Resu
     }
     let capability_path = config
         .kit
-        .capability_paths
+        .lock_paths
         .iter()
         .find(|candidate| {
             let candidate_config = KitConfig {
                 contract_path: config.kit.contract_path.clone(),
-                capability_paths: vec![(*candidate).clone()],
+                lock_paths: vec![(*candidate).clone()],
             };
             discover_kit(root, &candidate_config, config.limits.clone()).is_ok()
         })
@@ -1013,7 +1013,7 @@ fn add_command(
                 id: id.into(),
                 label: None,
                 color_scheme: leptos_ui_theme_core::ColorScheme::Light,
-                inputs: BTreeMap::from([("theme".into(), id.into())]),
+                inputs: [("theme".into(), id.into())].into_iter().collect(),
             },
             Vec::new(),
         )
@@ -1544,7 +1544,7 @@ checksum = "sha256:test"
             "portalBodyHost": true
         }});
         std::fs::write(
-            root.join("src/components/ui/_kit/installed-kit-capability.json"),
+            root.join("src/components/ui/_kit/kit.lock.json"),
             serde_json::to_vec_pretty(&installed_capability).unwrap(),
         )
         .unwrap();

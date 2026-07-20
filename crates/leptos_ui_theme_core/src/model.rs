@@ -1,6 +1,7 @@
 use crate::{CONFIG_FILE, PROJECT_SCHEMA, ThemeError, validate_relative_path};
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use unicode_normalization::UnicodeNormalization;
 
 pub const COMPILED_LIMITS: Limits = Limits {
@@ -43,15 +44,16 @@ pub struct ProjectConfig {
     pub bootstrap: BootstrapConfig,
     pub html: HtmlConfig,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub runtime_evidence: Option<serde_json::Value>,
+    pub runtime_evidence: Option<RuntimeEvidenceConfig>,
     pub limits: Limits,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct KitConfig {
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub contract_path: Option<String>,
-    pub capability_paths: Vec<String>,
+    pub lock_paths: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -82,9 +84,10 @@ pub struct SystemProfile {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Profile {
     pub id: String,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub label: Option<String>,
     pub color_scheme: ColorScheme,
-    pub inputs: BTreeMap<String, String>,
+    pub inputs: IndexMap<String, String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -120,6 +123,7 @@ pub struct AxisConfig {
     pub attribute: String,
     pub default_context: String,
     pub contexts: Vec<String>,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub system: Option<SystemAxis>,
 }
 
@@ -151,6 +155,7 @@ pub struct SeededOutputs {
 #[serde(deny_unknown_fields)]
 pub struct BootstrapConfig {
     pub mode: BootstrapMode,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub external: Option<ExternalBootstrap>,
 }
 
@@ -168,19 +173,39 @@ pub enum BootstrapMode {
 pub struct ExternalBootstrap {
     pub output_path: String,
     pub served_path: String,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub public_path: Option<String>,
+}
+
+impl Default for ExternalBootstrap {
+    fn default() -> Self {
+        Self {
+            output_path: "public/theme-init.js".into(),
+            served_path: "theme-init.js".into(),
+            public_path: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct HtmlConfig {
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub index_path: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub index_candidates: Option<Vec<String>>,
     pub public_base_path: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeEvidenceConfig {
+    pub path: String,
+    pub required: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct Limits {
     pub file_bytes: u64,
     pub files: u32,
@@ -202,6 +227,31 @@ pub struct Limits {
     pub diagnostics: u32,
 }
 
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            file_bytes: 2_097_152,
+            files: 1_024,
+            aggregate_input_bytes: 67_108_864,
+            source_files: 512,
+            journal_entries: 128,
+            evidence_manifests: 512,
+            retained_backups: 128,
+            retained_backup_bytes: 67_108_864,
+            json_depth: 64,
+            tokens: 25_000,
+            reference_edges: 125_000,
+            reference_depth: 64,
+            resolver_nodes: 12_500,
+            profiles: 128,
+            resolver_contexts: 128,
+            generated_bytes: 16_777_216,
+            generated_artifact_bytes: 2_097_152,
+            diagnostics: 1_250,
+        }
+    }
+}
+
 impl Default for ProjectConfig {
     fn default() -> Self {
         let profiles = vec![
@@ -209,13 +259,13 @@ impl Default for ProjectConfig {
                 id: "light".into(),
                 label: None,
                 color_scheme: ColorScheme::Light,
-                inputs: BTreeMap::from([("theme".into(), "light".into())]),
+                inputs: IndexMap::from([("theme".into(), "light".into())]),
             },
             Profile {
                 id: "dark".into(),
                 label: None,
                 color_scheme: ColorScheme::Dark,
-                inputs: BTreeMap::from([("theme".into(), "dark".into())]),
+                inputs: IndexMap::from([("theme".into(), "dark".into())]),
             },
         ];
         Self {
@@ -224,9 +274,7 @@ impl Default for ProjectConfig {
             dtcg_version: "2025.10".into(),
             kit: KitConfig {
                 contract_path: None,
-                capability_paths: vec![
-                    "src/components/ui/_kit/installed-kit-capability.json".into(),
-                ],
+                lock_paths: vec!["src/components/ui/_kit/kit.lock.json".into()],
             },
             selectors: Selectors {
                 theme: "data-ui-theme".into(),
@@ -266,26 +314,7 @@ impl Default for ProjectConfig {
                 public_base_path: "/".into(),
             },
             runtime_evidence: None,
-            limits: Limits {
-                file_bytes: 2_097_152,
-                files: 1_024,
-                aggregate_input_bytes: 67_108_864,
-                source_files: 512,
-                journal_entries: 128,
-                evidence_manifests: 512,
-                retained_backups: 128,
-                retained_backup_bytes: 67_108_864,
-                json_depth: 64,
-                tokens: 25_000,
-                reference_edges: 125_000,
-                reference_depth: 64,
-                resolver_nodes: 12_500,
-                profiles: 128,
-                resolver_contexts: 128,
-                generated_bytes: 16_777_216,
-                generated_artifact_bytes: 2_097_152,
-                diagnostics: 1_250,
-            },
+            limits: Limits::default(),
         }
     }
 }
@@ -335,14 +364,18 @@ impl ProjectConfig {
                 "profile count is outside configured limits".into(),
             ));
         }
-        if self.kit.capability_paths.is_empty() || self.kit.capability_paths.len() > 32 {
+        if self.kit.lock_paths.is_empty() || self.kit.lock_paths.len() > 32 {
             return Err(ThemeError::Config(
-                "kit.capabilityPaths must contain between 1 and 32 paths".into(),
+                "kit.lockPaths must contain between 1 and 32 paths".into(),
             ));
         }
-        for path in &self.kit.capability_paths {
+        for path in &self.kit.lock_paths {
             validate_relative_path(path)?;
         }
+        ensure_unique_paths(
+            "kit.lockPaths",
+            self.kit.lock_paths.iter().map(String::as_str),
+        )?;
         if let Some(path) = self.kit.contract_path.as_deref() {
             validate_relative_path(path)?;
         }
@@ -365,24 +398,19 @@ impl ProjectConfig {
             if profile
                 .label
                 .as_ref()
-                .is_some_and(|label| label.trim().is_empty() || label.len() > 255)
+                .is_some_and(|label| label.is_empty() || label.len() > 255)
             {
                 return Err(ThemeError::Config("profile labels cannot be empty".into()));
             }
-            if profile.inputs.get("theme").map(String::as_str) != Some(&profile.id) {
+            if !profile.inputs.contains_key("theme") {
                 return Err(ThemeError::Config(format!(
-                    "profile `{}` must select its own theme context",
+                    "profile `{}` must select a theme context",
                     profile.id
                 )));
             }
             for (axis, context) in &profile.inputs {
-                if !matches!(axis.as_str(), "theme" | "density" | "motion" | "contrast") {
-                    return Err(ThemeError::Config(format!(
-                        "profile `{}` uses unknown axis `{axis}`",
-                        profile.id
-                    )));
-                }
-                validate_theme_id(context)?;
+                validate_resolver_identifier(axis)?;
+                validate_resolver_identifier(context)?;
             }
         }
         if self.profiles.default != self.profiles.system.light
@@ -394,12 +422,12 @@ impl ProjectConfig {
             ));
         }
         match (&self.html.index_path, &self.html.index_candidates) {
-            (Some(_), None) => {}
+            (Some(path), None) => validate_relative_path(path)?,
             (None, Some(candidates)) if !candidates.is_empty() && candidates.len() <= 16 => {
-                let unique: BTreeSet<_> = candidates.iter().collect();
-                if unique.len() != candidates.len() {
-                    return Err(ThemeError::Config("duplicate HTML index candidate".into()));
-                }
+                ensure_unique_paths(
+                    "html.indexCandidates",
+                    candidates.iter().map(String::as_str),
+                )?;
             }
             _ => {
                 return Err(ThemeError::Config(
@@ -412,14 +440,29 @@ impl ProjectConfig {
             (BootstrapMode::ExternalSync, Some(external)) => {
                 validate_relative_path(&external.output_path)?;
                 validate_relative_path(&external.served_path)?;
+                if file_name(&external.output_path) != file_name(&external.served_path) {
+                    return Err(ThemeError::Config(
+                        "bootstrap external outputPath and servedPath filenames differ".into(),
+                    ));
+                }
+                let derived = join_public_path(&self.html.public_base_path, &external.served_path)?;
                 if external
                     .public_path
                     .as_ref()
-                    .is_some_and(|path| !valid_public_path(path))
+                    .is_some_and(|path| path != &derived)
                 {
-                    return Err(ThemeError::Config(
-                        "bootstrap.external.publicPath is invalid".into(),
-                    ));
+                    return Err(ThemeError::Config(format!(
+                        "bootstrap.external.publicPath must equal `{derived}`"
+                    )));
+                }
+                for index in self.index_paths() {
+                    let parent = path_parent(index);
+                    if !is_descendant_of_directory(&external.output_path, parent) {
+                        return Err(ThemeError::Config(format!(
+                            "bootstrap external output `{}` is not below index directory `{parent}`",
+                            external.output_path
+                        )));
+                    }
                 }
             }
             (BootstrapMode::ExternalSync, None) => {
@@ -435,7 +478,7 @@ impl ProjectConfig {
             }
         }
         self.validate_axes()?;
-        if !valid_public_path(&self.html.public_base_path) {
+        if !valid_public_base_path(&self.html.public_base_path) {
             return Err(ThemeError::Config("html.publicBasePath is invalid".into()));
         }
         let light = self.profile(&self.profiles.system.light)?;
@@ -451,22 +494,38 @@ impl ProjectConfig {
         for path in self.all_paths() {
             validate_relative_path(path)?;
         }
-        let mut outputs = BTreeSet::new();
-        for path in [
+        if let Some(runtime_evidence) = &self.runtime_evidence {
+            validate_relative_path(&runtime_evidence.path)?;
+        }
+        let outputs = [
             &self.outputs.css,
             &self.outputs.rust,
             &self.outputs.lock,
             &self.outputs.seeded.module,
             &self.outputs.seeded.controller,
             &self.outputs.seeded.scope,
-        ] {
-            if !outputs.insert(path) {
+        ];
+        for (index, path) in outputs.iter().enumerate() {
+            for other in &outputs[index + 1..] {
+                if paths_collide(path, other) {
+                    return Err(ThemeError::Config(format!(
+                        "output `{path}` overlaps output `{other}`"
+                    )));
+                }
+            }
+        }
+        let output_set: BTreeSet<_> = outputs.into_iter().collect();
+        if output_set.len() != outputs.len() {
+            return Err(ThemeError::Config("output paths must be unique".into()));
+        }
+        for path in outputs {
+            if path == &self.token_root {
                 return Err(ThemeError::Config(format!(
-                    "overlapping output path `{path}`"
+                    "output `{path}` cannot be the token root"
                 )));
             }
         }
-        self.validate_path_boundaries(&outputs)?;
+        self.validate_path_boundaries(&output_set)?;
         Ok(())
     }
 
@@ -495,7 +554,7 @@ impl ProjectConfig {
                 )));
             }
             for context in &axis.contexts {
-                validate_theme_id(context)?;
+                validate_css_context(context)?;
             }
             match (name, &axis.system) {
                 ("density", None) => {}
@@ -526,6 +585,13 @@ impl ProjectConfig {
             self.token_root.as_str(),
             self.resolver.as_str(),
         ];
+        protected.extend(self.kit.lock_paths.iter().map(String::as_str));
+        if let Some(path) = self.kit.contract_path.as_deref() {
+            protected.push(path);
+        }
+        if let Some(runtime_evidence) = &self.runtime_evidence {
+            protected.push(&runtime_evidence.path);
+        }
         if let Some(path) = self.html.index_path.as_deref() {
             protected.push(path);
         }
@@ -534,7 +600,7 @@ impl ProjectConfig {
         }
         for output in outputs {
             for input in &protected {
-                if paths_overlap(output, input) {
+                if paths_collide(output, input) {
                     return Err(ThemeError::Config(format!(
                         "output `{output}` overlaps protected input `{input}`"
                     )));
@@ -549,10 +615,10 @@ impl ProjectConfig {
         if let Some(external) = &self.bootstrap.external
             && (outputs
                 .iter()
-                .any(|path| paths_overlap(path, &external.output_path))
+                .any(|path| paths_collide(path, &external.output_path))
                 || protected
                     .iter()
-                    .any(|path| paths_overlap(path, &external.output_path)))
+                    .any(|path| paths_collide(path, &external.output_path)))
         {
             return Err(ThemeError::Config(format!(
                 "external bootstrap output `{}` overlaps another path",
@@ -581,6 +647,13 @@ impl ProjectConfig {
             self.outputs.seeded.controller.as_str(),
             self.outputs.seeded.scope.as_str(),
         ];
+        paths.extend(self.kit.lock_paths.iter().map(String::as_str));
+        if let Some(path) = self.kit.contract_path.as_deref() {
+            paths.push(path);
+        }
+        if let Some(runtime_evidence) = &self.runtime_evidence {
+            paths.push(&runtime_evidence.path);
+        }
         if let Some(path) = self.html.index_path.as_deref() {
             paths.push(path);
         }
@@ -588,6 +661,21 @@ impl ProjectConfig {
             paths.extend(candidates.iter().map(String::as_str));
         }
         paths
+    }
+
+    fn index_paths(&self) -> Vec<&str> {
+        self.html
+            .index_path
+            .iter()
+            .map(String::as_str)
+            .chain(
+                self.html
+                    .index_candidates
+                    .iter()
+                    .flatten()
+                    .map(String::as_str),
+            )
+            .collect()
     }
 }
 
@@ -600,11 +688,169 @@ fn paths_overlap(left: &str, right: &str) -> bool {
     left == right || is_descendant(left, right) || is_descendant(right, left)
 }
 
-fn valid_public_path(value: &str) -> bool {
-    value.starts_with('/')
-        && value.ends_with('/')
-        && !value.contains("//")
-        && !value.contains(['\\', '?', '#', '\0'])
+fn paths_collide(left: &str, right: &str) -> bool {
+    paths_overlap(left, right) || paths_overlap(&fold_path(left), &fold_path(right))
+}
+
+fn fold_path(path: &str) -> String {
+    path.chars().flat_map(char::to_lowercase).collect()
+}
+
+fn ensure_unique_paths<'a>(
+    name: &str,
+    paths: impl IntoIterator<Item = &'a str>,
+) -> Result<(), ThemeError> {
+    let mut exact = BTreeSet::new();
+    let mut folded = BTreeSet::new();
+    for path in paths {
+        validate_relative_path(path)?;
+        if !exact.insert(path) || !folded.insert(fold_path(path)) {
+            return Err(ThemeError::Config(format!(
+                "{name} contains colliding paths"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
+fn validate_resolver_identifier(value: &str) -> Result<(), ThemeError> {
+    if value.is_empty() || value.len() > 255 || !value.nfc().eq(value.chars()) {
+        Err(ThemeError::Config(
+            "resolver identifier must be a nonempty NFC string of at most 255 bytes".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_css_context(value: &str) -> Result<(), ThemeError> {
+    validate_resolver_identifier(value)?;
+    if value.contains('\0') {
+        Err(ThemeError::Config(
+            "selected axis contexts cannot contain U+0000".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn is_descendant_of_directory(path: &str, directory: &str) -> bool {
+    directory.is_empty() || is_descendant(path, directory)
+}
+
+fn path_parent(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(parent, _)| parent)
+}
+
+fn file_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+fn valid_public_base_path(value: &str) -> bool {
+    value == "/"
+        || (value.starts_with('/')
+            && value.ends_with('/')
+            && canonical_public_path(value, true).is_some())
+}
+
+fn join_public_path(base: &str, served: &str) -> Result<String, ThemeError> {
+    if !valid_public_base_path(base) {
+        return Err(ThemeError::Config("html.publicBasePath is invalid".into()));
+    }
+    let encoded = served
+        .split('/')
+        .map(encode_url_segment)
+        .collect::<Vec<_>>()
+        .join("/");
+    Ok(format!("{base}{encoded}"))
+}
+
+fn encode_url_segment(segment: &str) -> String {
+    let mut encoded = String::with_capacity(segment.len());
+    for byte in segment.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    encoded
+}
+
+fn canonical_public_path(value: &str, directory: bool) -> Option<()> {
+    if !value.is_ascii()
+        || !value.starts_with('/')
+        || value.contains(['\\', '?', '#'])
+        || directory != value.ends_with('/')
+    {
+        return None;
+    }
+    let body = value.strip_prefix('/')?;
+    let body = if directory {
+        body.strip_suffix('/').unwrap_or(body)
+    } else {
+        body
+    };
+    if body.is_empty() {
+        return directory.then_some(());
+    }
+    for segment in body.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return None;
+        }
+        let bytes = segment.as_bytes();
+        let mut decoded_segment = Vec::with_capacity(bytes.len());
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == b'%' {
+                if index + 2 >= bytes.len()
+                    || !bytes[index + 1].is_ascii_hexdigit()
+                    || !bytes[index + 2].is_ascii_hexdigit()
+                    || bytes[index + 1].is_ascii_lowercase()
+                    || bytes[index + 2].is_ascii_lowercase()
+                {
+                    return None;
+                }
+                let decoded = (hex_value(bytes[index + 1])? << 4) | hex_value(bytes[index + 2])?;
+                if decoded.is_ascii_alphanumeric()
+                    || matches!(decoded, b'-' | b'.' | b'_' | b'~' | b'/' | b'\\' | b'%')
+                {
+                    return None;
+                }
+                decoded_segment.push(decoded);
+                index += 3;
+            } else if !bytes[index].is_ascii_alphanumeric()
+                && !matches!(bytes[index], b'-' | b'.' | b'_' | b'~')
+            {
+                return None;
+            } else {
+                decoded_segment.push(bytes[index]);
+                index += 1;
+            }
+        }
+        let decoded = std::str::from_utf8(&decoded_segment).ok()?;
+        if decoded == "." || decoded == ".." {
+            return None;
+        }
+    }
+    Some(())
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 pub fn validate_theme_id(value: &str) -> Result<(), ThemeError> {
@@ -745,5 +991,130 @@ impl Limits {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::PROJECT_SCHEMA_JSON;
+
+    #[test]
+    fn project_schema_identity_and_default_bytes_are_stable() {
+        let schema: serde_json::Value = serde_json::from_str(PROJECT_SCHEMA_JSON).unwrap();
+        assert_eq!(schema["$id"], PROJECT_SCHEMA);
+
+        let value = serde_json::to_value(ProjectConfig::default()).unwrap();
+        assert_eq!(
+            value.as_object().unwrap().keys().collect::<Vec<_>>(),
+            [
+                "$schema",
+                "schemaVersion",
+                "dtcgVersion",
+                "kit",
+                "selectors",
+                "storageKey",
+                "tokenRoot",
+                "resolver",
+                "profiles",
+                "outputs",
+                "bootstrap",
+                "html",
+                "limits",
+            ]
+        );
+        assert_eq!(
+            value["kit"]["lockPaths"],
+            serde_json::json!(["src/components/ui/_kit/kit.lock.json"])
+        );
+        assert!(value["html"]["indexPath"].is_null());
+        assert_eq!(
+            value["html"]["indexCandidates"],
+            serde_json::json!(["index.html"])
+        );
+
+        let schema_keys = schema["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let mut runtime_keys = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        runtime_keys.extend(["axes", "runtimeEvidence"]);
+        assert_eq!(schema_keys, runtime_keys);
+
+        let schema_limit_keys = schema["$defs"]["limits"]["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let runtime_limit_keys = value["limits"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(schema_limit_keys, runtime_limit_keys);
+    }
+
+    #[test]
+    fn omitted_limit_members_use_only_frozen_defaults() {
+        let limits: Limits = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            serde_json::to_value(limits).unwrap(),
+            serde_json::to_value(Limits::default()).unwrap()
+        );
+    }
+
+    #[test]
+    fn semantic_validation_rejects_collisions_and_conditionals() {
+        let mut config = ProjectConfig::default();
+        config.outputs.rust = "styles/themes.css/generated.rs".into();
+        assert!(config.validate().is_err());
+
+        let mut config = ProjectConfig::default();
+        config.kit.lock_paths = vec!["kit/LOCK.json".into(), "kit/lock.json".into()];
+        assert!(config.validate().is_err());
+
+        let mut config = ProjectConfig::default();
+        config.bootstrap.mode = BootstrapMode::ExternalSync;
+        assert!(config.validate().is_err());
+
+        let mut value = serde_json::to_value(ProjectConfig::default()).unwrap();
+        value["unknown"] = serde_json::Value::Bool(true);
+        assert!(serde_json::from_value::<ProjectConfig>(value).is_err());
+
+        let mut value = serde_json::to_value(ProjectConfig::default()).unwrap();
+        value["kit"].as_object_mut().unwrap().remove("contractPath");
+        assert!(serde_json::from_value::<ProjectConfig>(value).is_err());
+
+        let mut value = serde_json::to_value(ProjectConfig::default()).unwrap();
+        value["html"].as_object_mut().unwrap().remove("indexPath");
+        assert!(serde_json::from_value::<ProjectConfig>(value).is_err());
+    }
+
+    #[test]
+    fn external_bootstrap_paths_are_derived_canonically() {
+        let mut config = ProjectConfig::default();
+        config.html.public_base_path = "/app/".into();
+        config.bootstrap = BootstrapConfig {
+            mode: BootstrapMode::ExternalSync,
+            external: Some(ExternalBootstrap {
+                output_path: "public/café.js".into(),
+                served_path: "assets/café.js".into(),
+                public_path: Some("/app/assets/caf%C3%A9.js".into()),
+            }),
+        };
+        assert!(config.validate().is_ok());
+
+        config.bootstrap.external.as_mut().unwrap().public_path =
+            Some("/app/assets/caf%c3%a9.js".into());
+        assert!(config.validate().is_err());
     }
 }

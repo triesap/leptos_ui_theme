@@ -42,7 +42,8 @@ pub use kit::{
 pub use model::{
     AxesConfig, AxisConfig, BootstrapConfig, BootstrapMode, COMPILED_LIMITS, ColorScheme,
     ExternalBootstrap, HtmlConfig, KitConfig, Limits, Outputs, Profile, Profiles, ProjectConfig,
-    SeededOutputs, SelectionAxis, Selectors, SystemProfile, validate_theme_id,
+    RuntimeEvidenceConfig, SeededOutputs, SelectionAxis, Selectors, SystemProfile,
+    validate_theme_id,
 };
 pub use path::{LogicalPath, validate_relative_path};
 pub use resolver::{ResolvedProfile, ResolvedToken, ThemeCompiler};
@@ -58,6 +59,8 @@ pub const CONFIG_FILE: &str = "leptos-ui-theme.json";
 /// The project configuration schema implemented by this release.
 pub const PROJECT_SCHEMA: &str =
     "https://triesap.github.io/leptos_ui_theme/schema/0.1.0/project.schema.json";
+/// The immutable draft 2020-12 project configuration schema.
+pub const PROJECT_SCHEMA_JSON: &str = include_str!("../schemas/project.schema.json");
 
 /// Errors emitted before any output is written.
 #[derive(Debug, thiserror::Error)]
@@ -155,7 +158,7 @@ mod tests {
     fn workspace_paths_reject_parent_traversal() {
         assert!(LogicalPath::new("../shared/kit.json").is_err());
         let mut config = ProjectConfig::default();
-        config.kit.capability_paths = vec!["../shared/installed-kit-capability.json".into()];
+        config.kit.lock_paths = vec!["../shared/kit.lock.json".into()];
         assert!(config.validate().is_err());
     }
 }
