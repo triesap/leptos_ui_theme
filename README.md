@@ -34,6 +34,13 @@ Patched HTML must contain exactly one line-bounded
 managed region after that anchor and preserves all existing Trunk links and
 other app-owned markup.
 
+The artifact plan includes Unix publication modes. New files and generated
+whole-file outputs converge to `0644` independently of the process umask,
+while existing app-owned seeded files and HTML retain their modes. Transaction
+recovery validates both the expected byte digest and publication mode. Inline
+bootstrap mode emits the exact CSP source expression for the generated script
+in the theme lock and command result.
+
 ## Contributing
 
 See `CONTRIBUTING.md`.

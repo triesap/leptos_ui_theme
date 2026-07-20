@@ -13,3 +13,6 @@ Semantic Versioning.
 - Separate workspace-scoped installed-kit capability inputs from app-scoped
   theme inputs and outputs, add relocation-stable capability fingerprints,
   and reconcile HTML through an explicit insertion anchor.
+- Record publication modes in plans and recovery journals, converge generated
+  outputs to `0644` under restrictive umasks, and retain deterministic inline
+  bootstrap CSP hash evidence.

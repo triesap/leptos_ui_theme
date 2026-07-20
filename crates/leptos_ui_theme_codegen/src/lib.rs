@@ -1779,7 +1779,10 @@ fn profile<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{CssMode, GeneratedArtifact, apply_artifacts, generate_css, serialize_css};
+    use super::{
+        CssMode, GeneratedArtifact, apply_artifacts, bootstrap_script, csp_source, generate_css,
+        serialize_css,
+    };
     use leptos_ui_theme_core::{
         ColorScheme, ProjectConfig, ResolvedProfile, ResolvedToken, TokenDomain, format_css_number,
     };
@@ -1877,7 +1880,126 @@ mod tests {
                 .expect("second apply")
                 .is_empty()
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(root.join("generated/theme.css"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o644
+            );
+        }
         std::fs::remove_dir_all(root).expect("remove temporary directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_modes_converge_and_seeded_modes_are_preserved() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temporary_directory();
+        std::fs::write(root.join("generated.txt"), b"same").unwrap();
+        std::fs::set_permissions(
+            root.join("generated.txt"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        std::fs::write(root.join("seeded.txt"), b"before").unwrap();
+        std::fs::set_permissions(
+            root.join("seeded.txt"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let artifacts = vec![
+            GeneratedArtifact::generated("generated.txt", b"same".to_vec()),
+            GeneratedArtifact::seeded("seeded.txt", b"after".to_vec()),
+        ];
+        assert_eq!(
+            apply_artifacts(&root, &artifacts).unwrap(),
+            ["generated.txt", "seeded.txt"]
+        );
+        assert_eq!(
+            std::fs::metadata(root.join("generated.txt"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+        assert_eq!(
+            std::fs::metadata(root.join("seeded.txt"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restrictive_umask_child() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let Ok(root) = std::env::var("LEPTOS_UI_THEME_UMASK_CHILD_ROOT") else {
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let artifacts = vec![GeneratedArtifact::generated(
+            "generated/theme.css",
+            b"theme\n".to_vec(),
+        )];
+        apply_artifacts(&root, &artifacts).unwrap();
+        assert_eq!(
+            std::fs::metadata(root.join("generated/theme.css"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_mode_is_independent_of_process_umask() {
+        let root = temporary_directory();
+        let current = std::env::current_exe().unwrap();
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("umask 077; exec \"$1\" --exact tests::restrictive_umask_child --nocapture")
+            .arg("leptos-ui-theme-umask")
+            .arg(current)
+            .env("LEPTOS_UI_THEME_UMASK_CHILD_ROOT", &root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bootstrap_csp_source_is_scanner_compatible_and_stable() {
+        let config = ProjectConfig::default();
+        let profiles = config
+            .profiles
+            .named
+            .iter()
+            .map(|profile| ResolvedProfile {
+                id: profile.id.clone(),
+                label: profile.label.clone(),
+                color_scheme: profile.color_scheme,
+                values: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let script = bootstrap_script(&config, &profiles).unwrap();
+        let source = csp_source(script.as_bytes());
+        assert!(source.starts_with("'sha256-"));
+        assert!(source.ends_with('\''));
+        assert_eq!(source.len(), "'sha256-'".len() + 44);
     }
 
     #[test]

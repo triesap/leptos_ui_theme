@@ -38,6 +38,7 @@ pub struct Snapshot {
     pub path: String,
     pub exists: bool,
     pub digest: Option<String>,
+    pub mode: Option<u32>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -49,6 +50,8 @@ pub struct Change {
     pub ownership: Ownership,
     pub before_digest: Option<String>,
     pub after_digest: Option<String>,
+    pub before_mode: Option<u32>,
+    pub after_mode: Option<u32>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -97,7 +100,8 @@ pub fn plan_artifacts(
         }
         let snapshot = snapshot_path(root, &artifact.path)?;
         let expected = format!("sha256:{}", sha256(&artifact.bytes));
-        if snapshot.digest.as_deref() != Some(&expected) {
+        let expected_mode = publication_mode(artifact, &snapshot);
+        if snapshot.digest.as_deref() != Some(&expected) || snapshot.mode != expected_mode {
             changes.push(Change {
                 operation: if snapshot.exists {
                     ChangeOperation::Replace
@@ -109,6 +113,8 @@ pub fn plan_artifacts(
                 ownership: artifact.ownership,
                 before_digest: snapshot.digest.clone(),
                 after_digest: Some(expected),
+                before_mode: snapshot.mode,
+                after_mode: expected_mode,
             });
         }
         snapshots.push(snapshot);
@@ -140,6 +146,7 @@ fn snapshot_path(root: &Path, relative: &str) -> Result<Snapshot, CodegenError> 
                 path: relative.into(),
                 exists: false,
                 digest: None,
+                mode: None,
             });
         }
         Err(source) => {
@@ -162,5 +169,39 @@ fn snapshot_path(root: &Path, relative: &str) -> Result<Snapshot, CodegenError> 
         path: relative.into(),
         exists: true,
         digest: Some(format!("sha256:{}", sha256(&bytes))),
+        mode: file_mode(&metadata),
     })
+}
+
+fn publication_mode(artifact: &GeneratedArtifact, snapshot: &Snapshot) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        if !snapshot.exists
+            || (artifact.ownership == Ownership::GeneratedLockOwned
+                && artifact.scope == ChangeScope::WholeFile)
+        {
+            Some(0o644)
+        } else {
+            snapshot.mode
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = artifact;
+        let _ = snapshot;
+        None
+    }
+}
+
+fn file_mode(metadata: &std::fs::Metadata) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        Some(metadata.permissions().mode() & 0o777)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
 }

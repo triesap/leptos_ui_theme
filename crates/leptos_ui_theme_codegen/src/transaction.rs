@@ -45,6 +45,7 @@ struct Operation {
     path: String,
     pre_digest: Option<String>,
     expected_digest: String,
+    target_mode: Option<u32>,
     stage_path: String,
     backup_path: Option<String>,
     commit_role: CommitRole,
@@ -287,6 +288,7 @@ fn build_journal(
             path: change.path.clone(),
             pre_digest: change.before_digest.clone(),
             expected_digest,
+            target_mode: change.after_mode,
             stage_path,
             backup_path,
             commit_role: if theme_lock_path == Some(change.path.as_str()) {
@@ -339,13 +341,18 @@ fn install_operation(
     )?;
     stage_file
         .write_all(bytes)
-        .and_then(|_| stage_file.sync_all())
         .map_err(|source| CodegenError::Io {
             path: PathBuf::from(&operation.stage_path),
             source,
         })?;
+    set_file_mode(&stage, operation.target_mode)?;
+    stage_file.sync_all().map_err(|source| CodegenError::Io {
+        path: PathBuf::from(&operation.stage_path),
+        source,
+    })?;
     drop(stage_file);
     verify_digest(&stage, &operation.expected_digest, &operation.stage_path)?;
+    verify_file_mode(&stage, operation.target_mode, &operation.stage_path)?;
     append_state(
         active,
         journal,
@@ -374,6 +381,7 @@ fn install_operation(
     })?;
     sync_parent(&target)?;
     verify_digest(&target, &operation.expected_digest, &operation.path)?;
+    verify_file_mode(&target, operation.target_mode, &operation.path)?;
     append_state(
         active,
         journal,
@@ -482,7 +490,51 @@ fn verify_final_tree(root: &Path, journal: &Journal) -> Result<(), CodegenError>
     for operation in &journal.operations {
         let target = project_path(root, &operation.path)?;
         verify_digest(&target, &operation.expected_digest, &operation.path)?;
+        verify_file_mode(&target, operation.target_mode, &operation.path)?;
     }
+    Ok(())
+}
+
+fn set_file_mode(path: &Path, mode: Option<u32>) -> Result<(), CodegenError> {
+    #[cfg(unix)]
+    if let Some(mode) = mode {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).map_err(
+            |source| CodegenError::Io {
+                path: path.to_path_buf(),
+                source,
+            },
+        )?;
+    }
+    #[cfg(not(unix))]
+    let _ = (path, mode);
+    Ok(())
+}
+
+fn verify_file_mode(
+    path: &Path,
+    expected: Option<u32>,
+    relative: &str,
+) -> Result<(), CodegenError> {
+    #[cfg(unix)]
+    if let Some(expected) = expected {
+        use std::os::unix::fs::PermissionsExt;
+        let actual = std::fs::metadata(path)
+            .map_err(|source| CodegenError::Io {
+                path: PathBuf::from(relative),
+                source,
+            })?
+            .permissions()
+            .mode()
+            & 0o777;
+        if actual != expected {
+            return Err(CodegenError::Conflict(format!(
+                "{relative} has mode {actual:04o}, expected {expected:04o}"
+            )));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (path, expected, relative);
     Ok(())
 }
 
@@ -1092,4 +1144,97 @@ fn valid_transaction_id(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        APPLY_LOCK, ApplyCommand, STATE_DIRECTORY, TRANSACTIONS_DIRECTORY, build_journal,
+        ensure_private_directory, ensure_state_directory, install_operation, open_lock,
+        publish_journal, recover,
+    };
+    use crate::{GeneratedArtifact, plan_artifacts};
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn recovery_rolls_back_an_uncommitted_lock_transaction() {
+        let root = std::env::temp_dir().join(format!(
+            "leptos-ui-theme-recovery-{}-{}",
+            std::process::id(),
+            NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("generated.txt"), b"before\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                root.join("generated.txt"),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        }
+        let artifacts = vec![
+            GeneratedArtifact::generated("generated.txt", b"after\n".to_vec()),
+            GeneratedArtifact::generated("theme.lock.json", b"lock\n".to_vec()),
+        ];
+        let plan = plan_artifacts(&root, &artifacts).unwrap();
+        let state = root.join(STATE_DIRECTORY);
+        ensure_state_directory(&state).unwrap();
+        drop(open_lock(&state.join(APPLY_LOCK)).unwrap());
+        let transactions = state.join(TRANSACTIONS_DIRECTORY);
+        ensure_private_directory(&transactions).unwrap();
+        let artifact_map = artifacts
+            .iter()
+            .map(|artifact| (artifact.path.as_str(), artifact))
+            .collect::<BTreeMap<_, _>>();
+        let journal = build_journal(
+            "00000000000000000000000000000001",
+            &plan,
+            ApplyCommand::Build,
+            Some("theme.lock.json"),
+            &artifact_map,
+        )
+        .unwrap();
+        let active = publish_journal(&transactions, &journal).unwrap();
+        let mut sequence = 0;
+        let first = &journal.operations[0];
+        install_operation(
+            &root,
+            &active,
+            &journal,
+            first,
+            &artifact_map[first.path.as_str()].bytes,
+            &mut sequence,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(root.join("generated.txt")).unwrap(),
+            b"after\n"
+        );
+
+        assert!(recover(&root).unwrap());
+        assert_eq!(
+            std::fs::read(root.join("generated.txt")).unwrap(),
+            b"before\n"
+        );
+        assert!(!root.join("theme.lock.json").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(root.join("generated.txt"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        assert_eq!(std::fs::read_dir(&transactions).unwrap().count(), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
