@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 const STATE_DIRECTORY: &str = ".leptos-ui-theme";
 const TRANSACTIONS_DIRECTORY: &str = "transactions";
@@ -83,6 +84,24 @@ pub fn apply_transaction(
     command: ApplyCommand,
     theme_lock_path: Option<&str>,
 ) -> Result<Vec<String>, CodegenError> {
+    apply_transaction_with_wait(
+        root,
+        artifacts,
+        plan,
+        command,
+        theme_lock_path,
+        Duration::ZERO,
+    )
+}
+
+pub fn apply_transaction_with_wait(
+    root: &Path,
+    artifacts: &[GeneratedArtifact],
+    plan: &PlanV1,
+    command: ApplyCommand,
+    theme_lock_path: Option<&str>,
+    lock_wait: Duration,
+) -> Result<Vec<String>, CodegenError> {
     if plan.changes.is_empty() {
         return Ok(Vec::new());
     }
@@ -91,11 +110,7 @@ pub fn apply_transaction(
     ensure_state_directory(&state)?;
     let lock_path = state.join(APPLY_LOCK);
     let lock = open_lock(&lock_path)?;
-    lock.try_lock_exclusive()
-        .map_err(|source| CodegenError::Io {
-            path: PathBuf::from(format!("{STATE_DIRECTORY}/{APPLY_LOCK}")),
-            source,
-        })?;
+    lock_exclusive_with_wait(&lock, lock_wait)?;
 
     let transactions = state.join(TRANSACTIONS_DIRECTORY);
     let result = (|| {
@@ -156,6 +171,30 @@ pub fn apply_transaction(
             source,
         }),
         (Ok(paths), Ok(())) => Ok(paths),
+    }
+}
+
+fn lock_exclusive_with_wait(lock: &File, wait: Duration) -> Result<(), CodegenError> {
+    let started = Instant::now();
+    loop {
+        match lock.try_lock_exclusive() {
+            Ok(()) => return Ok(()),
+            Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
+                if started.elapsed() >= wait {
+                    return Err(CodegenError::Conflict(
+                        "the theme apply lock is busy".into(),
+                    ));
+                }
+                let remaining = wait.saturating_sub(started.elapsed());
+                std::thread::sleep(remaining.min(Duration::from_millis(10)));
+            }
+            Err(source) => {
+                return Err(CodegenError::Io {
+                    path: PathBuf::from(format!("{STATE_DIRECTORY}/{APPLY_LOCK}")),
+                    source,
+                });
+            }
+        }
     }
 }
 

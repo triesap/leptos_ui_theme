@@ -1,6 +1,7 @@
 use crate::{CONFIG_FILE, PROJECT_SCHEMA, ThemeError, validate_relative_path};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use unicode_normalization::UnicodeNormalization;
 
 pub const COMPILED_LIMITS: Limits = Limits {
     file_bytes: 16_777_216,
@@ -315,6 +316,16 @@ impl ProjectConfig {
                 "selector attributes must be unique".into(),
             ));
         }
+        if selectors.iter().any(|attribute| {
+            matches!(
+                attribute.as_str(),
+                "data-leptos-ui-theme-bootstrap" | "data-leptos-ui-theme-bootstrap-outcome"
+            )
+        }) {
+            return Err(ThemeError::Config(
+                "selector attributes use a reserved runtime name".into(),
+            ));
+        }
         if self.profiles.named.is_empty()
             || self.profiles.named.len() > self.limits.profiles as usize
         {
@@ -329,7 +340,8 @@ impl ProjectConfig {
         }
         if self.storage_key.is_empty()
             || self.storage_key.len() > 255
-            || self.storage_key.contains('\0')
+            || !self.storage_key.nfc().eq(self.storage_key.chars())
+            || self.storage_key.chars().any(forbidden_storage_scalar)
         {
             return Err(ThemeError::Config("storageKey is invalid".into()));
         }
@@ -601,13 +613,18 @@ pub fn validate_theme_id(value: &str) -> Result<(), ThemeError> {
 }
 
 fn validate_attribute(value: &str) -> Result<(), ThemeError> {
-    let valid = value.starts_with("data-")
-        && value.len() <= 63
-        && value
+    let suffix = value.strip_prefix("data-").unwrap_or_default();
+    let valid = (6..=63).contains(&value.len())
+        && suffix
             .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-        && !value.ends_with('-')
-        && !value.contains("--");
+            .next()
+            .is_some_and(|byte| byte.is_ascii_lowercase())
+        && suffix.split('-').all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        });
     if valid {
         Ok(())
     } else {
@@ -615,6 +632,21 @@ fn validate_attribute(value: &str) -> Result<(), ThemeError> {
             "invalid selector attribute `{value}`"
         )))
     }
+}
+
+fn forbidden_storage_scalar(scalar: char) -> bool {
+    matches!(
+        scalar,
+        '\u{0000}'..='\u{001f}'
+            | '\u{007f}'..='\u{009f}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{061c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+    )
 }
 
 impl Limits {

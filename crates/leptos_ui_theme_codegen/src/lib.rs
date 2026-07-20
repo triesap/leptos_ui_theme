@@ -7,17 +7,21 @@ mod transaction;
 
 pub use plan::{Change, ChangeOperation, ChangeScope, Ownership, PlanV1, Snapshot, plan_artifacts};
 pub use runtime::{seeded_controller, seeded_module, seeded_scope};
-pub use transaction::{ApplyCommand, apply_transaction, ensure_no_active_transaction, recover};
+pub use transaction::{
+    ApplyCommand, apply_transaction, apply_transaction_with_wait, ensure_no_active_transaction,
+    recover,
+};
 
 use leptos_ui_theme_core::{
     BootstrapMode, ColorScheme, ProjectConfig, ResolvedProfile, ResolvedToken, ThemeCompiler,
     ThemeError, TokenDomain, format_css_number, serialize_color_fallback, serialize_color_modern,
     sha256,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CodegenError {
@@ -126,6 +130,11 @@ struct ThemeLock<'a> {
     bootstrap: BootstrapLock,
     html_integration: HtmlIntegrationLock,
     outputs: BTreeMap<&'a str, String>,
+}
+
+#[derive(Deserialize)]
+struct PreviousThemeLock {
+    outputs: BTreeMap<String, String>,
 }
 
 #[derive(Serialize)]
@@ -312,6 +321,12 @@ pub fn build_with_options(root: &Path, options: BuildOptions) -> Result<BuildRes
     };
     let mut lock_bytes = serde_json::to_vec_pretty(&lock)?;
     lock_bytes.push(b'\n');
+    protect_generated_ownership(
+        root,
+        &artifacts,
+        &compiler.config.outputs.lock,
+        compiler.config.limits.file_bytes,
+    )?;
     artifacts.push(GeneratedArtifact::generated(
         compiler.config.outputs.lock.clone(),
         lock_bytes,
@@ -333,17 +348,104 @@ pub fn build_with_options(root: &Path, options: BuildOptions) -> Result<BuildRes
     })
 }
 
+fn protect_generated_ownership(
+    root: &Path,
+    artifacts: &[GeneratedArtifact],
+    lock_relative: &str,
+    file_limit: u64,
+) -> Result<(), CodegenError> {
+    let lock_path = root.join(lock_relative);
+    let previous = match std::fs::read(&lock_path) {
+        Ok(bytes) => {
+            if bytes.len() as u64 > file_limit {
+                return Err(CodegenError::Core(ThemeError::Config(
+                    "existing theme lock exceeds the configured file limit".into(),
+                )));
+            }
+            Some(
+                serde_json::from_slice::<PreviousThemeLock>(&bytes).map_err(|source| {
+                    CodegenError::Core(ThemeError::Json {
+                        path: PathBuf::from(lock_relative),
+                        source,
+                    })
+                })?,
+            )
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => None,
+        Err(source) => {
+            return Err(CodegenError::Io {
+                path: PathBuf::from(lock_relative),
+                source,
+            });
+        }
+    };
+    for artifact in artifacts {
+        if artifact.ownership != Ownership::GeneratedLockOwned {
+            continue;
+        }
+        let path = root.join(&artifact.path);
+        let current = match std::fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => None,
+            Err(source) => {
+                return Err(CodegenError::Io {
+                    path: PathBuf::from(&artifact.path),
+                    source,
+                });
+            }
+        };
+        let Some(current) = current else { continue };
+        if current.len() as u64 > file_limit {
+            return Err(CodegenError::Core(ThemeError::Config(format!(
+                "existing generated output `{}` exceeds the configured file limit",
+                artifact.path
+            ))));
+        }
+        if previous.is_none()
+            && artifact.scope == ChangeScope::HtmlOwnedRegion
+            && !current
+                .windows(b"<!-- leptos-ui-theme:start -->".len())
+                .any(|window| window == b"<!-- leptos-ui-theme:start -->")
+            && !current
+                .windows(b"<!-- leptos-ui-theme:end -->".len())
+                .any(|window| window == b"<!-- leptos-ui-theme:end -->")
+        {
+            continue;
+        }
+        let current_digest = format!("sha256:{}", sha256(&current));
+        let expected_previous = previous
+            .as_ref()
+            .and_then(|lock| lock.outputs.get(&artifact.path));
+        if expected_previous != Some(&current_digest) {
+            return Err(CodegenError::Conflict(format!(
+                "generated output `{}` contains unaccepted local edits",
+                artifact.path
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub fn apply(root: &Path, result: &BuildResult) -> Result<Vec<String>, CodegenError> {
+    apply_with_wait(root, result, Duration::ZERO)
+}
+
+pub fn apply_with_wait(
+    root: &Path,
+    result: &BuildResult,
+    lock_wait: Duration,
+) -> Result<Vec<String>, CodegenError> {
     let lock_path = result
         .artifacts
         .last()
         .map(|artifact| artifact.path.as_str());
-    apply_transaction(
+    apply_transaction_with_wait(
         root,
         &result.artifacts,
         &result.plan,
         ApplyCommand::Build,
         lock_path,
+        lock_wait,
     )
 }
 
@@ -360,8 +462,18 @@ pub fn apply_artifacts_for(
     command: ApplyCommand,
     theme_lock_path: Option<&str>,
 ) -> Result<Vec<String>, CodegenError> {
+    apply_artifacts_for_with_wait(root, artifacts, command, theme_lock_path, Duration::ZERO)
+}
+
+pub fn apply_artifacts_for_with_wait(
+    root: &Path,
+    artifacts: &[GeneratedArtifact],
+    command: ApplyCommand,
+    theme_lock_path: Option<&str>,
+    lock_wait: Duration,
+) -> Result<Vec<String>, CodegenError> {
     let plan = plan_artifacts(root, artifacts)?;
-    apply_transaction(root, artifacts, &plan, command, theme_lock_path)
+    apply_transaction_with_wait(root, artifacts, &plan, command, theme_lock_path, lock_wait)
 }
 
 pub fn check(_root: &Path, result: &BuildResult) -> Vec<String> {

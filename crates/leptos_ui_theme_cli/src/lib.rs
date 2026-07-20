@@ -4,8 +4,8 @@
 use clap::{Args, Parser, Subcommand};
 use leptos_ui_theme_codegen::{
     ApplyCommand, BuildOptions as CodegenBuildOptions, Change as PlannedChange, ChangeOperation,
-    ChangeScope, CodegenError, GeneratedArtifact, Ownership, apply, apply_artifacts,
-    apply_artifacts_for, build, build_with_options, check, seeded_controller, seeded_module,
+    ChangeScope, CodegenError, GeneratedArtifact, Ownership, apply_artifacts_for_with_wait,
+    apply_with_wait, build, build_with_options, check, seeded_controller, seeded_module,
     seeded_scope,
 };
 use leptos_ui_theme_core::{CONFIG_FILE, Profile, ProjectConfig, ThemeCompiler, ThemeError};
@@ -14,6 +14,7 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -30,6 +31,13 @@ pub struct Cli {
     quiet: bool,
     #[arg(long, global = true, conflicts_with_all = ["json", "quiet"])]
     verbose: bool,
+    #[arg(
+        long,
+        global = true,
+        default_value_t = 0,
+        value_parser = clap::value_parser!(u64).range(0..=300_000)
+    )]
+    lock_wait_ms: u64,
     #[command(subcommand)]
     command: Command,
 }
@@ -195,10 +203,13 @@ pub fn run(cli: Cli) -> i32 {
                     changes: outcome.changes,
                     data: outcome.data,
                 };
-                println!(
-                    "{}",
-                    serde_json::to_string(&envelope).expect("serialize envelope")
-                );
+                match serde_json::to_string(&envelope) {
+                    Ok(serialized) => println!("{serialized}"),
+                    Err(error) => {
+                        eprintln!("error: cannot serialize command output: {error}");
+                        return 70;
+                    }
+                }
             } else if !quiet {
                 print_human(&outcome);
             }
@@ -228,10 +239,13 @@ pub fn run(cli: Cli) -> i32 {
                     changes: Vec::new(),
                     data: serde_json::Value::Null,
                 };
-                println!(
-                    "{}",
-                    serde_json::to_string(&envelope).expect("serialize envelope")
-                );
+                match serde_json::to_string(&envelope) {
+                    Ok(serialized) => println!("{serialized}"),
+                    Err(serialization_error) => {
+                        eprintln!("error: cannot serialize command failure: {serialization_error}");
+                        return 70;
+                    }
+                }
             } else {
                 eprintln!("error: {error}");
             }
@@ -298,11 +312,17 @@ fn execute(cli: &Cli) -> Result<Outcome, CliError> {
         source,
     })?;
     match &cli.command {
-        Command::Init(options) => init(&cwd, options.dry_run, options.no_patch_index),
+        Command::Init(options) => init(
+            &cwd,
+            options.dry_run,
+            options.no_patch_index,
+            cli.lock_wait_ms,
+        ),
         Command::Build(options) => build_command(
             &discover(&cwd, false)?,
             options.dry_run,
             options.no_patch_index,
+            cli.lock_wait_ms,
         ),
         Command::Check => check_command(&discover(&cwd, false)?),
         Command::List => list_command(&discover(&cwd, false)?),
@@ -321,6 +341,7 @@ fn execute(cli: &Cli) -> Result<Outcome, CliError> {
             base.as_deref(),
             *from_contract_defaults,
             *dry_run,
+            cli.lock_wait_ms,
         ),
         Command::Doctor { strict } => {
             debug_assert!(*strict);
@@ -347,7 +368,12 @@ fn discover(start: &Path, init: bool) -> Result<PathBuf, CliError> {
     }
 }
 
-fn init(start: &Path, dry_run: bool, no_patch_index: bool) -> Result<Outcome, CliError> {
+fn init(
+    start: &Path,
+    dry_run: bool,
+    no_patch_index: bool,
+    lock_wait_ms: u64,
+) -> Result<Outcome, CliError> {
     let root = discover(start, true)?;
     if root.join(CONFIG_FILE).exists() {
         return Err(CliError::Conflict(format!("{CONFIG_FILE} already exists")));
@@ -405,14 +431,15 @@ fn init(start: &Path, dry_run: bool, no_patch_index: bool) -> Result<Outcome, Cl
                 }
             })
             .collect::<Vec<_>>();
-        apply_artifacts_for(&root, &artifacts, ApplyCommand::Init, None)?;
+        let lock_wait = Duration::from_millis(lock_wait_ms);
+        apply_artifacts_for_with_wait(&root, &artifacts, ApplyCommand::Init, None, lock_wait)?;
         let result = build_with_options(
             &root,
             CodegenBuildOptions {
                 patch_index: !no_patch_index,
             },
         )?;
-        let applied = apply(&root, &result)?;
+        let applied = apply_with_wait(&root, &result, lock_wait)?;
         changes.extend(
             result
                 .plan
@@ -440,7 +467,12 @@ fn init(start: &Path, dry_run: bool, no_patch_index: bool) -> Result<Outcome, Cl
     })
 }
 
-fn build_command(root: &Path, dry_run: bool, no_patch_index: bool) -> Result<Outcome, CliError> {
+fn build_command(
+    root: &Path,
+    dry_run: bool,
+    no_patch_index: bool,
+    lock_wait_ms: u64,
+) -> Result<Outcome, CliError> {
     let result = build_with_options(
         root,
         CodegenBuildOptions {
@@ -451,7 +483,7 @@ fn build_command(root: &Path, dry_run: bool, no_patch_index: bool) -> Result<Out
     let changed_paths = if dry_run {
         stale.clone()
     } else {
-        apply(root, &result)?
+        apply_with_wait(root, &result, Duration::from_millis(lock_wait_ms))?
     };
     let changes = result
         .plan
@@ -552,6 +584,7 @@ fn add_command(
     base: Option<&str>,
     from_defaults: bool,
     dry_run: bool,
+    lock_wait_ms: u64,
 ) -> Result<Outcome, CliError> {
     leptos_ui_theme_core::validate_theme_id(id)?;
     let config_path = root.join(CONFIG_FILE);
@@ -636,7 +669,13 @@ fn add_command(
             .iter()
             .map(|(path, bytes)| GeneratedArtifact::user_authored(path.clone(), bytes.clone()))
             .collect::<Vec<_>>();
-        apply_artifacts(root, &artifacts)?;
+        apply_artifacts_for_with_wait(
+            root,
+            &artifacts,
+            ApplyCommand::Add,
+            None,
+            Duration::from_millis(lock_wait_ms),
+        )?;
     }
     Ok(Outcome {
         command: "add",
@@ -897,15 +936,22 @@ mod tests {
             "<!doctype html>\n<html>\n<head>\n<link data-trunk rel=\"css\" href=\"styles/kit.css\">\n</head>\n<body></body>\n</html>\n",
         )
         .unwrap();
-        let outcome = init(&root, false, false).unwrap();
+        let outcome = init(&root, false, false, 0).unwrap();
         assert!(outcome.changes.len() >= 10);
         let css = std::fs::read_to_string(root.join("styles/themes.css")).unwrap();
         assert!(css.contains("@layer leptos-ui-kit.themes"));
         assert!(css.contains("--kit-color-surface: #ffffff"));
         let index = std::fs::read_to_string(root.join("index.html")).unwrap();
         assert!(index.contains("<!-- leptos-ui-theme:start -->"));
-        let build = build_command(&root, false, false).unwrap();
+        let build = build_command(&root, false, false, 0).unwrap();
         assert!(build.changes.is_empty());
+        std::fs::write(root.join("styles/themes.css"), "/* local edit */\n").unwrap();
+        assert!(matches!(
+            build_command(&root, false, false, 0),
+            Err(super::CliError::Codegen(
+                leptos_ui_theme_codegen::CodegenError::Conflict(_)
+            ))
+        ));
         std::fs::remove_dir_all(root).unwrap();
     }
 

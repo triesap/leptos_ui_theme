@@ -27,6 +27,7 @@ serde_json = { version = "1.0.145", features = ["preserve_order"] }
 serde_json_canonicalizer = "0.3.2"
 sha2 = "0.10.9"
 thiserror = "2.0.17"
+unicode-normalization = "0.1.25"
 
 leptos_ui_theme_core = { version = "0.1.0", path = "crates/leptos_ui_theme_core" }
 leptos_ui_theme_codegen = { version = "0.1.0", path = "crates/leptos_ui_theme_codegen" }
