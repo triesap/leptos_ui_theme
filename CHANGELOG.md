@@ -10,3 +10,6 @@ Semantic Versioning.
 - Add the three-crate compiler workspace, DTCG resolution, deterministic CSS
   and Rust generation, locks, and the `init`, `add`, `build`, `check`, `list`,
   `explain`, and strict `doctor` CLI flows.
+- Separate workspace-scoped installed-kit capability inputs from app-scoped
+  theme inputs and outputs, add relocation-stable capability fingerprints,
+  and reconcile HTML through an explicit insertion anchor.

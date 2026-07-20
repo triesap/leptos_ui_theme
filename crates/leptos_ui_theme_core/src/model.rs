@@ -51,7 +51,7 @@ pub struct ProjectConfig {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct KitConfig {
     pub contract_path: Option<String>,
-    pub lock_paths: Vec<String>,
+    pub capability_paths: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -224,7 +224,9 @@ impl Default for ProjectConfig {
             dtcg_version: "2025.10".into(),
             kit: KitConfig {
                 contract_path: None,
-                lock_paths: vec!["src/components/ui/_kit/kit.lock.json".into()],
+                capability_paths: vec![
+                    "src/components/ui/_kit/installed-kit-capability.json".into(),
+                ],
             },
             selectors: Selectors {
                 theme: "data-ui-theme".into(),
@@ -333,10 +335,16 @@ impl ProjectConfig {
                 "profile count is outside configured limits".into(),
             ));
         }
-        if self.kit.lock_paths.is_empty() || self.kit.lock_paths.len() > 32 {
+        if self.kit.capability_paths.is_empty() || self.kit.capability_paths.len() > 32 {
             return Err(ThemeError::Config(
-                "kit.lockPaths must contain between 1 and 32 paths".into(),
+                "kit.capabilityPaths must contain between 1 and 32 paths".into(),
             ));
+        }
+        for path in &self.kit.capability_paths {
+            validate_relative_path(path)?;
+        }
+        if let Some(path) = self.kit.contract_path.as_deref() {
+            validate_relative_path(path)?;
         }
         if self.storage_key.is_empty()
             || self.storage_key.len() > 255
@@ -518,10 +526,6 @@ impl ProjectConfig {
             self.token_root.as_str(),
             self.resolver.as_str(),
         ];
-        protected.extend(self.kit.lock_paths.iter().map(String::as_str));
-        if let Some(path) = self.kit.contract_path.as_deref() {
-            protected.push(path);
-        }
         if let Some(path) = self.html.index_path.as_deref() {
             protected.push(path);
         }
@@ -542,19 +546,18 @@ impl ProjectConfig {
                 "resolver must be below tokenRoot".into(),
             ));
         }
-        if let Some(external) = &self.bootstrap.external {
-            if outputs
+        if let Some(external) = &self.bootstrap.external
+            && (outputs
                 .iter()
                 .any(|path| paths_overlap(path, &external.output_path))
                 || protected
                     .iter()
-                    .any(|path| paths_overlap(path, &external.output_path))
-            {
-                return Err(ThemeError::Config(format!(
-                    "external bootstrap output `{}` overlaps another path",
-                    external.output_path
-                )));
-            }
+                    .any(|path| paths_overlap(path, &external.output_path)))
+        {
+            return Err(ThemeError::Config(format!(
+                "external bootstrap output `{}` overlaps another path",
+                external.output_path
+            )));
         }
         Ok(())
     }
@@ -578,10 +581,6 @@ impl ProjectConfig {
             self.outputs.seeded.controller.as_str(),
             self.outputs.seeded.scope.as_str(),
         ];
-        if let Some(path) = self.kit.contract_path.as_deref() {
-            paths.push(path);
-        }
-        paths.extend(self.kit.lock_paths.iter().map(String::as_str));
         if let Some(path) = self.html.index_path.as_deref() {
             paths.push(path);
         }

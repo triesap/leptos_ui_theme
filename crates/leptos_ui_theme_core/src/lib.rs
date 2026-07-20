@@ -29,7 +29,10 @@ pub use dtcg::{
     validate_reserved_members, validate_token_value,
 };
 pub use identity::{AbiVersion, ContractId, ContractRevision, Sha256Digest, ThemeId, TokenPath};
-pub use kit::{KitCapability, KitLock, VerifiedKit, discover_kit};
+pub use kit::{
+    INSTALLED_KIT_CAPABILITY_SCHEMA, InstalledKitCapability, InstalledKitCapabilityRecord,
+    KitCapability, VerifiedKit, discover_kit,
+};
 pub use model::{
     AxesConfig, AxisConfig, BootstrapConfig, BootstrapMode, COMPILED_LIMITS, ColorScheme,
     ExternalBootstrap, HtmlConfig, KitConfig, Limits, Outputs, Profile, Profiles, ProjectConfig,
@@ -119,7 +122,7 @@ pub fn sha256(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProjectConfig, sha256};
+    use super::{LogicalPath, ProjectConfig, sha256};
 
     #[test]
     fn default_config_is_valid() {
@@ -132,5 +135,13 @@ mod tests {
             sha256(b"leptos_ui_theme"),
             "33697aab7d70cc50dd8fee884096a5f82132b3e21e01366f7c54f7344144657c"
         );
+    }
+
+    #[test]
+    fn workspace_paths_reject_parent_traversal() {
+        assert!(LogicalPath::new("../shared/kit.json").is_err());
+        let mut config = ProjectConfig::default();
+        config.kit.capability_paths = vec!["../shared/installed-kit-capability.json".into()];
+        assert!(config.validate().is_err());
     }
 }

@@ -1,8 +1,8 @@
 use crate::contract::{KitTokenContract, TokenDomain};
 use crate::model::{ColorScheme, Profile, ProjectConfig};
 use crate::{
-    CONFIG_FILE, DtcgType, LogicalPath, SourceLoader, ThemeError, discover_kit, dtcg_alias_target,
-    expand_group_extends, read_json, validate_contrast, validate_reserved_members,
+    COMPILED_LIMITS, CONFIG_FILE, DtcgType, LogicalPath, SourceLoader, ThemeError, discover_kit,
+    dtcg_alias_target, expand_group_extends, validate_contrast, validate_reserved_members,
     validate_token_value,
 };
 use serde::{Deserialize, Serialize};
@@ -32,9 +32,13 @@ pub struct ResolvedProfile {
 
 #[derive(Clone, Debug)]
 pub struct ThemeCompiler {
+    pub workspace_root: PathBuf,
     pub root: PathBuf,
     pub config_path: PathBuf,
     pub config: ProjectConfig,
+    pub kit_installation_path: PathBuf,
+    pub kit_capability_path: PathBuf,
+    pub kit_capability_fingerprint: String,
     pub contract_path: PathBuf,
     pub kit_stylesheet_path: PathBuf,
     pub contract: KitTokenContract,
@@ -62,18 +66,41 @@ struct RawToken {
 impl ThemeCompiler {
     pub fn load(root: impl Into<PathBuf>) -> Result<Self, ThemeError> {
         let root = root.into();
-        let config_path = root.join(CONFIG_FILE);
-        let config: ProjectConfig = read_json(&config_path)?;
+        Self::load_with_workspace(&root, &root)
+    }
+
+    pub fn load_with_workspace(
+        workspace_root: impl Into<PathBuf>,
+        config_root: impl Into<PathBuf>,
+    ) -> Result<Self, ThemeError> {
+        let workspace_loader = SourceLoader::new(&workspace_root.into(), COMPILED_LIMITS)?;
+        let loader = SourceLoader::new(&config_root.into(), COMPILED_LIMITS)?;
+        if !loader.root().starts_with(workspace_loader.root()) {
+            return Err(ThemeError::Security(
+                "app config root is outside the security workspace root".into(),
+            ));
+        }
+        let config_logical = LogicalPath::new(CONFIG_FILE)?;
+        let config_path = loader.resolve_file(&config_logical)?;
+        let config: ProjectConfig = loader.read_json(&config_logical)?;
         config.validate()?;
-        let kit = discover_kit(&root, &config.kit, config.limits.clone())?;
+        let workspace_loader = SourceLoader::new(workspace_loader.root(), config.limits.clone())?;
+        let loader = SourceLoader::new(loader.root(), config.limits.clone())?;
+        let kit = discover_kit(workspace_loader.root(), &config.kit, config.limits.clone())?;
+        let kit_installation_path = kit.installation_path;
+        let kit_capability_path = kit.capability_path;
+        let kit_capability_fingerprint = kit.capability_fingerprint;
         let contract_path = kit.contract_path;
         let kit_stylesheet_path = kit.stylesheet_path;
         let contract = kit.contract;
-        let loader = SourceLoader::new(&root, config.limits.clone())?;
         Ok(Self {
-            root,
+            workspace_root: workspace_loader.root().to_path_buf(),
+            root: loader.root().to_path_buf(),
             config_path,
             config,
+            kit_installation_path,
+            kit_capability_path,
+            kit_capability_fingerprint,
             contract_path,
             kit_stylesheet_path,
             contract,

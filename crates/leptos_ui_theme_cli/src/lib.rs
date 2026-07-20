@@ -446,7 +446,7 @@ fn init(
             values: Vec::new(),
         })
         .collect::<Vec<_>>();
-    let files = vec![
+    let files = [
         (CONFIG_FILE.into(), pretty_json(&config)?),
         ("tokens/theme.resolver.json".into(), pretty_json(&resolver)?),
         ("tokens/themes/light.tokens.json".into(), b"{}\n".to_vec()),
@@ -603,25 +603,34 @@ fn write_scratch_file(root: &Path, relative: &str, bytes: &[u8]) -> Result<(), C
 fn copy_init_inputs(root: &Path, scratch: &Path, config: &ProjectConfig) -> Result<(), CliError> {
     let verified = discover_kit(root, &config.kit, config.limits.clone())?;
     for source in [
+        &verified.installation_path,
         &verified.contract_path,
         &verified.capability_path,
         &verified.stylesheet_path,
     ] {
         copy_init_input(root, scratch, source)?;
     }
-    let lock_path = config
+    let capability_path = config
         .kit
-        .lock_paths
+        .capability_paths
         .iter()
         .find(|candidate| {
             let candidate_config = KitConfig {
                 contract_path: config.kit.contract_path.clone(),
-                lock_paths: vec![(*candidate).clone()],
+                capability_paths: vec![(*candidate).clone()],
             };
             discover_kit(root, &candidate_config, config.limits.clone()).is_ok()
         })
-        .ok_or_else(|| ThemeError::Contract("valid kit lock path disappeared".into()))?;
-    copy_init_input(root, scratch, &root.join(lock_path))?;
+        .ok_or_else(|| ThemeError::Contract("valid kit capability path disappeared".into()))?;
+    if !verified
+        .installation_path
+        .ends_with(Path::new(capability_path))
+    {
+        return Err(ThemeError::Contract(
+            "selected installed kit capability path changed during initialization".into(),
+        )
+        .into());
+    }
     let index_paths = config
         .html
         .index_path
@@ -1019,7 +1028,7 @@ fn add_command(
     resolver["modifiers"]["theme"]["contexts"][id] = serde_json::Value::Array(sources);
     config.profiles.named.push(profile);
     config.validate()?;
-    let files = vec![
+    let files = [
         (CONFIG_FILE.into(), pretty_json(&config)?),
         (config.resolver.clone(), pretty_json(&resolver)?),
         (source_path, b"{}\n".to_vec()),
@@ -1499,7 +1508,10 @@ checksum = "sha256:test"
         });
         let capability_bytes = serde_json::to_vec_pretty(&capability).unwrap();
         std::fs::write(&capability_path, &capability_bytes).unwrap();
-        let lock = serde_json::json!({"themeIntegration": {
+        let installed_capability = serde_json::json!({
+            "$schema": leptos_ui_theme_core::INSTALLED_KIT_CAPABILITY_SCHEMA,
+            "schemaVersion": "1.0.0",
+            "themeIntegration": {
             "producerPackage": "leptos_ui_kit_cli",
             "producerVersion": "0.2.0",
             "producerChecksum": null,
@@ -1525,13 +1537,13 @@ checksum = "sha256:test"
             "portalBodyHost": true
         }});
         std::fs::write(
-            root.join("src/components/ui/_kit/kit.lock.json"),
-            serde_json::to_vec_pretty(&lock).unwrap(),
+            root.join("src/components/ui/_kit/installed-kit-capability.json"),
+            serde_json::to_vec_pretty(&installed_capability).unwrap(),
         )
         .unwrap();
         std::fs::write(
             root.join("index.html"),
-            "<!doctype html>\n<html>\n<head>\n<link data-trunk rel=\"css\" href=\"styles/kit.css\">\n</head>\n<body></body>\n</html>\n",
+            "<!doctype html>\n<html>\n<head>\n<link data-trunk rel=\"css\" href=\"styles/app.css\">\n<!-- leptos-ui-theme:anchor -->\n<link data-trunk rel=\"css\" href=\"styles/kit.css\">\n</head>\n<body></body>\n</html>\n",
         )
         .unwrap();
         let outcome = init(&root, false, false, 0).unwrap();
@@ -1549,9 +1561,17 @@ checksum = "sha256:test"
         let lock: serde_json::Value =
             serde_json::from_slice(&std::fs::read(root.join("src/theme/theme.lock.json")).unwrap())
                 .unwrap();
-        assert_eq!(lock["toolVersion"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(lock["tool"]["package"], "leptos_ui_theme_codegen");
+        assert_eq!(lock["tool"]["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(lock["dtcgVersion"], "2025.10");
         assert_eq!(lock["contract"]["contractId"], "leptos-ui-kit");
+        assert_eq!(lock["kit"]["installation"]["root"], "workspace");
+        assert!(
+            lock["kit"]["capabilityFingerprint"]
+                .as_str()
+                .unwrap()
+                .starts_with("sha256:")
+        );
         assert!(
             lock["inputs"]
                 .as_array()
@@ -1561,6 +1581,8 @@ checksum = "sha256:test"
         );
         let index = std::fs::read_to_string(root.join("index.html")).unwrap();
         assert!(index.contains("<!-- leptos-ui-theme:start -->"));
+        assert!(index.contains("href=\"styles/app.css\""));
+        assert!(index.contains("href=\"styles/kit.css\""));
         let build = build_command(&root, false, false, 0, &[]).unwrap();
         assert!(build.changes.is_empty());
         std::fs::write(root.join("styles/themes.css"), "/* local edit */\n").unwrap();

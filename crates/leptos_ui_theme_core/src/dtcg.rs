@@ -115,13 +115,13 @@ fn expand_group(
 
     let child_names = expanded
         .iter()
-        .filter_map(|(name, value)| {
-            (!name.starts_with('$')
+        .filter(|(name, value)| {
+            !name.starts_with('$')
                 && value
                     .as_object()
-                    .is_some_and(|object| !object.contains_key("$value")))
-            .then(|| name.clone())
+                    .is_some_and(|object| !object.contains_key("$value"))
         })
+        .map(|(name, _)| name.clone())
         .collect::<Vec<_>>();
     for name in child_names {
         let child = expanded

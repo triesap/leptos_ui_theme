@@ -8,25 +8,32 @@ const LAYER_ORDER: [&str; 3] = [
     "leptos-ui-kit.themes",
     "leptos-ui-kit.components",
 ];
+pub const INSTALLED_KIT_CAPABILITY_SCHEMA: &str =
+    "https://triesap.github.io/leptos_ui_theme/schema/0.1.0/installed-kit-capability.schema.json";
 
 #[derive(Clone, Debug)]
 pub struct VerifiedKit {
+    pub installation_path: PathBuf,
     pub contract_path: PathBuf,
     pub capability_path: PathBuf,
     pub stylesheet_path: PathBuf,
+    pub capability_fingerprint: String,
     pub capability: KitCapability,
     pub contract: KitTokenContract,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct KitLock {
-    pub theme_integration: KitLockRecord,
+pub struct InstalledKitCapability {
+    #[serde(rename = "$schema")]
+    pub schema: String,
+    pub schema_version: String,
+    pub theme_integration: InstalledKitCapabilityRecord,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct KitLockRecord {
+pub struct InstalledKitCapabilityRecord {
     pub producer_package: String,
     pub producer_version: String,
     pub producer_checksum: Option<String>,
@@ -126,10 +133,10 @@ pub fn discover_kit(
     let loader = SourceLoader::new(root, limits)?;
     let mut candidates = Vec::new();
     let mut failures = Vec::new();
-    for lock_path in &config.lock_paths {
-        match verify_candidate(&loader, lock_path, config.contract_path.as_deref()) {
+    for capability_path in &config.capability_paths {
+        match verify_candidate(&loader, capability_path, config.contract_path.as_deref()) {
             Ok(candidate) => candidates.push(candidate),
-            Err(error) => failures.push(format!("{lock_path}: {error}")),
+            Err(error) => failures.push(format!("{capability_path}: {error}")),
         }
     }
     match candidates.len() {
@@ -146,12 +153,19 @@ pub fn discover_kit(
 
 fn verify_candidate(
     loader: &SourceLoader,
-    lock_relative: &str,
+    installation_relative: &str,
     explicit_contract: Option<&str>,
 ) -> Result<VerifiedKit, ThemeError> {
-    let lock_logical = LogicalPath::new(lock_relative.to_owned())?;
-    let lock: KitLock = loader.read_json(&lock_logical)?;
-    let record = &lock.theme_integration;
+    let installation_logical = LogicalPath::new(installation_relative.to_owned())?;
+    let installation: InstalledKitCapability = loader.read_json(&installation_logical)?;
+    if installation.schema != INSTALLED_KIT_CAPABILITY_SCHEMA
+        || installation.schema_version != "1.0.0"
+    {
+        return Err(ThemeError::Contract(
+            "unsupported installed kit capability schema".into(),
+        ));
+    }
+    let record = &installation.theme_integration;
     require_constants(record)?;
     if explicit_contract.is_some_and(|path| path != record.contract_path) {
         return Err(ThemeError::Contract(
@@ -169,6 +183,7 @@ fn verify_candidate(
     let contract_path = loader.resolve_file(&contract_logical)?;
     let capability_path = loader.resolve_file(&capability_logical)?;
     let stylesheet_path = loader.resolve_file(&stylesheet_logical)?;
+    let installation_path = loader.resolve_file(&installation_logical)?;
     let contract = KitTokenContract::load(&contract_path)?;
     if contract.contract_id != record.contract_id
         || contract.abi_version != record.contract_abi_version
@@ -182,15 +197,17 @@ fn verify_candidate(
         ));
     }
     Ok(VerifiedKit {
+        installation_path,
         contract_path,
         capability_path,
         stylesheet_path,
+        capability_fingerprint: capability_fingerprint(&capability)?,
         capability,
         contract,
     })
 }
 
-fn require_constants(record: &KitLockRecord) -> Result<(), ThemeError> {
+fn require_constants(record: &InstalledKitCapabilityRecord) -> Result<(), ThemeError> {
     let valid = record.producer_package == "leptos_ui_kit_cli"
         && record.producer_checksum.is_none()
         && record.primitives_package == "web_ui_primitives"
@@ -223,7 +240,7 @@ fn require_constants(record: &KitLockRecord) -> Result<(), ThemeError> {
 
 fn verify_capability(
     capability: &KitCapability,
-    lock: &KitLockRecord,
+    lock: &InstalledKitCapabilityRecord,
     capability_path: &LogicalPath,
 ) -> Result<(), ThemeError> {
     let capability_contract = LogicalPath::new(capability.contract.path.clone())?;
@@ -269,6 +286,31 @@ fn verify_capability(
     }
 }
 
+fn capability_fingerprint(capability: &KitCapability) -> Result<String, ThemeError> {
+    let normalized = serde_json::json!({
+        "schema": capability.schema,
+        "schemaVersion": capability.schema_version,
+        "producer": capability.producer,
+        "primitives": capability.primitives,
+        "contract": {
+            "contractId": capability.contract.contract_id,
+            "abiVersion": capability.contract.abi_version,
+            "revision": capability.contract.revision,
+            "canonicalDigest": capability.contract.canonical_digest,
+            "installedBytesDigest": capability.contract.installed_bytes_digest,
+        },
+        "stylesheet": {
+            "installedBytesDigest": capability.stylesheet.installed_bytes_digest,
+        },
+        "layerAbi": capability.layer_abi,
+        "portalAbi": capability.portal_abi,
+    });
+    let bytes = serde_json_canonicalizer::to_vec(&normalized).map_err(|error| {
+        ThemeError::Contract(format!("cannot fingerprint kit capability: {error}"))
+    })?;
+    Ok(format!("sha256:{}", sha256(&bytes)))
+}
+
 fn verify_digest(
     loader: &SourceLoader,
     path: &LogicalPath,
@@ -297,4 +339,69 @@ fn valid_digest(value: &str) -> bool {
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ContractCapability, KitCapability, LayerCapability, PortalCapability, PrimitivesCapability,
+        ProducerCapability, StylesheetCapability, capability_fingerprint,
+    };
+
+    fn capability(contract_path: &str, stylesheet_path: &str) -> KitCapability {
+        KitCapability {
+            schema:
+                "https://triesap.github.io/leptos_ui_kit/schema/0.2.0/theme-integration.schema.json"
+                    .into(),
+            schema_version: "1.0.0".into(),
+            producer: ProducerCapability {
+                package: "leptos_ui_kit_cli".into(),
+                version: "0.2.0".into(),
+                repository: "https://github.com/triesap/leptos_ui_kit".into(),
+                checksum: None,
+            },
+            primitives: PrimitivesCapability {
+                package: "web_ui_primitives".into(),
+                requirement: ">=0.2.0,<0.3.0".into(),
+                version: "0.2.0".into(),
+                checksum: "sha256:test".into(),
+                presence_abi: 2,
+            },
+            contract: ContractCapability {
+                path: contract_path.into(),
+                contract_id: "leptos-ui-kit".into(),
+                abi_version: 1,
+                revision: 2,
+                canonical_digest: format!("sha256:{}", "1".repeat(64)),
+                installed_bytes_digest: format!("sha256:{}", "2".repeat(64)),
+            },
+            stylesheet: StylesheetCapability {
+                path: stylesheet_path.into(),
+                installed_bytes_digest: format!("sha256:{}", "3".repeat(64)),
+            },
+            layer_abi: LayerCapability {
+                version: 1,
+                order: vec![
+                    "leptos-ui-kit.tokens".into(),
+                    "leptos-ui-kit.themes".into(),
+                    "leptos-ui-kit.components".into(),
+                ],
+            },
+            portal_abi: PortalCapability {
+                version: 1,
+                mount_type: "web_ui_primitives::leptos::PortalMount".into(),
+                body_host: true,
+            },
+        }
+    }
+
+    #[test]
+    fn capability_identity_is_source_neutral() {
+        let left = capability("token-contract.json", "styles/kit.css");
+        let right = capability("relocated/token-contract.json", "assets/kit.css");
+        assert_eq!(
+            capability_fingerprint(&left).unwrap(),
+            capability_fingerprint(&right).unwrap()
+        );
+    }
 }

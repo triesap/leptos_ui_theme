@@ -23,6 +23,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+pub const HTML_INSERTION_ANCHOR: &str = "<!-- leptos-ui-theme:anchor -->";
+
 #[derive(Debug, thiserror::Error)]
 pub enum CodegenError {
     #[error(transparent)]
@@ -208,8 +210,9 @@ impl GeneratedArtifact {
 #[serde(rename_all = "camelCase")]
 struct ThemeLock {
     schema_version: &'static str,
-    tool_version: &'static str,
+    tool: ToolLock,
     dtcg_version: String,
+    kit: KitProvenanceLock,
     contract: ContractLock,
     config: InputLock,
     inputs: Vec<InputLock>,
@@ -219,6 +222,23 @@ struct ThemeLock {
     bootstrap: BootstrapLock,
     html_integration: HtmlIntegrationLock,
     outputs: BTreeMap<String, OutputLock>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolLock {
+    package: &'static str,
+    version: &'static str,
+    repository: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct KitProvenanceLock {
+    capability_fingerprint: String,
+    installation: InputLock,
+    capability: InputLock,
+    stylesheet: InputLock,
 }
 
 #[derive(Deserialize)]
@@ -251,6 +271,7 @@ struct PreviousHtmlIntegration {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ContractLock {
+    path: String,
     contract_id: String,
     abi_version: u32,
     revision: u32,
@@ -261,8 +282,16 @@ struct ContractLock {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct InputLock {
+    root: InputRoot,
     path: String,
     bytes_digest: String,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum InputRoot {
+    AppConfig,
+    Workspace,
 }
 
 #[derive(Serialize)]
@@ -294,6 +323,7 @@ struct HtmlIntegrationLock {
     mode: &'static str,
     selected_index_path: String,
     snippet_digest: String,
+    container_input_digest: String,
     region_digest: Option<String>,
     container_digest: Option<String>,
 }
@@ -303,12 +333,17 @@ pub fn build(root: &Path) -> Result<BuildResult, CodegenError> {
 }
 
 pub fn build_with_options(root: &Path, options: BuildOptions) -> Result<BuildResult, CodegenError> {
+    build_with_workspace(root, root, options)
+}
+
+pub fn build_with_workspace(
+    workspace_root: &Path,
+    config_root: &Path,
+    options: BuildOptions,
+) -> Result<BuildResult, CodegenError> {
     validate_dependency_records(options.dependency_state, &options.dependencies)?;
-    let root = std::fs::canonicalize(root).map_err(|source| CodegenError::Io {
-        path: root.to_path_buf(),
-        source,
-    })?;
-    let compiler = ThemeCompiler::load(&root)?;
+    let compiler = ThemeCompiler::load_with_workspace(workspace_root, config_root)?;
+    let root = compiler.root.clone();
     let profiles = compiler.resolve()?;
     let mut axes = Vec::new();
     if let Some(configured) = &compiler.config.axes {
@@ -357,17 +392,6 @@ pub fn build_with_options(root: &Path, options: BuildOptions) -> Result<BuildRes
         })?
         .to_string_lossy()
         .into_owned();
-    let kit_stylesheet_relative = compiler
-        .kit_stylesheet_path
-        .strip_prefix(&root)
-        .map_err(|_| {
-            CodegenError::Core(ThemeError::Security(
-                compiler.kit_stylesheet_path.display().to_string(),
-            ))
-        })?
-        .to_string_lossy()
-        .into_owned();
-    let kit_href = relative_asset(&index_relative, &kit_stylesheet_relative)?;
     let script = bootstrap_script(&compiler.config, &profiles)?;
     if compiler.config.bootstrap.mode == BootstrapMode::ExternalSync {
         let external = compiler.config.bootstrap.external.as_ref().ok_or_else(|| {
@@ -386,8 +410,9 @@ pub fn build_with_options(root: &Path, options: BuildOptions) -> Result<BuildRes
         path: selected_index.clone(),
         source,
     })?;
+    let index_exterior_digest = format!("sha256:{}", sha256(&html_exterior(&index_bytes)?));
     let region = html_region(&compiler.config, &profiles, &index_relative, &script)?;
-    let patched = patch_index(&index_bytes, &region, &kit_href)?;
+    let patched = patch_index(&index_bytes, &region)?;
     let script_digest = (compiler.config.bootstrap.mode != BootstrapMode::Disabled)
         .then(|| format!("sha256:{}", sha256(script.as_bytes())));
     let csp_source = (compiler.config.bootstrap.mode == BootstrapMode::InlineCspHash)
@@ -409,7 +434,7 @@ pub fn build_with_options(root: &Path, options: BuildOptions) -> Result<BuildRes
         let text = std::str::from_utf8(&index_bytes).map_err(|_| {
             CodegenError::Core(ThemeError::Config("index HTML must be UTF-8".into()))
         })?;
-        let expected = patch_index(&index_bytes, &region, &kit_href)?;
+        let expected = patch_index(&index_bytes, &region)?;
         if text.contains("<!-- leptos-ui-theme:start -->") && index_bytes != expected {
             return Err(CodegenError::Core(ThemeError::Config(
                 "manual HTML region is stale".into(),
@@ -445,6 +470,26 @@ pub fn build_with_options(root: &Path, options: BuildOptions) -> Result<BuildRes
         })
         .collect();
     let input_digests = collect_input_digests(&root, &compiler.config)?;
+    let installation_input = input_lock(
+        InputRoot::Workspace,
+        &compiler.workspace_root,
+        &compiler.kit_installation_path,
+    )?;
+    let capability_input = input_lock(
+        InputRoot::Workspace,
+        &compiler.workspace_root,
+        &compiler.kit_capability_path,
+    )?;
+    let contract_input = input_lock(
+        InputRoot::Workspace,
+        &compiler.workspace_root,
+        &compiler.contract_path,
+    )?;
+    let stylesheet_input = input_lock(
+        InputRoot::Workspace,
+        &compiler.workspace_root,
+        &compiler.kit_stylesheet_path,
+    )?;
     let profile_digests = profiles
         .iter()
         .map(|profile| {
@@ -457,9 +502,20 @@ pub fn build_with_options(root: &Path, options: BuildOptions) -> Result<BuildRes
         .collect::<Result<Vec<_>, CodegenError>>()?;
     let lock = ThemeLock {
         schema_version: "1.0.0",
-        tool_version: env!("CARGO_PKG_VERSION"),
+        tool: ToolLock {
+            package: env!("CARGO_PKG_NAME"),
+            version: env!("CARGO_PKG_VERSION"),
+            repository: env!("CARGO_PKG_REPOSITORY"),
+        },
         dtcg_version: compiler.config.dtcg_version.clone(),
+        kit: KitProvenanceLock {
+            capability_fingerprint: compiler.kit_capability_fingerprint.clone(),
+            installation: installation_input,
+            capability: capability_input,
+            stylesheet: stylesheet_input,
+        },
         contract: ContractLock {
+            path: contract_input.path,
             contract_id: compiler.contract.contract_id.clone(),
             abi_version: compiler.contract.abi_version,
             revision: compiler.contract.revision,
@@ -467,6 +523,7 @@ pub fn build_with_options(root: &Path, options: BuildOptions) -> Result<BuildRes
             installed_bytes_digest: format!("sha256:{}", sha256(&contract_bytes)),
         },
         config: InputLock {
+            root: InputRoot::AppConfig,
             path: CONFIG_FILE.into(),
             bytes_digest: format!("sha256:{}", sha256(&config_bytes)),
         },
@@ -493,6 +550,7 @@ pub fn build_with_options(root: &Path, options: BuildOptions) -> Result<BuildRes
                 .to_string_lossy()
                 .into_owned(),
             snippet_digest: format!("sha256:{}", sha256(region.as_bytes())),
+            container_input_digest: index_exterior_digest,
             region_digest: if options.patch_index {
                 Some(format!("sha256:{}", sha256(region.as_bytes())))
             } else {
@@ -508,6 +566,16 @@ pub fn build_with_options(root: &Path, options: BuildOptions) -> Result<BuildRes
     };
     let mut lock_bytes = serde_json::to_vec_pretty(&lock)?;
     lock_bytes.push(b'\n');
+    protect_workspace_inputs(
+        &root,
+        &artifacts,
+        &[
+            &compiler.kit_installation_path,
+            &compiler.kit_capability_path,
+            &compiler.contract_path,
+            &compiler.kit_stylesheet_path,
+        ],
+    )?;
     let (backup_artifacts, accepted_generated) = protect_generated_ownership(
         &root,
         &artifacts,
@@ -562,6 +630,27 @@ pub fn build_with_options(root: &Path, options: BuildOptions) -> Result<BuildRes
         accepted_generated,
         manual_html_stale,
     })
+}
+
+fn protect_workspace_inputs(
+    config_root: &Path,
+    artifacts: &[GeneratedArtifact],
+    inputs: &[&PathBuf],
+) -> Result<(), CodegenError> {
+    for artifact in artifacts {
+        let target = config_root.join(
+            LogicalPath::new(artifact.path.clone())
+                .map_err(CodegenError::Core)?
+                .to_path_buf(),
+        );
+        if inputs.iter().any(|input| target == input.as_path()) {
+            return Err(CodegenError::Core(ThemeError::Security(format!(
+                "generated output overlaps workspace input `{}`",
+                artifact.path
+            ))));
+        }
+    }
+    Ok(())
 }
 
 fn protect_generated_ownership(
@@ -806,8 +895,35 @@ fn collect_input_digests(
     }
     Ok(inputs
         .into_iter()
-        .map(|(path, bytes_digest)| InputLock { path, bytes_digest })
+        .map(|(path, bytes_digest)| InputLock {
+            root: InputRoot::AppConfig,
+            path,
+            bytes_digest,
+        })
         .collect())
+}
+
+fn input_lock(kind: InputRoot, root: &Path, path: &Path) -> Result<InputLock, CodegenError> {
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| CodegenError::Core(ThemeError::Security(path.display().to_string())))?
+        .to_str()
+        .ok_or_else(|| {
+            CodegenError::Core(ThemeError::Security(
+                "input provenance path is not UTF-8".into(),
+            ))
+        })?
+        .replace('\\', "/");
+    LogicalPath::new(relative.clone()).map_err(CodegenError::Core)?;
+    let bytes = std::fs::read(path).map_err(|source| CodegenError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(InputLock {
+        root: kind,
+        path: relative,
+        bytes_digest: format!("sha256:{}", sha256(&bytes)),
+    })
 }
 
 fn generated_metadata(compiler: &ThemeCompiler) -> String {
@@ -1254,12 +1370,15 @@ fn serialize_shadow_entry(value: &serde_json::Value, mode: CssMode) -> Result<St
         CssMode::Fallback => serialize_color_fallback(color_value)?,
         CssMode::Modern => serialize_color_modern(color_value)?,
     };
-    let prefix = object
+    let prefix = if object
         .get("inset")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
-        .then_some("inset ")
-        .unwrap_or("");
+    {
+        "inset "
+    } else {
+        ""
+    };
     Ok(format!(
         "{prefix}{} {} {} {} {color}",
         dimension("offsetX")?,
@@ -1529,11 +1648,7 @@ fn select_index(root: &Path, config: &ProjectConfig) -> Result<PathBuf, CodegenE
     }
 }
 
-fn patch_index(
-    index: &[u8],
-    canonical_region: &str,
-    kit_stylesheet_href: &str,
-) -> Result<Vec<u8>, CodegenError> {
+fn patch_index(index: &[u8], canonical_region: &str) -> Result<Vec<u8>, CodegenError> {
     let text = std::str::from_utf8(index)
         .map_err(|_| CodegenError::Core(ThemeError::Config("index HTML must be UTF-8".into())))?;
     if text.contains('\0') || text.starts_with('\u{feff}') {
@@ -1552,6 +1667,13 @@ fn patch_index(
     let region = canonical_region.replace('\n', newline);
     let start = format!("<!-- leptos-ui-theme:start -->{newline}");
     let end = format!("<!-- leptos-ui-theme:end -->{newline}");
+    let anchor = format!("{HTML_INSERTION_ANCHOR}{newline}");
+    let anchors: Vec<_> = text.match_indices(&anchor).collect();
+    if anchors.len() != 1 {
+        return Err(CodegenError::Core(ThemeError::Config(
+            "index HTML must contain exactly one line-bounded theme insertion anchor".into(),
+        )));
+    }
     let starts: Vec<_> = text.match_indices(&start).collect();
     let ends: Vec<_> = text.match_indices(&end).collect();
     if starts.len() == 1 && ends.len() == 1 && starts[0].0 < ends[0].0 {
@@ -1567,31 +1689,35 @@ fn patch_index(
             "index HTML has ambiguous theme markers".into(),
         )));
     }
-    let kit_lines: Vec<_> = text
-        .split_inclusive(newline)
-        .scan(0usize, |offset, line| {
-            let start = *offset;
-            *offset += line.len();
-            Some((start, line))
-        })
-        .filter(|(_, line)| {
-            line.contains("<link")
-                && line.contains("data-trunk")
-                && line.contains("rel=\"css\"")
-                && line.contains(&format!("href=\"{}\"", html_escape(kit_stylesheet_href)))
-        })
-        .collect();
-    if kit_lines.len() != 1 || !kit_lines[0].1.ends_with(newline) {
-        return Err(CodegenError::Core(ThemeError::Config(
-            "index HTML must contain one line-bounded kit stylesheet link".into(),
-        )));
-    }
-    let insertion = kit_lines[0].0 + kit_lines[0].1.len();
+    let insertion = anchors[0].0 + anchor.len();
     let mut output = Vec::with_capacity(index.len() + region.len());
     output.extend_from_slice(&index[..insertion]);
     output.extend_from_slice(region.as_bytes());
     output.extend_from_slice(&index[insertion..]);
     Ok(output)
+}
+
+fn html_exterior(index: &[u8]) -> Result<Vec<u8>, CodegenError> {
+    let text = std::str::from_utf8(index)
+        .map_err(|_| CodegenError::Core(ThemeError::Config("index HTML must be UTF-8".into())))?;
+    let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let start = format!("<!-- leptos-ui-theme:start -->{newline}");
+    let end = format!("<!-- leptos-ui-theme:end -->{newline}");
+    let starts: Vec<_> = text.match_indices(&start).collect();
+    let ends: Vec<_> = text.match_indices(&end).collect();
+    match (starts.as_slice(), ends.as_slice()) {
+        ([], []) => Ok(index.to_vec()),
+        ([(start_offset, _)], [(end_offset, _)]) if start_offset < end_offset => {
+            let end_offset = end_offset + end.len();
+            let mut exterior = Vec::with_capacity(index.len() - (end_offset - start_offset));
+            exterior.extend_from_slice(&index[..*start_offset]);
+            exterior.extend_from_slice(&index[end_offset..]);
+            Ok(exterior)
+        }
+        _ => Err(CodegenError::Core(ThemeError::Config(
+            "index HTML has ambiguous theme markers".into(),
+        ))),
+    }
 }
 
 fn relative_asset(index_path: &str, target_path: &str) -> Result<String, CodegenError> {
