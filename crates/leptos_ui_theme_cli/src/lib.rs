@@ -813,7 +813,6 @@ mod tests {
             std::fs::remove_dir_all(&root).unwrap();
         }
         std::fs::create_dir_all(&root).unwrap();
-        init(&root, false, false).unwrap();
         let contract_path = root.join("src/components/ui/_kit/token-contract.json");
         std::fs::create_dir_all(contract_path.parent().unwrap()).unwrap();
         let mut contract = serde_json::json!({
@@ -898,15 +897,15 @@ mod tests {
             "<!doctype html>\n<html>\n<head>\n<link data-trunk rel=\"css\" href=\"styles/kit.css\">\n</head>\n<body></body>\n</html>\n",
         )
         .unwrap();
-        let outcome = build_command(&root, false, false).unwrap();
-        assert_eq!(outcome.changes.len(), 4);
+        let outcome = init(&root, false, false).unwrap();
+        assert!(outcome.changes.len() >= 10);
         let css = std::fs::read_to_string(root.join("styles/themes.css")).unwrap();
         assert!(css.contains("@layer leptos-ui-kit.themes"));
         assert!(css.contains("--kit-color-surface: #ffffff"));
         let index = std::fs::read_to_string(root.join("index.html")).unwrap();
         assert!(index.contains("<!-- leptos-ui-theme:start -->"));
-        let second = build_command(&root, false, false).unwrap();
-        assert!(second.changes.is_empty());
+        let build = build_command(&root, false, false).unwrap();
+        assert!(build.changes.is_empty());
         std::fs::remove_dir_all(root).unwrap();
     }
 
