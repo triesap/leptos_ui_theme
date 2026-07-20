@@ -9,6 +9,7 @@ mod kit;
 mod model;
 mod path;
 mod resolver;
+mod source;
 
 pub use color::{Srgb, parse_color, validate_contrast};
 pub use contract::{
@@ -22,12 +23,13 @@ pub use diagnostic::{
 pub use identity::{AbiVersion, ContractId, ContractRevision, Sha256Digest, ThemeId, TokenPath};
 pub use kit::{KitCapability, KitLock, VerifiedKit, discover_kit};
 pub use model::{
-    AxesConfig, AxisConfig, BootstrapConfig, BootstrapMode, ColorScheme, ExternalBootstrap,
-    HtmlConfig, KitConfig, Limits, Outputs, Profile, Profiles, ProjectConfig, SeededOutputs,
-    Selectors, SystemProfile, validate_theme_id,
+    AxesConfig, AxisConfig, BootstrapConfig, BootstrapMode, COMPILED_LIMITS, ColorScheme,
+    ExternalBootstrap, HtmlConfig, KitConfig, Limits, Outputs, Profile, Profiles, ProjectConfig,
+    SeededOutputs, SelectionAxis, Selectors, SystemProfile, validate_theme_id,
 };
 pub use path::{LogicalPath, validate_relative_path};
 pub use resolver::{ResolvedProfile, ResolvedToken, ThemeCompiler};
+pub use source::SourceLoader;
 
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -92,14 +94,7 @@ impl ThemeError {
 }
 
 pub(crate) fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, ThemeError> {
-    let bytes = std::fs::read(path).map_err(|source| ThemeError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    serde_json::from_slice(&bytes).map_err(|source| ThemeError::Json {
-        path: path.to_path_buf(),
-        source,
-    })
+    source::read_json_file(path)
 }
 
 /// Compute a lowercase SHA-256 digest.

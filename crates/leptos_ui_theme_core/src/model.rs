@@ -1,4 +1,4 @@
-use crate::{PROJECT_SCHEMA, ThemeError, validate_relative_path};
+use crate::{CONFIG_FILE, PROJECT_SCHEMA, ThemeError, validate_relative_path};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -83,6 +83,15 @@ pub struct Profile {
 pub enum ColorScheme {
     Light,
     Dark,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SelectionAxis {
+    Theme,
+    Density,
+    Motion,
+    Contrast,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Default)]
@@ -271,6 +280,17 @@ impl ProjectConfig {
         ] {
             validate_attribute(attribute)?;
         }
+        let selectors = [
+            &self.selectors.theme,
+            &self.selectors.density,
+            &self.selectors.motion,
+            &self.selectors.contrast,
+        ];
+        if selectors.iter().collect::<BTreeSet<_>>().len() != selectors.len() {
+            return Err(ThemeError::Config(
+                "selector attributes must be unique".into(),
+            ));
+        }
         if self.profiles.named.is_empty()
             || self.profiles.named.len() > self.limits.max_profiles as usize
         {
@@ -298,11 +318,33 @@ impl ProjectConfig {
                     profile.id
                 )));
             }
-            if profile.label.as_ref().is_some_and(String::is_empty) {
+            if profile
+                .label
+                .as_ref()
+                .is_some_and(|label| label.trim().is_empty() || label.len() > 255)
+            {
                 return Err(ThemeError::Config("profile labels cannot be empty".into()));
             }
+            if profile.inputs.get("theme").map(String::as_str) != Some(&profile.id) {
+                return Err(ThemeError::Config(format!(
+                    "profile `{}` must select its own theme context",
+                    profile.id
+                )));
+            }
+            for (axis, context) in &profile.inputs {
+                if !matches!(axis.as_str(), "theme" | "density" | "motion" | "contrast") {
+                    return Err(ThemeError::Config(format!(
+                        "profile `{}` uses unknown axis `{axis}`",
+                        profile.id
+                    )));
+                }
+                validate_theme_id(context)?;
+            }
         }
-        if self.profiles.default != self.profiles.system.light {
+        if self.profiles.default != self.profiles.system.light
+            || !ids.contains(self.profiles.default.as_str())
+            || !ids.contains(self.profiles.system.dark.as_str())
+        {
             return Err(ThemeError::Config(
                 "profiles.default must equal profiles.system.light".into(),
             ));
@@ -326,6 +368,15 @@ impl ProjectConfig {
             (BootstrapMode::ExternalSync, Some(external)) => {
                 validate_relative_path(&external.output_path)?;
                 validate_relative_path(&external.served_path)?;
+                if external
+                    .public_path
+                    .as_ref()
+                    .is_some_and(|path| !valid_public_path(path))
+                {
+                    return Err(ThemeError::Config(
+                        "bootstrap.external.publicPath is invalid".into(),
+                    ));
+                }
             }
             (BootstrapMode::ExternalSync, None) => {
                 return Err(ThemeError::Config(
@@ -340,6 +391,9 @@ impl ProjectConfig {
             }
         }
         self.validate_axes()?;
+        if !valid_public_path(&self.html.public_base_path) {
+            return Err(ThemeError::Config("html.publicBasePath is invalid".into()));
+        }
         let light = self.profile(&self.profiles.system.light)?;
         let dark = self.profile(&self.profiles.system.dark)?;
         if light.color_scheme != ColorScheme::Light
@@ -368,6 +422,7 @@ impl ProjectConfig {
                 )));
             }
         }
+        self.validate_path_boundaries(&outputs)?;
         Ok(())
     }
 
@@ -387,10 +442,16 @@ impl ProjectConfig {
                 )));
             }
             let unique: BTreeSet<_> = axis.contexts.iter().collect();
-            if unique.len() != axis.contexts.len() || !unique.contains(&axis.default_context) {
+            if unique.len() != axis.contexts.len()
+                || axis.contexts.len() > self.limits.max_profiles as usize
+                || !unique.contains(&axis.default_context)
+            {
                 return Err(ThemeError::Config(format!(
                     "invalid {name} axis context inventory"
                 )));
+            }
+            for context in &axis.contexts {
+                validate_theme_id(context)?;
             }
             match (name, &axis.system) {
                 ("density", None) => {}
@@ -410,6 +471,53 @@ impl ProjectConfig {
                     }
                 }
                 (_, None) => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_path_boundaries(&self, outputs: &BTreeSet<&String>) -> Result<(), ThemeError> {
+        let mut protected = vec![
+            CONFIG_FILE,
+            self.token_root.as_str(),
+            self.resolver.as_str(),
+        ];
+        protected.extend(self.kit.lock_paths.iter().map(String::as_str));
+        if let Some(path) = self.kit.contract_path.as_deref() {
+            protected.push(path);
+        }
+        if let Some(path) = self.html.index_path.as_deref() {
+            protected.push(path);
+        }
+        if let Some(candidates) = &self.html.index_candidates {
+            protected.extend(candidates.iter().map(String::as_str));
+        }
+        for output in outputs {
+            for input in &protected {
+                if paths_overlap(output, input) {
+                    return Err(ThemeError::Config(format!(
+                        "output `{output}` overlaps protected input `{input}`"
+                    )));
+                }
+            }
+        }
+        if !is_descendant(&self.resolver, &self.token_root) {
+            return Err(ThemeError::Config(
+                "resolver must be below tokenRoot".into(),
+            ));
+        }
+        if let Some(external) = &self.bootstrap.external {
+            if outputs
+                .iter()
+                .any(|path| paths_overlap(path, &external.output_path))
+                || protected
+                    .iter()
+                    .any(|path| paths_overlap(path, &external.output_path))
+            {
+                return Err(ThemeError::Config(format!(
+                    "external bootstrap output `{}` overlaps another path",
+                    external.output_path
+                )));
             }
         }
         Ok(())
@@ -446,6 +554,22 @@ impl ProjectConfig {
         }
         paths
     }
+}
+
+fn is_descendant(path: &str, parent: &str) -> bool {
+    path.strip_prefix(parent)
+        .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn paths_overlap(left: &str, right: &str) -> bool {
+    left == right || is_descendant(left, right) || is_descendant(right, left)
+}
+
+fn valid_public_path(value: &str) -> bool {
+    value.starts_with('/')
+        && value.ends_with('/')
+        && !value.contains("//")
+        && !value.contains(['\\', '?', '#', '\0'])
 }
 
 pub fn validate_theme_id(value: &str) -> Result<(), ThemeError> {
