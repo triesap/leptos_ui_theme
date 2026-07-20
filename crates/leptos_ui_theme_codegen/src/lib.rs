@@ -13,9 +13,9 @@ pub use transaction::{
 };
 
 use leptos_ui_theme_core::{
-    BootstrapMode, ColorScheme, ProjectConfig, ResolvedProfile, ResolvedToken, ThemeCompiler,
-    ThemeError, TokenDomain, format_css_number, serialize_color_fallback, serialize_color_modern,
-    sha256,
+    BootstrapMode, ColorScheme, LogicalPath, ProjectConfig, ResolvedProfile, ResolvedToken,
+    ThemeCompiler, ThemeError, TokenDomain, format_css_number, serialize_color_fallback,
+    serialize_color_modern, sha256,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -57,6 +57,7 @@ pub struct BuildResult {
     pub profiles: Vec<ResolvedProfile>,
     pub plan: PlanV1,
     pub bootstrap: BootstrapMetadata,
+    pub accepted_generated: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug)]
@@ -90,6 +91,7 @@ pub struct BuildOptions {
     pub patch_index: bool,
     pub dependency_state: DependencyState,
     pub dependencies: Vec<DependencyRecord>,
+    pub accept_generated: Vec<String>,
 }
 
 impl Default for BuildOptions {
@@ -98,6 +100,7 @@ impl Default for BuildOptions {
             patch_index: true,
             dependency_state: DependencyState::Pending,
             dependencies: default_dependency_records(),
+            accept_generated: Vec::new(),
         }
     }
 }
@@ -406,30 +409,58 @@ pub fn build_with_options(root: &Path, options: BuildOptions) -> Result<BuildRes
     };
     let mut lock_bytes = serde_json::to_vec_pretty(&lock)?;
     lock_bytes.push(b'\n');
-    protect_generated_ownership(
+    let (backup_artifacts, accepted_generated) = protect_generated_ownership(
         root,
         &artifacts,
         &compiler.config.outputs.lock,
         compiler.config.limits.file_bytes,
+        &options.accept_generated,
     )?;
-    artifacts.push(GeneratedArtifact::generated(
-        compiler.config.outputs.lock.clone(),
-        lock_bytes,
-    ));
-    let total: usize = artifacts.iter().map(|artifact| artifact.bytes.len()).sum();
+    let lock_artifact =
+        GeneratedArtifact::generated(compiler.config.outputs.lock.clone(), lock_bytes);
+    let total: usize = artifacts
+        .iter()
+        .map(|artifact| artifact.bytes.len())
+        .sum::<usize>()
+        + lock_artifact.bytes.len();
     if total as u64 > compiler.config.limits.generated_bytes
         || artifacts.iter().any(|artifact| {
             artifact.bytes.len() as u64 > compiler.config.limits.generated_artifact_bytes
         })
+        || lock_artifact.bytes.len() as u64 > compiler.config.limits.generated_artifact_bytes
     {
         return Err(CodegenError::OutputLimit);
     }
+    let mut backups = backup_artifacts
+        .into_iter()
+        .map(|artifact| (artifact.path.clone(), artifact))
+        .collect::<BTreeMap<_, _>>();
+    let mut ordered_artifacts = Vec::with_capacity(artifacts.len() + backups.len() + 1);
+    for artifact in artifacts {
+        if let Some(backup_path) = accepted_generated.get(&artifact.path) {
+            ordered_artifacts.push(backups.remove(backup_path).ok_or_else(|| {
+                CodegenError::Core(ThemeError::Config(format!(
+                    "accepted output `{}` has no retained backup payload",
+                    artifact.path
+                )))
+            })?);
+        }
+        ordered_artifacts.push(artifact);
+    }
+    if !backups.is_empty() {
+        return Err(CodegenError::Core(ThemeError::Config(
+            "retained backup has no accepted generated output".into(),
+        )));
+    }
+    ordered_artifacts.push(lock_artifact);
+    artifacts = ordered_artifacts;
     let plan = plan_artifacts(root, &artifacts)?;
     Ok(BuildResult {
         artifacts,
         profiles,
         plan,
         bootstrap,
+        accepted_generated,
     })
 }
 
@@ -438,7 +469,25 @@ fn protect_generated_ownership(
     artifacts: &[GeneratedArtifact],
     lock_relative: &str,
     file_limit: u64,
-) -> Result<(), CodegenError> {
+    accepted_paths: &[String],
+) -> Result<(Vec<GeneratedArtifact>, BTreeMap<String, String>), CodegenError> {
+    let mut requested = accepted_paths
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    if requested.len() != accepted_paths.len() {
+        return Err(CodegenError::Core(ThemeError::Config(
+            "duplicate --accept-generated path".into(),
+        )));
+    }
+    for path in &requested {
+        LogicalPath::new(path.clone()).map_err(CodegenError::Core)?;
+        if path == lock_relative {
+            return Err(CodegenError::Core(ThemeError::Config(
+                "the theme lock cannot be accepted as a generated conflict".into(),
+            )));
+        }
+    }
     let lock_path = root.join(lock_relative);
     let previous = match std::fs::read(&lock_path) {
         Ok(bytes) => {
@@ -464,6 +513,8 @@ fn protect_generated_ownership(
             });
         }
     };
+    let mut backups = Vec::new();
+    let mut accepted = BTreeMap::new();
     for artifact in artifacts {
         if artifact.ownership != Ownership::GeneratedLockOwned {
             continue;
@@ -502,13 +553,58 @@ fn protect_generated_ownership(
             .as_ref()
             .and_then(|lock| lock.outputs.get(&artifact.path));
         if expected_previous != Some(&current_digest) {
-            return Err(CodegenError::Conflict(format!(
-                "generated output `{}` contains unaccepted local edits",
-                artifact.path
-            )));
+            if expected_previous.is_none() {
+                return Err(CodegenError::Conflict(format!(
+                    "generated output `{}` was not owned by the previous theme lock",
+                    artifact.path
+                )));
+            }
+            if !requested.remove(&artifact.path) {
+                return Err(CodegenError::Conflict(format!(
+                    "generated output `{}` contains unaccepted local edits",
+                    artifact.path
+                )));
+            }
+            let backup_path = format!(
+                ".leptos-ui-theme/backups/{}-{}.bak",
+                sha256(artifact.path.as_bytes()),
+                current_digest.trim_start_matches("sha256:")
+            );
+            let physical_backup = root.join(&backup_path);
+            match std::fs::read(&physical_backup) {
+                Ok(existing) if existing == current => {
+                    backups.push(GeneratedArtifact::generated(
+                        backup_path.clone(),
+                        current.clone(),
+                    ));
+                }
+                Ok(_) => {
+                    return Err(CodegenError::Conflict(format!(
+                        "retained backup `{backup_path}` has unexpected bytes"
+                    )));
+                }
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                    backups.push(GeneratedArtifact::generated(
+                        backup_path.clone(),
+                        current.clone(),
+                    ));
+                }
+                Err(source) => {
+                    return Err(CodegenError::Io {
+                        path: PathBuf::from(&backup_path),
+                        source,
+                    });
+                }
+            }
+            accepted.insert(artifact.path.clone(), backup_path);
         }
     }
-    Ok(())
+    if let Some(path) = requested.into_iter().next() {
+        return Err(CodegenError::Core(ThemeError::Config(format!(
+            "`--accept-generated {path}` does not name a changed generated output"
+        ))));
+    }
+    Ok((backups, accepted))
 }
 
 pub fn apply(root: &Path, result: &BuildResult) -> Result<Vec<String>, CodegenError> {

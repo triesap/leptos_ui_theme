@@ -47,7 +47,7 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Init(HtmlWriteOptions),
-    Build(HtmlWriteOptions),
+    Build(BuildWriteOptions),
     Check,
     List,
     Explain {
@@ -82,8 +82,20 @@ struct HtmlWriteOptions {
     no_patch_index: bool,
 }
 
+#[derive(Clone, Debug, Args)]
+struct BuildWriteOptions {
+    #[arg(long)]
+    dry_run: bool,
+    #[arg(long)]
+    no_patch_index: bool,
+    #[arg(long = "accept-generated")]
+    accept_generated: Vec<String>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CliError {
+    #[error("{0}")]
+    Usage(String),
     #[error(transparent)]
     Core(#[from] ThemeError),
     #[error(transparent)]
@@ -109,6 +121,7 @@ pub enum CliError {
 impl CliError {
     fn exit_code(&self) -> i32 {
         match self {
+            Self::Usage(_) => 2,
             Self::Conflict(_) => 4,
             Self::Core(ThemeError::Security(_)) => 5,
             Self::Core(ThemeError::Contract(_)) => 6,
@@ -321,6 +334,15 @@ where
 }
 
 fn execute(cli: &Cli) -> Result<Outcome, CliError> {
+    if let Command::Build(options) = &cli.command {
+        let unique = options
+            .accept_generated
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        if unique.len() != options.accept_generated.len() {
+            return Err(CliError::Usage("duplicate --accept-generated path".into()));
+        }
+    }
     let cwd = std::fs::canonicalize(&cli.cwd).map_err(|source| CliError::Io {
         path: cli.cwd.clone(),
         source,
@@ -337,6 +359,7 @@ fn execute(cli: &Cli) -> Result<Outcome, CliError> {
             options.dry_run,
             options.no_patch_index,
             cli.lock_wait_ms,
+            &options.accept_generated,
         ),
         Command::Check => check_command(&discover(&cwd, false)?),
         Command::List => list_command(&discover(&cwd, false)?),
@@ -454,6 +477,7 @@ fn init(
                 patch_index: !no_patch_index,
                 dependency_state: dependency_plan.state,
                 dependencies: dependency_plan.records.clone(),
+                accept_generated: Vec::new(),
             },
         )?;
         let applied = apply_with_wait(&root, &result, lock_wait)?;
@@ -463,7 +487,7 @@ fn init(
                 .changes
                 .iter()
                 .filter(|change| applied.contains(&change.path))
-                .map(change_from_plan),
+                .map(|change| change_from_plan(change, &result.accepted_generated)),
         );
     }
     Ok(Outcome {
@@ -492,6 +516,7 @@ fn build_command(
     dry_run: bool,
     no_patch_index: bool,
     lock_wait_ms: u64,
+    accept_generated: &[String],
 ) -> Result<Outcome, CliError> {
     let config: ProjectConfig = read_json(&root.join(CONFIG_FILE))?;
     let dependency_plan = dependency_plan(root, &config, false)?;
@@ -501,6 +526,7 @@ fn build_command(
             patch_index: !no_patch_index,
             dependency_state: dependency_plan.state,
             dependencies: dependency_plan.records.clone(),
+            accept_generated: accept_generated.to_vec(),
         },
     )?;
     let stale = check(root, &result);
@@ -514,7 +540,13 @@ fn build_command(
         .changes
         .iter()
         .filter(|change| changed_paths.contains(&change.path))
-        .map(change_from_plan)
+        .filter(|change| {
+            !result
+                .accepted_generated
+                .values()
+                .any(|backup| backup == &change.path)
+        })
+        .map(|change| change_from_plan(change, &result.accepted_generated))
         .collect::<Vec<_>>();
     let status = if dry_run && !changes.is_empty() {
         Status::Planned
@@ -539,6 +571,7 @@ fn build_command(
             "htmlSnippet": no_patch_index.then_some(result.bootstrap.html_snippet),
             "dependencyState": dependency_plan.state,
             "dependencies": dependency_plan.records,
+            "acceptedGenerated": result.accepted_generated,
         }),
     })
 }
@@ -552,6 +585,7 @@ fn check_command(root: &Path) -> Result<Outcome, CliError> {
             patch_index: true,
             dependency_state: dependency_plan.state,
             dependencies: dependency_plan.records,
+            accept_generated: Vec::new(),
         },
     )?;
     let stale = check(root, &result);
@@ -605,6 +639,7 @@ fn doctor_command(root: &Path) -> Result<Outcome, CliError> {
             patch_index: true,
             dependency_state: dependency_plan.state,
             dependencies: dependency_plan.records.clone(),
+            accept_generated: Vec::new(),
         },
     )?;
     let stale = check(root, &result);
@@ -1010,7 +1045,11 @@ fn create_change(path: &str, bytes: &[u8]) -> Change {
     }
 }
 
-fn change_from_plan(change: &PlannedChange) -> Change {
+fn change_from_plan(
+    change: &PlannedChange,
+    accepted_generated: &BTreeMap<String, String>,
+) -> Change {
+    let backup_path = accepted_generated.get(&change.path).cloned();
     Change {
         path: change.path.clone(),
         scope: change.scope,
@@ -1022,8 +1061,8 @@ fn change_from_plan(change: &PlannedChange) -> Change {
         container_after_digest: None,
         exterior_before_digest: None,
         exterior_after_digest: None,
-        backup_path: None,
-        accepted_generated_conflict: false,
+        accepted_generated_conflict: backup_path.is_some(),
+        backup_path,
     }
 }
 
@@ -1238,15 +1277,39 @@ checksum = "sha256:test"
         assert!(css.contains("--kit-color-surface: #ffffff"));
         let index = std::fs::read_to_string(root.join("index.html")).unwrap();
         assert!(index.contains("<!-- leptos-ui-theme:start -->"));
-        let build = build_command(&root, false, false, 0).unwrap();
+        let build = build_command(&root, false, false, 0, &[]).unwrap();
         assert!(build.changes.is_empty());
         std::fs::write(root.join("styles/themes.css"), "/* local edit */\n").unwrap();
         assert!(matches!(
-            build_command(&root, false, false, 0),
+            build_command(&root, false, false, 0, &[]),
             Err(super::CliError::Codegen(
                 leptos_ui_theme_codegen::CodegenError::Conflict(_)
             ))
         ));
+        let accepted =
+            build_command(&root, false, false, 0, &["styles/themes.css".into()]).unwrap();
+        let accepted_change = accepted
+            .changes
+            .iter()
+            .find(|change| change.path == "styles/themes.css")
+            .unwrap();
+        assert!(accepted_change.accepted_generated_conflict);
+        let backup_path = accepted_change.backup_path.as_ref().unwrap();
+        assert_eq!(
+            std::fs::read(root.join(backup_path)).unwrap(),
+            b"/* local edit */\n"
+        );
+        assert!(
+            std::fs::read_to_string(root.join("styles/themes.css"))
+                .unwrap()
+                .contains("@layer leptos-ui-kit.themes")
+        );
+        assert!(
+            build_command(&root, false, false, 0, &[])
+                .unwrap()
+                .changes
+                .is_empty()
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
