@@ -5,6 +5,7 @@ use crate::{
     SourceLoader, SourceRole, ThemeError, discover_kit_with_loader, dtcg_alias_target,
     expand_group_extends, validate_contrast, validate_reserved_members, validate_token_value,
 };
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -17,7 +18,7 @@ pub struct ResolvedToken {
     pub css_custom_property: String,
     pub domain: TokenDomain,
     pub value: serde_json::Value,
-    pub provenance: String,
+    pub provenance: Vec<ResolutionProvenance>,
     pub alias_of: Option<String>,
 }
 
@@ -27,7 +28,26 @@ pub struct ResolvedProfile {
     pub id: String,
     pub label: Option<String>,
     pub color_scheme: ColorScheme,
+    pub inputs: IndexMap<String, String>,
     pub values: Vec<ResolvedToken>,
+    pub semantic_digest: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolutionProvenance {
+    pub operation: ResolutionOperation,
+    pub source: String,
+    pub target: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResolutionOperation {
+    ContractDefault,
+    Source,
+    Alias,
+    Deprecation,
 }
 
 #[derive(Debug)]
@@ -45,8 +65,12 @@ pub struct ThemeCompiler {
     loader: SourceLoader,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct ResolverDocument {
+    #[serde(rename = "$schema")]
+    schema: Option<String>,
+    name: Option<String>,
     version: String,
     #[serde(default)]
     sets: serde_json::Map<String, serde_json::Value>,
@@ -54,13 +78,17 @@ struct ResolverDocument {
     modifiers: serde_json::Map<String, serde_json::Value>,
     #[serde(rename = "resolutionOrder", default)]
     resolution_order: Vec<serde_json::Value>,
+    #[serde(rename = "$extensions", default)]
+    extensions: serde_json::Map<String, serde_json::Value>,
+    #[serde(rename = "$defs", default)]
+    defs: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Clone)]
 struct RawToken {
     token_type: String,
     value: serde_json::Value,
-    provenance: String,
+    provenance: Vec<ResolutionProvenance>,
 }
 
 impl ThemeCompiler {
@@ -190,17 +218,27 @@ impl ThemeCompiler {
                     RawToken {
                         token_type: mapping.token_type.clone(),
                         value,
-                        provenance: "contract-default".into(),
+                        provenance: vec![ResolutionProvenance {
+                            operation: ResolutionOperation::ContractDefault,
+                            source: mapping.path.clone(),
+                            target: None,
+                        }],
                     },
                 );
             }
         }
 
         for order in &resolver.resolution_order {
-            let reference = order
-                .get("$ref")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| ThemeError::Resolution("resolutionOrder entry lacks $ref".into()))?;
+            let Some(reference) = order.get("$ref").and_then(serde_json::Value::as_str) else {
+                apply_sources(
+                    order.get("sources"),
+                    resolver_path,
+                    &self.loader,
+                    &mut raw,
+                    &self.config,
+                )?;
+                continue;
+            };
             if let Some(name) = reference.strip_prefix("#/sets/") {
                 let set = resolver.sets.get(name).ok_or_else(|| {
                     ThemeError::Resolution(format!("unknown resolver set `{name}`"))
@@ -254,7 +292,7 @@ impl ThemeCompiler {
                     terminal.path, value.token_type, terminal.token_type
                 )));
             }
-            if value.provenance != "contract-default"
+            if !value.is_contract_default()
                 && (!terminal.theme_override
                     || (terminal.domain != TokenDomain::Theme
                         && Some(terminal.domain) != axis_domain))
@@ -284,7 +322,13 @@ impl ThemeCompiler {
             id: profile.id.clone(),
             label: profile.label.clone(),
             color_scheme: profile.color_scheme,
+            inputs: profile.inputs.clone(),
             values,
+            semantic_digest: String::new(),
+        };
+        let resolved = ResolvedProfile {
+            semantic_digest: semantic_digest(&resolved)?,
+            ..resolved
         };
         validate_contrast(&self.contract, &resolved.values)?;
         Ok(resolved)
@@ -298,16 +342,21 @@ impl ThemeCompiler {
         resolver_path: &LogicalPath,
         raw: &mut BTreeMap<String, RawToken>,
     ) -> Result<(), ThemeError> {
-        let context = profile.inputs.get(modifier_name).ok_or_else(|| {
-            ThemeError::Resolution(format!(
-                "profile `{}` omits `{modifier_name}` input",
-                profile.id
-            ))
-        })?;
         let modifier = resolver
             .modifiers
             .get(modifier_name)
             .ok_or_else(|| ThemeError::Resolution(format!("unknown modifier `{modifier_name}`")))?;
+        let context = profile
+            .inputs
+            .get(modifier_name)
+            .map(String::as_str)
+            .or_else(|| modifier.get("default").and_then(serde_json::Value::as_str))
+            .ok_or_else(|| {
+                ThemeError::Resolution(format!(
+                    "profile `{}` omits `{modifier_name}` input and the modifier has no default",
+                    profile.id
+                ))
+            })?;
         let sources = modifier
             .get("contexts")
             .and_then(|value| value.get(context));
@@ -330,13 +379,70 @@ fn validate_resolver(
             "resolver resolutionOrder is empty".into(),
         ));
     }
+    if resolver.schema.as_deref().is_some_and(|schema| {
+        schema != "https://www.designtokens.org/schemas/2025.10/resolver.json"
+    }) || resolver.name.as_deref().is_some_and(str::is_empty)
+    {
+        return Err(ThemeError::Resolution(
+            "resolver schema or name is invalid".into(),
+        ));
+    }
+    crate::validate_extensions(Some(&serde_json::Value::Object(
+        resolver.extensions.clone(),
+    )))?;
+    for (name, set) in &resolver.sets {
+        validate_resolver_name(name)?;
+        if !set
+            .get("sources")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|sources| !sources.is_empty())
+        {
+            return Err(ThemeError::Resolution(format!(
+                "resolver set `{name}` has no sources"
+            )));
+        }
+    }
+    if resolver.modifiers.is_empty() {
+        return Err(ThemeError::Resolution(
+            "resolver modifiers are empty".into(),
+        ));
+    }
+    for (name, modifier) in &resolver.modifiers {
+        validate_resolver_name(name)?;
+        let contexts = modifier
+            .get("contexts")
+            .and_then(serde_json::Value::as_object)
+            .filter(|contexts| !contexts.is_empty())
+            .ok_or_else(|| {
+                ThemeError::Resolution(format!("resolver modifier `{name}` has no contexts"))
+            })?;
+        if let Some(default) = modifier.get("default").and_then(serde_json::Value::as_str)
+            && !contexts.contains_key(default)
+        {
+            return Err(ThemeError::Resolution(format!(
+                "resolver modifier `{name}` default is not a context"
+            )));
+        }
+        for (context, sources) in contexts {
+            validate_resolver_name(context)?;
+            if !sources
+                .as_array()
+                .is_some_and(|sources| !sources.is_empty())
+            {
+                return Err(ThemeError::Resolution(format!(
+                    "resolver context `{name}.{context}` has no sources"
+                )));
+            }
+        }
+    }
     let context_count = resolver
         .modifiers
         .values()
         .filter_map(|modifier| modifier.get("contexts")?.as_object())
         .map(serde_json::Map::len)
         .sum::<usize>();
-    let nodes = resolver.sets.len() + resolver.modifiers.len() + context_count;
+    let nodes =
+        resolver.sets.len() + resolver.modifiers.len() + context_count + resolver.defs.len();
     if nodes > config.limits.resolver_nodes as usize
         || context_count > config.limits.resolver_contexts as usize
     {
@@ -345,6 +451,22 @@ fn validate_resolver(
         ));
     }
     Ok(())
+}
+
+fn validate_resolver_name(name: &str) -> Result<(), ThemeError> {
+    if name.is_empty()
+        || name.len() > 63
+        || !name.as_bytes()[0].is_ascii_lowercase()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        Err(ThemeError::Resolution(format!(
+            "invalid resolver identifier `{name}`"
+        )))
+    } else {
+        Ok(())
+    }
 }
 
 fn apply_sources(
@@ -364,39 +486,74 @@ fn apply_sources(
             "resolver source list exceeds limits.sourceFiles".into(),
         ));
     }
+    let mut inline_names = BTreeSet::new();
     for source in sources {
-        let reference = source
-            .get("$ref")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| ThemeError::Resolution("resolver source lacks $ref".into()))?;
-        let LocalReference {
-            document: logical,
-            pointer,
-        } = LocalReference::parse(resolver_path, reference)?;
-        let token_root = LogicalPath::new(config.token_root.clone())?;
-        if logical.as_str() != token_root.as_str()
-            && !logical
-                .as_str()
-                .starts_with(&format!("{}/", token_root.as_str()))
-        {
-            return Err(ThemeError::Security(format!(
-                "resolver reference escapes the token root: `{reference}`"
-            )));
-        }
-        let value: serde_json::Value = loader.read_json_for(&logical, SourceRole::TokenResolver)?;
-        let value = expand_group_extends(&value)?;
-        let value = if pointer.as_str().is_empty() {
-            &value
-        } else {
-            value.pointer(pointer.as_str()).ok_or_else(|| {
-                ThemeError::Resolution(format!(
-                    "unknown JSON Pointer `#{}` in `{logical}`",
-                    pointer.as_str()
-                ))
-            })?
-        };
         let mut flattened = BTreeMap::new();
-        flatten_tokens(value, None, "", Path::new(logical.as_str()), &mut flattened)?;
+        if let Some(reference) = source.get("$ref").and_then(serde_json::Value::as_str) {
+            let LocalReference {
+                document: logical,
+                pointer,
+            } = LocalReference::parse(resolver_path, reference)?;
+            let token_root = LogicalPath::new(config.token_root.clone())?;
+            if logical.as_str() != token_root.as_str()
+                && !logical
+                    .as_str()
+                    .starts_with(&format!("{}/", token_root.as_str()))
+            {
+                return Err(ThemeError::Security(format!(
+                    "resolver reference escapes the token root: `{reference}`"
+                )));
+            }
+            let value: serde_json::Value =
+                loader.read_json_for(&logical, SourceRole::TokenResolver)?;
+            let value = expand_group_extends(&value)?;
+            let value = if pointer.as_str().is_empty() {
+                &value
+            } else {
+                value.pointer(pointer.as_str()).ok_or_else(|| {
+                    ThemeError::Resolution(format!(
+                        "unknown JSON Pointer `#{}` in `{logical}`",
+                        pointer.as_str()
+                    ))
+                })?
+            };
+            flatten_tokens(value, None, "", Path::new(logical.as_str()), &mut flattened)?;
+        } else {
+            let object = source.as_object().ok_or_else(|| {
+                ThemeError::Resolution(
+                    "resolver source must be a reference or inline object".into(),
+                )
+            })?;
+            if object
+                .keys()
+                .any(|key| !matches!(key.as_str(), "name" | "tokens"))
+            {
+                return Err(ThemeError::Resolution(
+                    "inline resolver source has an unknown member".into(),
+                ));
+            }
+            let name = object
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| ThemeError::Resolution("inline source lacks a name".into()))?;
+            validate_resolver_name(name)?;
+            if !inline_names.insert(name) {
+                return Err(ThemeError::Resolution(format!(
+                    "duplicate inline source name `{name}`"
+                )));
+            }
+            let tokens = object
+                .get("tokens")
+                .ok_or_else(|| ThemeError::Resolution("inline source lacks tokens".into()))?;
+            let tokens = expand_group_extends(tokens)?;
+            flatten_tokens(
+                &tokens,
+                None,
+                "",
+                Path::new(resolver_path.as_str()),
+                &mut flattened,
+            )?;
+        }
         if flattened.len() > config.limits.tokens as usize
             || raw.len().saturating_add(flattened.len()) > config.limits.tokens as usize
         {
@@ -451,7 +608,11 @@ fn flatten_tokens(
             RawToken {
                 token_type: token_type.as_str().into(),
                 value: token_value.clone(),
-                provenance: path.display().to_string(),
+                provenance: vec![ResolutionProvenance {
+                    operation: ResolutionOperation::Source,
+                    source: path.display().to_string(),
+                    target: Some(prefix.to_owned()),
+                }],
             },
         );
     }
@@ -479,11 +640,15 @@ fn flatten_tokens(
             let token_type = DtcgType::parse(token_type)?;
             validate_token_value(token_type, token_value)?;
             output.insert(
-                token_path,
+                token_path.clone(),
                 RawToken {
                     token_type: token_type.as_str().into(),
                     value: token_value.clone(),
-                    provenance: path.display().to_string(),
+                    provenance: vec![ResolutionProvenance {
+                        operation: ResolutionOperation::Source,
+                        source: path.display().to_string(),
+                        target: Some(token_path.clone()),
+                    }],
                 },
             );
         } else {
@@ -567,7 +732,12 @@ fn resolve_raw_token(
             )));
         }
         token.value = target.value;
-        token.provenance = format!("{} -> {}", token.provenance, alias.as_str());
+        token.provenance.extend(target.provenance);
+        token.provenance.push(ResolutionProvenance {
+            operation: ResolutionOperation::Alias,
+            source: key.to_owned(),
+            target: Some(alias.as_str().to_owned()),
+        });
     } else {
         token.value = resolve_property_aliases(
             &token.value,
@@ -662,7 +832,7 @@ fn apply_deprecations(
         let terminal = contract.terminal_mapping(&mapping.path)?;
         match values.get(&terminal.path) {
             Some(current)
-                if current.provenance != "contract-default"
+                if !current.is_contract_default()
                     && (current.token_type != legacy.token_type
                         || current.value != legacy.value) =>
             {
@@ -671,12 +841,20 @@ fn apply_deprecations(
                     mapping.path, terminal.path
                 )));
             }
-            Some(current) if current.provenance != "contract-default" => {}
+            Some(current) if !current.is_contract_default() => {}
             _ => {
                 values.insert(
                     terminal.path.clone(),
                     RawToken {
-                        provenance: format!("{} -> {}", legacy.provenance, terminal.path),
+                        provenance: {
+                            let mut provenance = legacy.provenance;
+                            provenance.push(ResolutionProvenance {
+                                operation: ResolutionOperation::Deprecation,
+                                source: mapping.path.clone(),
+                                target: Some(terminal.path.clone()),
+                            });
+                            provenance
+                        },
                         ..legacy
                     },
                 );
@@ -686,15 +864,52 @@ fn apply_deprecations(
     Ok(())
 }
 
+impl RawToken {
+    fn is_contract_default(&self) -> bool {
+        self.provenance.len() == 1
+            && self.provenance[0].operation == ResolutionOperation::ContractDefault
+    }
+}
+
+fn semantic_digest(profile: &ResolvedProfile) -> Result<String, ThemeError> {
+    let semantic = serde_json::json!({
+        "id": profile.id,
+        "colorScheme": profile.color_scheme,
+        "inputs": profile.inputs,
+        "values": profile.values,
+    });
+    let bytes = serde_json_canonicalizer::to_vec(&semantic).map_err(|error| {
+        ThemeError::Resolution(format!("cannot canonicalize resolved profile: {error}"))
+    })?;
+    Ok(format!("sha256:{}", crate::sha256(&bytes)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        RawToken, ResolverDocument, apply_deprecations, flatten_tokens, resolve_aliases,
-        validate_resolver,
+        RawToken, ResolutionOperation, ResolutionProvenance, ResolvedProfile, ResolverDocument,
+        apply_deprecations, flatten_tokens, resolve_aliases, semantic_digest, validate_resolver,
     };
-    use crate::KitTokenContract;
+    use crate::{ColorScheme, KitTokenContract};
+    use indexmap::IndexMap;
     use std::collections::BTreeMap;
     use std::path::Path;
+
+    fn source_provenance(source: &str) -> Vec<ResolutionProvenance> {
+        vec![ResolutionProvenance {
+            operation: ResolutionOperation::Source,
+            source: source.to_owned(),
+            target: None,
+        }]
+    }
+
+    fn default_provenance(source: &str) -> Vec<ResolutionProvenance> {
+        vec![ResolutionProvenance {
+            operation: ResolutionOperation::ContractDefault,
+            source: source.to_owned(),
+            target: None,
+        }]
+    }
 
     fn contract() -> KitTokenContract {
         serde_json::from_value(serde_json::json!({
@@ -762,7 +977,7 @@ mod tests {
                 RawToken {
                     token_type: "color".into(),
                     value: serde_json::json!("#ffffff"),
-                    provenance: "theme.tokens.json".into(),
+                    provenance: source_provenance("theme.tokens.json"),
                 },
             ),
             (
@@ -770,14 +985,17 @@ mod tests {
                 RawToken {
                     token_type: "color".into(),
                     value: serde_json::json!("#000000"),
-                    provenance: "contract-default".into(),
+                    provenance: default_provenance("color.primary"),
                 },
             ),
         ]);
         apply_deprecations(&contract, &mut values).expect("redirect assignment");
         assert!(!values.contains_key("color.legacy"));
         assert_eq!(values["color.primary"].value, "#ffffff");
-        assert!(values["color.primary"].provenance.contains("color.primary"));
+        assert!(values["color.primary"].provenance.iter().any(|entry| {
+            entry.operation == ResolutionOperation::Deprecation
+                && entry.target.as_deref() == Some("color.primary")
+        }));
     }
 
     #[test]
@@ -789,7 +1007,7 @@ mod tests {
                 RawToken {
                     token_type: "color".into(),
                     value: serde_json::json!("#ffffff"),
-                    provenance: "legacy.tokens.json".into(),
+                    provenance: source_provenance("legacy.tokens.json"),
                 },
             ),
             (
@@ -797,7 +1015,7 @@ mod tests {
                 RawToken {
                     token_type: "color".into(),
                     value: serde_json::json!("#000000"),
-                    provenance: "primary.tokens.json".into(),
+                    provenance: source_provenance("primary.tokens.json"),
                 },
             ),
         ]);
@@ -815,6 +1033,45 @@ mod tests {
     }
 
     #[test]
+    fn modifier_defaults_must_name_an_existing_context() {
+        let valid: ResolverDocument = serde_json::from_value(serde_json::json!({
+            "version": "2025.10",
+            "modifiers": {
+                "theme": {
+                    "default": "light",
+                    "contexts": {
+                        "light": [{"name": "empty", "tokens": {}}]
+                    }
+                }
+            },
+            "resolutionOrder": [{"$ref": "#/modifiers/theme"}]
+        }))
+        .unwrap();
+        assert!(validate_resolver(&valid, &crate::ProjectConfig::default()).is_ok());
+
+        let mut invalid = serde_json::to_value(&valid).unwrap();
+        invalid["modifiers"]["theme"]["default"] = serde_json::json!("missing");
+        let invalid: ResolverDocument = serde_json::from_value(invalid).unwrap();
+        assert!(validate_resolver(&invalid, &crate::ProjectConfig::default()).is_err());
+    }
+
+    #[test]
+    fn semantic_profile_digests_include_inputs_and_are_stable() {
+        let mut profile = ResolvedProfile {
+            id: "light".into(),
+            label: None,
+            color_scheme: ColorScheme::Light,
+            inputs: IndexMap::from([("theme".into(), "light".into())]),
+            values: Vec::new(),
+            semantic_digest: String::new(),
+        };
+        let first = semantic_digest(&profile).unwrap();
+        assert_eq!(first, semantic_digest(&profile).unwrap());
+        profile.inputs.insert("theme".into(), "dark".into());
+        assert_ne!(first, semantic_digest(&profile).unwrap());
+    }
+
+    #[test]
     fn alias_depth_limit_fails_instead_of_leaving_an_alias() {
         let mut values = BTreeMap::from([
             (
@@ -822,7 +1079,7 @@ mod tests {
                 RawToken {
                     token_type: "number".into(),
                     value: serde_json::json!("{b}"),
-                    provenance: "test".into(),
+                    provenance: source_provenance("test"),
                 },
             ),
             (
@@ -830,7 +1087,7 @@ mod tests {
                 RawToken {
                     token_type: "number".into(),
                     value: serde_json::json!("{c}"),
-                    provenance: "test".into(),
+                    provenance: source_provenance("test"),
                 },
             ),
             (
@@ -838,7 +1095,7 @@ mod tests {
                 RawToken {
                     token_type: "number".into(),
                     value: serde_json::json!(1),
-                    provenance: "test".into(),
+                    provenance: source_provenance("test"),
                 },
             ),
         ]);
@@ -853,7 +1110,7 @@ mod tests {
                 RawToken {
                     token_type: "color".into(),
                     value: serde_json::json!("#000000"),
-                    provenance: "test".into(),
+                    provenance: source_provenance("test"),
                 },
             ),
             (
@@ -867,7 +1124,7 @@ mod tests {
                         "blur": {"value": 4, "unit": "px"},
                         "spread": {"value": 0, "unit": "px"}
                     }),
-                    provenance: "test".into(),
+                    provenance: source_provenance("test"),
                 },
             ),
         ]);

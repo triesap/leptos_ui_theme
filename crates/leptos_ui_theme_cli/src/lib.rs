@@ -447,7 +447,9 @@ fn init(
             id: profile.id.clone(),
             label: profile.label.clone(),
             color_scheme: profile.color_scheme,
+            inputs: profile.inputs.clone(),
             values: Vec::new(),
+            semantic_digest: String::new(),
         })
         .collect::<Vec<_>>();
     let files = [

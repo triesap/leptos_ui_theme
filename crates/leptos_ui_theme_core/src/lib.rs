@@ -47,7 +47,9 @@ pub use model::{
     validate_theme_id,
 };
 pub use path::{LocalReference, LogicalPath, validate_relative_path};
-pub use resolver::{ResolvedProfile, ResolvedToken, ThemeCompiler};
+pub use resolver::{
+    ResolutionOperation, ResolutionProvenance, ResolvedProfile, ResolvedToken, ThemeCompiler,
+};
 pub use source::{OpenedSource, SourceLoader, SourceRole};
 
 use sha2::{Digest, Sha256};

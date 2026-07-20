@@ -470,14 +470,11 @@ pub fn build_with_workspace(
     let stylesheet_input = input_lock(InputRoot::Workspace, &compiler.kit_stylesheet);
     let profile_digests = profiles
         .iter()
-        .map(|profile| {
-            let bytes = serde_json_canonicalizer::to_vec(profile)?;
-            Ok(ProfileLock {
-                id: profile.id.clone(),
-                semantic_digest: format!("sha256:{}", sha256(&bytes)),
-            })
+        .map(|profile| ProfileLock {
+            id: profile.id.clone(),
+            semantic_digest: profile.semantic_digest.clone(),
         })
-        .collect::<Result<Vec<_>, CodegenError>>()?;
+        .collect();
     let lock = ThemeLock {
         schema_version: "1.0.0",
         tool: ToolLock {
@@ -1721,7 +1718,7 @@ mod tests {
                 "components": [0.62, 0.2, 260.0],
                 "alpha": 0.8
             }),
-            provenance: "test".into(),
+            provenance: Vec::new(),
             alias_of: None,
         }
     }
@@ -1734,13 +1731,17 @@ mod tests {
                 id: "light".into(),
                 label: None,
                 color_scheme: ColorScheme::Light,
+                inputs: Default::default(),
                 values: vec![oklch_token()],
+                semantic_digest: String::new(),
             },
             ResolvedProfile {
                 id: "dark".into(),
                 label: None,
                 color_scheme: ColorScheme::Dark,
+                inputs: Default::default(),
                 values: vec![oklch_token()],
+                semantic_digest: String::new(),
             },
         ];
         let css = generate_css(&config, &profiles, &[]).expect("generate CSS");
@@ -1882,7 +1883,9 @@ mod tests {
                 id: profile.id.clone(),
                 label: profile.label.clone(),
                 color_scheme: profile.color_scheme,
+                inputs: profile.inputs.clone(),
                 values: Vec::new(),
+                semantic_digest: String::new(),
             })
             .collect::<Vec<_>>();
         let script = bootstrap_script(&config, &profiles).unwrap();
