@@ -13,6 +13,8 @@ description = "Deterministic artifact generation for leptos_ui_theme"
 workspace = true
 
 [dependencies]
+fs2.workspace = true
+getrandom.workspace = true
 leptos_ui_theme_core.workspace = true
 serde.workspace = true
 serde_json.workspace = true

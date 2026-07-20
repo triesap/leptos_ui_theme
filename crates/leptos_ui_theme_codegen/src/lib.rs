@@ -2,8 +2,10 @@
 #![doc = "Deterministic artifact generation for `leptos_ui_theme`."]
 
 mod plan;
+mod transaction;
 
 pub use plan::{Change, ChangeOperation, ChangeScope, Ownership, PlanV1, Snapshot, plan_artifacts};
+pub use transaction::{ApplyCommand, apply_transaction, ensure_no_active_transaction, recover};
 
 use leptos_ui_theme_core::{
     BootstrapMode, ColorScheme, ProjectConfig, ResolvedProfile, ResolvedToken, ThemeCompiler,
@@ -11,9 +13,7 @@ use leptos_ui_theme_core::{
     sha256,
 };
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet};
-use std::fs::OpenOptions;
-use std::io::Write;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, thiserror::Error)]
@@ -91,15 +91,6 @@ impl GeneratedArtifact {
             ownership: Ownership::GeneratedLockOwned,
         }
     }
-}
-
-struct PendingArtifact {
-    relative: String,
-    path: PathBuf,
-    stage: PathBuf,
-    backup: PathBuf,
-    previous: Option<Vec<u8>>,
-    bytes: Vec<u8>,
 }
 
 #[derive(Serialize)]
@@ -222,174 +213,34 @@ pub fn build(root: &Path) -> Result<BuildResult, CodegenError> {
 }
 
 pub fn apply(root: &Path, result: &BuildResult) -> Result<Vec<String>, CodegenError> {
-    result.plan.revalidate(root)?;
-    apply_artifacts(root, &result.artifacts)
+    let lock_path = result
+        .artifacts
+        .last()
+        .map(|artifact| artifact.path.as_str());
+    apply_transaction(
+        root,
+        &result.artifacts,
+        &result.plan,
+        ApplyCommand::Build,
+        lock_path,
+    )
 }
 
 pub fn apply_artifacts(
     root: &Path,
     artifacts: &[GeneratedArtifact],
 ) -> Result<Vec<String>, CodegenError> {
-    let mut paths = BTreeSet::new();
-    for artifact in artifacts {
-        let relative = Path::new(&artifact.path);
-        if relative.is_absolute()
-            || artifact.path.is_empty()
-            || !relative
-                .components()
-                .all(|component| matches!(component, std::path::Component::Normal(_)))
-            || !paths.insert(&artifact.path)
-        {
-            return Err(CodegenError::Core(ThemeError::Security(
-                artifact.path.clone(),
-            )));
-        }
-    }
-    let canonical_root = std::fs::canonicalize(root).map_err(|source| CodegenError::Io {
-        path: root.to_path_buf(),
-        source,
-    })?;
-    let mut pending = Vec::new();
-    for (ordinal, artifact) in artifacts.iter().enumerate() {
-        let path = root.join(&artifact.path);
-        if path.is_symlink() {
-            return Err(CodegenError::Core(ThemeError::Security(
-                artifact.path.clone(),
-            )));
-        }
-        let previous = read_optional(&path)?;
-        if previous.as_deref() == Some(&artifact.bytes) {
-            continue;
-        }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|source| CodegenError::Io {
-                path: parent.to_path_buf(),
-                source,
-            })?;
-            let canonical_parent =
-                std::fs::canonicalize(parent).map_err(|source| CodegenError::Io {
-                    path: parent.to_path_buf(),
-                    source,
-                })?;
-            if !canonical_parent.starts_with(&canonical_root) {
-                return Err(CodegenError::Core(ThemeError::Security(
-                    artifact.path.clone(),
-                )));
-            }
-        }
-        let transaction = format!("{}-{ordinal:06}", std::process::id());
-        let stage = sibling(&path, &format!(".leptos-ui-theme-{transaction}.stage"));
-        let backup = sibling(&path, &format!(".leptos-ui-theme-{transaction}.backup"));
-        if stage.exists() || backup.exists() {
-            return Err(CodegenError::Conflict(artifact.path.clone()));
-        }
-        pending.push(PendingArtifact {
-            relative: artifact.path.clone(),
-            path,
-            stage,
-            backup,
-            previous,
-            bytes: artifact.bytes.clone(),
-        });
-    }
-
-    for (index, item) in pending.iter().enumerate() {
-        let write = (|| {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&item.stage)?;
-            file.write_all(&item.bytes)?;
-            file.sync_all()
-        })();
-        if let Err(source) = write {
-            cleanup_pending(&pending[..index]);
-            return Err(CodegenError::Io {
-                path: item.stage.clone(),
-                source,
-            });
-        }
-    }
-
-    for item in &pending {
-        let current = match read_optional(&item.path) {
-            Ok(current) => current,
-            Err(error) => {
-                cleanup_pending(&pending);
-                return Err(error);
-            }
-        };
-        if item.path.is_symlink() || current != item.previous {
-            cleanup_pending(&pending);
-            return Err(CodegenError::Conflict(item.relative.clone()));
-        }
-    }
-
-    for (installed, item) in pending.iter().enumerate() {
-        if item.previous.is_some()
-            && let Err(source) = std::fs::rename(&item.path, &item.backup)
-        {
-            rollback(&pending[..installed]);
-            cleanup_pending(&pending);
-            return Err(CodegenError::Io {
-                path: item.path.clone(),
-                source,
-            });
-        }
-        if let Err(source) = std::fs::rename(&item.stage, &item.path) {
-            if item.previous.is_some() {
-                let _ = std::fs::rename(&item.backup, &item.path);
-            }
-            rollback(&pending[..installed]);
-            cleanup_pending(&pending);
-            return Err(CodegenError::Io {
-                path: item.path.clone(),
-                source,
-            });
-        }
-    }
-    for item in &pending {
-        if item.backup.exists() {
-            std::fs::remove_file(&item.backup).map_err(|source| CodegenError::Io {
-                path: item.backup.clone(),
-                source,
-            })?;
-        }
-    }
-    Ok(pending.into_iter().map(|item| item.relative).collect())
+    apply_artifacts_for(root, artifacts, ApplyCommand::Add, None)
 }
 
-fn sibling(path: &Path, suffix: &str) -> PathBuf {
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(suffix);
-    path.with_file_name(name)
-}
-
-fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, CodegenError> {
-    match std::fs::read(path) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(source) => Err(CodegenError::Io {
-            path: path.to_path_buf(),
-            source,
-        }),
-    }
-}
-
-fn cleanup_pending(pending: &[PendingArtifact]) {
-    for item in pending {
-        let _ = std::fs::remove_file(&item.stage);
-        let _ = std::fs::remove_file(&item.backup);
-    }
-}
-
-fn rollback(installed: &[PendingArtifact]) {
-    for item in installed.iter().rev() {
-        let _ = std::fs::remove_file(&item.path);
-        if item.backup.exists() {
-            let _ = std::fs::rename(&item.backup, &item.path);
-        }
-    }
+pub fn apply_artifacts_for(
+    root: &Path,
+    artifacts: &[GeneratedArtifact],
+    command: ApplyCommand,
+    theme_lock_path: Option<&str>,
+) -> Result<Vec<String>, CodegenError> {
+    let plan = plan_artifacts(root, artifacts)?;
+    apply_transaction(root, artifacts, &plan, command, theme_lock_path)
 }
 
 pub fn check(_root: &Path, result: &BuildResult) -> Vec<String> {

@@ -3,7 +3,8 @@
 
 use clap::{Args, Parser, Subcommand};
 use leptos_ui_theme_codegen::{
-    CodegenError, GeneratedArtifact, apply, apply_artifacts, build, check,
+    ApplyCommand, CodegenError, GeneratedArtifact, apply, apply_artifacts, apply_artifacts_for,
+    build, check,
 };
 use leptos_ui_theme_core::{CONFIG_FILE, Profile, ProjectConfig, ThemeCompiler, ThemeError};
 use serde::Serialize;
@@ -292,7 +293,7 @@ fn init(start: &Path, dry_run: bool) -> Result<Outcome, CliError> {
                 }
             })
             .collect::<Vec<_>>();
-        apply_artifacts(&root, &artifacts)?;
+        apply_artifacts_for(&root, &artifacts, ApplyCommand::Init, None)?;
     }
     Ok(Outcome {
         command: "init",
