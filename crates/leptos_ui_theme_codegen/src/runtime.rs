@@ -21,8 +21,7 @@ pub fn seeded_controller(_config: &ProjectConfig, _profiles: &[ResolvedProfile])
     r#"//! Application-owned theme preference and browser integration.
 
 use super::generated::{
-    BOOTSTRAP_ATTRIBUTE, BOOTSTRAP_ENABLED, BOOTSTRAP_OUTCOME_PROPERTY, STORAGE_KEY,
-    SYSTEM_DARK_THEME, SYSTEM_LIGHT_THEME, THEME_ATTRIBUTE, ThemeId, parse_theme_id,
+    SYSTEM_LIGHT_THEME, ThemeId, parse_theme_id,
 };
 use leptos::prelude::*;
 
@@ -111,6 +110,7 @@ impl ThemeController {
         self.refresh_effective();
     }
 
+    #[cfg(target_arch = "wasm32")]
     fn update_without_persistence(self, preference: ThemePreference) {
         self.preference.set(preference);
         if let Err(issue) = browser::apply(preference) {
@@ -174,30 +174,13 @@ mod browser {
 #[cfg(target_arch = "wasm32")]
 mod browser {
     use super::*;
+    use super::super::generated::{
+        BOOTSTRAP_ATTRIBUTE, BOOTSTRAP_ENABLED, BOOTSTRAP_OUTCOME_PROPERTY, STORAGE_KEY,
+        SYSTEM_DARK_THEME, THEME_ATTRIBUTE,
+    };
     use leptos::__reexports::send_wrapper::SendWrapper;
-    use leptos::wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
-    use leptos::web_sys::{Event, Storage, StorageEvent, window};
-
-    #[wasm_bindgen]
-    extern "C" {
-        #[wasm_bindgen(js_namespace = Object, js_name = getOwnPropertyDescriptor)]
-        fn own_property_descriptor(object: &JsValue, key: &str) -> JsValue;
-
-        #[wasm_bindgen(js_namespace = Reflect, js_name = deleteProperty)]
-        fn delete_property(object: &JsValue, key: &str) -> Result<bool, JsValue>;
-
-        #[wasm_bindgen(method, getter, structural)]
-        fn value(this: &JsValue) -> JsValue;
-
-        #[wasm_bindgen(method, getter, structural)]
-        fn enumerable(this: &JsValue) -> bool;
-
-        #[wasm_bindgen(method, getter, structural)]
-        fn writable(this: &JsValue) -> bool;
-
-        #[wasm_bindgen(method, getter, structural)]
-        fn configurable(this: &JsValue) -> bool;
-    }
+    use leptos::wasm_bindgen::{JsCast, JsValue, closure::Closure};
+    use leptos::web_sys::{Event, js_sys, window};
 
     pub fn initialize() -> (ThemePreference, Vec<RuntimeIssue>) {
         let mut issues = Vec::new();
@@ -219,17 +202,18 @@ mod browser {
 
     fn adopt_bootstrap(issues: &mut Vec<RuntimeIssue>) -> Option<ThemePreference> {
         let global = window()?;
-        let descriptor = own_property_descriptor(global.as_ref(), BOOTSTRAP_OUTCOME_PROPERTY);
+        let descriptor = own_property_descriptor(global.as_ref())?;
         if descriptor.is_undefined()
             || descriptor.is_null()
-            || descriptor.enumerable()
-            || descriptor.writable()
-            || !descriptor.configurable()
+            || descriptor_flag(&descriptor, "enumerable") != Some(false)
+            || descriptor_flag(&descriptor, "writable") != Some(false)
+            || descriptor_flag(&descriptor, "configurable") != Some(true)
+            || !descriptor_has_value(&descriptor)
         {
             issues.push(RuntimeIssue::BootstrapOutcomeUnavailable);
             return None;
         }
-        let Some(outcome) = descriptor.value().as_string() else {
+        let Some(outcome) = property(&descriptor, "value").ok()?.as_string() else {
             issues.push(RuntimeIssue::BootstrapOutcomeUnavailable);
             return None;
         };
@@ -258,7 +242,7 @@ mod browser {
             issues.push(RuntimeIssue::BootstrapOutcomeUnavailable);
             return None;
         };
-        if delete_property(global.as_ref(), BOOTSTRAP_OUTCOME_PROPERTY) != Ok(true) {
+        if delete_transfer(global.as_ref()) != Ok(true) {
             issues.push(RuntimeIssue::BootstrapOutcomeUnavailable);
             return None;
         }
@@ -285,9 +269,14 @@ mod browser {
         let Some(global) = window() else {
             return;
         };
-        let descriptor = own_property_descriptor(global.as_ref(), BOOTSTRAP_OUTCOME_PROPERTY);
-        if !descriptor.is_null() && !descriptor.is_undefined() && descriptor.configurable() {
-            let _ = delete_property(global.as_ref(), BOOTSTRAP_OUTCOME_PROPERTY);
+        let Some(descriptor) = own_property_descriptor(global.as_ref()) else {
+            return;
+        };
+        if !descriptor.is_null()
+            && !descriptor.is_undefined()
+            && descriptor_flag(&descriptor, "configurable") == Some(true)
+        {
+            let _ = delete_transfer(global.as_ref());
         }
     }
 
@@ -300,17 +289,67 @@ mod browser {
         }
     }
 
-    fn local_storage() -> Result<Option<Storage>, RuntimeIssue> {
-        window()
-            .ok_or(RuntimeIssue::StorageReadFailed)?
-            .local_storage()
-            .map_err(|_| RuntimeIssue::StorageReadFailed)
+    fn own_property_descriptor(global: &JsValue) -> Option<JsValue> {
+        let object: &js_sys::Object = global.unchecked_ref();
+        js_sys::Reflect::get_own_property_descriptor(
+            object,
+            &JsValue::from_str(BOOTSTRAP_OUTCOME_PROPERTY),
+        )
+        .ok()
+    }
+
+    fn descriptor_flag(descriptor: &JsValue, key: &str) -> Option<bool> {
+        property(descriptor, key).ok()?.as_bool()
+    }
+
+    fn descriptor_has_value(descriptor: &JsValue) -> bool {
+        let object: &js_sys::Object = descriptor.unchecked_ref();
+        js_sys::Object::has_own(object, &JsValue::from_str("value"))
+    }
+
+    fn delete_transfer(global: &JsValue) -> Result<bool, JsValue> {
+        let object: &js_sys::Object = global.unchecked_ref();
+        js_sys::Reflect::delete_property(
+            object,
+            &JsValue::from_str(BOOTSTRAP_OUTCOME_PROPERTY),
+        )
+    }
+
+    fn property(object: &JsValue, key: &str) -> Result<JsValue, JsValue> {
+        js_sys::Reflect::get(object, &JsValue::from_str(key))
+    }
+
+    fn call_method(
+        object: &JsValue,
+        method: &str,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsValue> {
+        let function = property(object, method)?.dyn_into::<js_sys::Function>()?;
+        match arguments {
+            [] => function.call0(object),
+            [first] => function.call1(object, first),
+            [first, second] => function.call2(object, first, second),
+            _ => Err(JsValue::from_str("unsupported browser adapter arity")),
+        }
+    }
+
+    fn local_storage(issue: RuntimeIssue) -> Result<Option<JsValue>, RuntimeIssue> {
+        let global = window().ok_or(issue)?;
+        let storage = property(global.as_ref(), "localStorage").map_err(|_| issue)?;
+        Ok((!storage.is_null() && !storage.is_undefined()).then_some(storage))
     }
 
     fn read_storage(issues: &mut Vec<RuntimeIssue>) -> ThemePreference {
-        match local_storage().and_then(|storage| {
+        match local_storage(RuntimeIssue::StorageReadFailed).and_then(|storage| {
             storage
-                .map(|storage| storage.get_item(STORAGE_KEY))
+                .map(|storage| {
+                    call_method(
+                        &storage,
+                        "getItem",
+                        &[JsValue::from_str(STORAGE_KEY)],
+                    )
+                    .map(|value| (!value.is_null()).then(|| value.as_string()).flatten())
+                })
                 .transpose()
                 .map_err(|_| RuntimeIssue::StorageReadFailed)
         }) {
@@ -340,22 +379,38 @@ mod browser {
     }
 
     pub fn persist(preference: ThemePreference) -> Result<(), RuntimeIssue> {
-        let storage = window()
-            .ok_or(RuntimeIssue::StorageWriteFailed)?
-            .local_storage()
-            .map_err(|_| RuntimeIssue::StorageWriteFailed)?
+        let storage = local_storage(RuntimeIssue::StorageWriteFailed)?
             .ok_or(RuntimeIssue::StorageWriteFailed)?;
-        match preference.storage_value() {
-            Some(value) => storage.set_item(STORAGE_KEY, value),
-            None => storage.remove_item(STORAGE_KEY),
-        }
-        .map_err(|_| RuntimeIssue::StorageWriteFailed)
+        let result = match preference.storage_value() {
+            Some(value) => call_method(
+                &storage,
+                "setItem",
+                &[JsValue::from_str(STORAGE_KEY), JsValue::from_str(value)],
+            ),
+            None => call_method(
+                &storage,
+                "removeItem",
+                &[JsValue::from_str(STORAGE_KEY)],
+            ),
+        };
+        result
+            .map(|_| ())
+            .map_err(|_| RuntimeIssue::StorageWriteFailed)
     }
 
     pub fn system_theme() -> ThemeId {
         let dark = window()
-            .and_then(|window| window.match_media("(prefers-color-scheme: dark)").ok().flatten())
-            .is_some_and(|query| query.matches());
+            .and_then(|window| {
+                call_method(
+                    window.as_ref(),
+                    "matchMedia",
+                    &[JsValue::from_str("(prefers-color-scheme: dark)")],
+                )
+                .ok()
+            })
+            .and_then(|query| property(&query, "matches").ok())
+            .and_then(|matches| matches.as_bool())
+            .unwrap_or(false);
         if dark {
             SYSTEM_DARK_THEME
         } else {
@@ -367,22 +422,31 @@ mod browser {
         let Some(global) = window() else {
             return;
         };
-        let storage = global.local_storage().ok().flatten();
+        let Some(storage) = local_storage(RuntimeIssue::StorageReadFailed)
+            .ok()
+            .flatten()
+        else {
+            return;
+        };
         let listener = Closure::<dyn FnMut(Event)>::new(move |event: Event| {
-            let Ok(event) = event.dyn_into::<StorageEvent>() else {
+            let event = event.as_ref();
+            let Ok(event_storage) = property(event, "storageArea") else {
                 return;
             };
-            if event.storage_area() != storage {
+            if !js_sys::Object::is(&event_storage, &storage) {
                 return;
             }
-            let preference = match event.key() {
-                None => ThemePreference::System,
-                Some(key) if key == STORAGE_KEY => event
-                    .new_value()
+            let key = property(event, "key").ok();
+            let preference = match key.as_ref().and_then(JsValue::as_string) {
+                None if key.as_ref().is_some_and(JsValue::is_null) => ThemePreference::System,
+                Some(key) if key == STORAGE_KEY => property(event, "newValue")
+                    .ok()
+                    .as_ref()
+                    .and_then(JsValue::as_string)
                     .as_deref()
                     .and_then(ThemePreference::parse)
                     .unwrap_or(ThemePreference::System),
-                Some(_) => return,
+                _ => return,
             };
             if controller.preference.get_untracked() != preference {
                 controller.update_without_persistence(preference);
@@ -412,7 +476,7 @@ mod browser {
 pub fn seeded_scope(config: &ProjectConfig) -> String {
     r#"//! Application-owned nested theme scopes and direct-body portal hosts.
 
-use super::generated::{THEME_ATTRIBUTE, ThemeId};
+use super::generated::ThemeId;
 use leptos::prelude::*;
 use web_ui_primitives::leptos::PortalMount;
 
@@ -474,6 +538,7 @@ fn sync_portal_theme(_portal_mount: Option<PortalMount>) {}
 
 #[cfg(target_arch = "wasm32")]
 fn sync_portal_theme(portal_mount: Option<PortalMount>) {
+    use super::generated::THEME_ATTRIBUTE;
     let Some(host) = portal_mount else {
         return;
     };
