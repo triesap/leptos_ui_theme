@@ -4,7 +4,7 @@
 use clap::{Args, Parser, Subcommand};
 use leptos_ui_theme_codegen::{
     ApplyCommand, CodegenError, GeneratedArtifact, apply, apply_artifacts, apply_artifacts_for,
-    build, check,
+    build, check, seeded_controller, seeded_module, seeded_scope,
 };
 use leptos_ui_theme_core::{CONFIG_FILE, Profile, ProjectConfig, ThemeCompiler, ThemeError};
 use serde::Serialize;
@@ -258,6 +258,17 @@ fn init(start: &Path, dry_run: bool) -> Result<Outcome, CliError> {
     let config = ProjectConfig::default();
     config.validate()?;
     let resolver = starter_resolver();
+    let starter_profiles = config
+        .profiles
+        .named
+        .iter()
+        .map(|profile| leptos_ui_theme_core::ResolvedProfile {
+            id: profile.id.clone(),
+            label: profile.label.clone(),
+            color_scheme: profile.color_scheme,
+            values: Vec::new(),
+        })
+        .collect::<Vec<_>>();
     let files = vec![
         (CONFIG_FILE.into(), pretty_json(&config)?),
         ("tokens/theme.resolver.json".into(), pretty_json(&resolver)?),
@@ -265,15 +276,15 @@ fn init(start: &Path, dry_run: bool) -> Result<Outcome, CliError> {
         ("tokens/themes/dark.tokens.json".into(), b"{}\n".to_vec()),
         (
             config.outputs.seeded.module.clone(),
-            SEEDED_MODULE.as_bytes().to_vec(),
+            seeded_module().into_bytes(),
         ),
         (
             config.outputs.seeded.controller.clone(),
-            SEEDED_CONTROLLER.as_bytes().to_vec(),
+            seeded_controller(&config, &starter_profiles).into_bytes(),
         ),
         (
             config.outputs.seeded.scope.clone(),
-            SEEDED_SCOPE.as_bytes().to_vec(),
+            seeded_scope(&config).into_bytes(),
         ),
     ];
     if !dry_run {
@@ -328,7 +339,14 @@ fn build_command(root: &Path, dry_run: bool) -> Result<Outcome, CliError> {
         status,
         exit_code: 0,
         changes,
-        data: json!({"profiles": result.profiles.iter().map(|profile| &profile.id).collect::<Vec<_>>() }),
+        data: json!({
+            "profiles": result.profiles.iter().map(|profile| &profile.id).collect::<Vec<_>>(),
+            "bootstrap": {
+                "mode": result.bootstrap.mode,
+                "scriptDigest": result.bootstrap.script_digest,
+                "cspSource": result.bootstrap.csp_source,
+            }
+        }),
     })
 }
 
@@ -531,10 +549,6 @@ fn starter_resolver() -> serde_json::Value {
         "resolutionOrder": [{"$ref": "#/modifiers/theme"}]
     })
 }
-
-const SEEDED_MODULE: &str = "pub mod controller;\npub mod generated;\npub mod scope;\n";
-const SEEDED_CONTROLLER: &str = "//! Application-owned theme controller integration.\n\npub const SYSTEM_THEME: &str = \"system\";\n";
-const SEEDED_SCOPE: &str = "//! Application-owned scoped theme integration.\n\n#[derive(Clone, Debug, Eq, PartialEq)]\npub struct ThemeScope(pub Option<String>);\n";
 
 #[cfg(test)]
 mod tests {
