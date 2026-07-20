@@ -392,10 +392,10 @@ fn validate_resolver(
     )))?;
     for (name, set) in &resolver.sets {
         validate_resolver_name(name)?;
-        if !set
+        if set
             .get("sources")
             .and_then(serde_json::Value::as_array)
-            .is_some_and(|sources| !sources.is_empty())
+            .is_none_or(Vec::is_empty)
         {
             return Err(ThemeError::Resolution(format!(
                 "resolver set `{name}` has no sources"
@@ -425,10 +425,7 @@ fn validate_resolver(
         }
         for (context, sources) in contexts {
             validate_resolver_name(context)?;
-            if !sources
-                .as_array()
-                .is_some_and(|sources| !sources.is_empty())
-            {
+            if sources.as_array().is_none_or(Vec::is_empty) {
                 return Err(ThemeError::Resolution(format!(
                     "resolver context `{name}.{context}` has no sources"
                 )));

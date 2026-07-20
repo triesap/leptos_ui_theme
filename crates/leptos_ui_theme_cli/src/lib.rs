@@ -1442,15 +1442,16 @@ fn dependency_plan(
         )
         .into());
     };
-    let leptos_declared =
-        validate_dependency_declaration(&manifest, "leptos", "=0.9.0-alpha", &["csr"])?;
-    let primitives_declared = validate_dependency_declaration(
+    let leptos_features =
+        validate_dependency_declaration(&manifest, "leptos", "=0.9.0-alpha", &[])?;
+    let primitives_features = validate_dependency_declaration(
         &manifest,
         "web_ui_primitives",
         ">=0.2.0,<0.3.0",
         &["core", "leptos"],
     )?;
-    if !leptos_declared || !primitives_declared {
+    let (Some(leptos_features), Some(primitives_features)) = (leptos_features, primitives_features)
+    else {
         if allow_pending {
             return Ok(DependencyPlan {
                 state: DependencyState::Pending,
@@ -1461,7 +1462,17 @@ fn dependency_plan(
             "Cargo.toml is missing generated runtime dependency declarations".into(),
         )
         .into());
+    };
+    let leptos_mode = selected_render_mode(&leptos_features);
+    let primitives_mode = selected_render_mode(&primitives_features);
+    if leptos_mode != primitives_mode {
+        return Err(ThemeError::Config(
+            "leptos and web_ui_primitives must select the same render mode".into(),
+        )
+        .into());
     }
+    records[0].features = leptos_features;
+    records[1].features = primitives_features;
     let Some(lock) = read_optional_toml(&lock_path)? else {
         if allow_pending {
             return Ok(DependencyPlan {
@@ -1521,13 +1532,13 @@ fn validate_dependency_declaration(
     package: &str,
     requirement: &str,
     expected_features: &[&str],
-) -> Result<bool, CliError> {
+) -> Result<Option<Vec<String>>, CliError> {
     let Some(entry) = manifest
         .get("dependencies")
         .and_then(toml::Value::as_table)
         .and_then(|dependencies| dependencies.get(package))
     else {
-        return Ok(false);
+        return Ok(None);
     };
     let Some(table) = entry.as_table() else {
         return Err(ThemeError::Config(format!(
@@ -1542,27 +1553,57 @@ fn validate_dependency_declaration(
         || !keys.contains(&"features")
         || table.get("version").and_then(toml::Value::as_str) != Some(requirement)
         || table.get("default-features").and_then(toml::Value::as_bool) != Some(false)
-        || table
-            .get("features")
-            .and_then(toml::Value::as_array)
-            .is_none_or(|features| {
-                let actual = features
-                    .iter()
-                    .filter_map(toml::Value::as_str)
-                    .collect::<std::collections::BTreeSet<_>>();
-                let expected = expected_features
-                    .iter()
-                    .copied()
-                    .collect::<std::collections::BTreeSet<_>>();
-                features.len() != expected_features.len() || actual != expected
-            })
     {
         return Err(ThemeError::Config(format!(
             "dependency `{package}` differs from the generated runtime requirement"
         ))
         .into());
     }
-    Ok(true)
+    let features = table
+        .get("features")
+        .and_then(toml::Value::as_array)
+        .expect("validated dependency features");
+    let Some(features) = features
+        .iter()
+        .map(toml::Value::as_str)
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Err(
+            ThemeError::Config(format!("dependency `{package}` features must be strings")).into(),
+        );
+    };
+    let actual = features
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let required = expected_features
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let delivery = ["csr", "hydrate", "ssr"]
+        .into_iter()
+        .filter(|feature| actual.contains(feature))
+        .collect::<Vec<_>>();
+    if features.len() != actual.len()
+        || !required.is_subset(&actual)
+        || delivery.len() > 1
+        || actual.len() != required.len() + delivery.len()
+    {
+        return Err(ThemeError::Config(format!(
+            "dependency `{package}` differs from the generated runtime requirement"
+        ))
+        .into());
+    }
+    let mut features = actual.into_iter().map(str::to_owned).collect::<Vec<_>>();
+    features.sort();
+    Ok(Some(features))
+}
+
+fn selected_render_mode(features: &[String]) -> Option<&str> {
+    features
+        .iter()
+        .find(|feature| matches!(feature.as_str(), "csr" | "hydrate" | "ssr"))
+        .map(String::as_str)
 }
 
 fn resolved_registry_package(
@@ -1876,7 +1917,7 @@ edition = "2024"
 
 [dependencies]
 leptos = { version = "=0.9.0-alpha", default-features = false, features = ["csr"] }
-web_ui_primitives = { version = ">=0.2.0,<0.3.0", default-features = false, features = ["core", "leptos"] }
+web_ui_primitives = { version = ">=0.2.0,<0.3.0", default-features = false, features = ["core", "csr", "leptos"] }
 "#,
         )
         .unwrap();

@@ -23,14 +23,23 @@ kit-owned files or application dependencies.
 ## Leptos render modes
 
 Generated theme source is render-mode neutral. Final applications select CSR,
-hydration, or SSR without the theme dependency plan forcing CSR.
+hydration, or SSR without the theme dependency plan forcing CSR. The `leptos`
+and `web_ui_primitives` declarations must select the same one delivery feature
+(`csr`, `hydrate`, or `ssr`); a shared-library consumer selects none.
 
 The first-paint compiler owns one canonical bootstrap script semantics with
 two security projections: an exact hash-authorized CSR snippet and a
 per-response nonce template for SSR. Hydration must attach to deterministic
 server component state before adopting the browser bootstrap outcome. Stored
 theme selection may change document colors before hydration, but it must not
-rewrite the component DOM being hydrated.
+rewrite the component DOM being hydrated. The generated controller therefore
+starts from the deterministic system/light server state and adopts storage,
+the first-paint transfer record, document attributes, and browser listeners in
+a post-hydration effect.
+
+Runtime issue state describes the latest completed browser operation. A
+successful retry clears a stale prior issue; apply and persistence are both
+attempted, and a persistence error takes precedence when both fail.
 
 ## Contributing
 

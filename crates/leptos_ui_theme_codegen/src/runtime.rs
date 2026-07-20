@@ -103,25 +103,28 @@ impl ThemeController {
     }
 
     pub fn set_preference(self, preference: ThemePreference) {
-        if self.preference.get_untracked() == preference {
-            return;
-        }
         self.preference.set(preference);
-        if let Err(issue) = browser::apply(preference) {
-            self.latest_issue.set(Some(issue));
-        }
-        if let Err(issue) = browser::persist(preference) {
-            self.latest_issue.set(Some(issue));
-        }
+        let apply_issue = browser::apply(preference).err();
+        let persist_issue = browser::persist(preference).err();
+        self.latest_issue.set(persist_issue.or(apply_issue));
         self.refresh_effective();
     }
 
     #[cfg(target_arch = "wasm32")]
     fn update_without_persistence(self, preference: ThemePreference) {
         self.preference.set(preference);
-        if let Err(issue) = browser::apply(preference) {
-            self.latest_issue.set(Some(issue));
-        }
+        self.latest_issue.set(browser::apply(preference).err());
+        self.refresh_effective();
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn adopt_after_hydration(
+        self,
+        preference: ThemePreference,
+        latest_issue: Option<RuntimeIssue>,
+    ) {
+        self.preference.set(preference);
+        self.latest_issue.set(latest_issue);
         self.refresh_effective();
     }
 
@@ -135,17 +138,14 @@ impl ThemeController {
 }
 
 pub fn provide_theme_controller() -> ThemeController {
-    let (preference, issues) = browser::initialize();
+    let preference = ThemePreference::System;
     let controller = ThemeController {
         preference: RwSignal::new(preference),
-        effective_theme: RwSignal::new(match preference {
-            ThemePreference::Named(theme) => theme,
-            ThemePreference::System => browser::system_theme(),
-        }),
-        latest_issue: RwSignal::new(issues.last().copied()),
+        effective_theme: RwSignal::new(SYSTEM_LIGHT_THEME),
+        latest_issue: RwSignal::new(None),
     };
     provide_context(controller);
-    browser::install_listeners(controller);
+    browser::install_after_hydration(controller);
     controller
 }
 
@@ -157,10 +157,6 @@ pub fn use_theme_controller() -> Option<ThemeController> {
 #[cfg(not(target_arch = "wasm32"))]
 mod browser {
     use super::*;
-
-    pub fn initialize() -> (ThemePreference, Vec<RuntimeIssue>) {
-        (ThemePreference::System, Vec::new())
-    }
 
     pub fn apply(_preference: ThemePreference) -> Result<(), RuntimeIssue> {
         Ok(())
@@ -174,7 +170,7 @@ mod browser {
         SYSTEM_LIGHT_THEME
     }
 
-    pub fn install_listeners(_controller: ThemeController) {}
+    pub fn install_after_hydration(_controller: ThemeController) {}
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -187,7 +183,7 @@ mod browser {
     use leptos::wasm_bindgen::{JsCast, JsValue, closure::Closure};
     use leptos::web_sys::{Event, js_sys, window};
 
-    pub fn initialize() -> (ThemePreference, Vec<RuntimeIssue>) {
+    fn initialize() -> (ThemePreference, Vec<RuntimeIssue>) {
         let mut issues = Vec::new();
         if BOOTSTRAP_ENABLED {
             if let Some(preference) = adopt_bootstrap(&mut issues) {
@@ -429,7 +425,15 @@ mod browser {
         }
     }
 
-    pub fn install_listeners(controller: ThemeController) {
+    pub fn install_after_hydration(controller: ThemeController) {
+        Effect::new(move |_| {
+            let (preference, issues) = initialize();
+            controller.adopt_after_hydration(preference, issues.last().copied());
+            install_listeners(controller);
+        });
+    }
+
+    fn install_listeners(controller: ThemeController) {
         let Some(global) = window() else {
             return;
         };
@@ -666,7 +670,11 @@ mod tests {
         assert!(controller.contains("pub enum RuntimeIssue"));
         assert!(controller.contains("\"storage\""));
         assert!(controller.contains("\"matchMedia\""));
-        assert!(controller.contains("self.preference.get_untracked() == preference"));
+        assert!(controller.contains("Effect::new(move |_|"));
+        assert!(controller.contains("adopt_after_hydration"));
+        assert!(controller.contains("let preference = ThemePreference::System"));
+        assert!(controller.contains("controller.preference.get_untracked() != preference"));
+        assert!(controller.contains("self.latest_issue.set(persist_issue.or(apply_issue))"));
         assert!(controller.contains("root.get_attribute(THEME_ATTRIBUTE)"));
         assert_eq!(
             controller

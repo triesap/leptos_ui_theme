@@ -148,7 +148,7 @@ pub fn default_dependency_records() -> Vec<DependencyRecord> {
         DependencyRecord {
             package: "leptos".into(),
             requirement: "=0.9.0-alpha".into(),
-            features: vec!["csr".into()],
+            features: Vec::new(),
             default_features: false,
             resolved_version: None,
             checksum: None,
@@ -171,15 +171,20 @@ fn validate_dependency_records(
     if dependencies.len() != 2
         || dependencies[0].package != "leptos"
         || dependencies[0].requirement != "=0.9.0-alpha"
-        || dependencies[0].features != ["csr"]
         || dependencies[0].default_features
         || dependencies[1].package != "web_ui_primitives"
         || dependencies[1].requirement != ">=0.2.0,<0.3.0"
-        || dependencies[1].features != ["core", "leptos"]
         || dependencies[1].default_features
     {
         return Err(CodegenError::Core(ThemeError::Config(
             "dependency plan differs from the generated runtime contract".into(),
+        )));
+    }
+    let leptos_mode = validate_render_features(&dependencies[0].features, &[])?;
+    let primitives_mode = validate_render_features(&dependencies[1].features, &["core", "leptos"])?;
+    if leptos_mode != primitives_mode {
+        return Err(CodegenError::Core(ThemeError::Config(
+            "generated runtime dependencies select different render modes".into(),
         )));
     }
     let all_resolved = dependencies
@@ -196,6 +201,44 @@ fn validate_dependency_records(
         )));
     }
     Ok(())
+}
+
+fn validate_render_features(
+    features: &[String],
+    required: &[&str],
+) -> Result<Option<&'static str>, CodegenError> {
+    let mut delivery = None;
+    for feature in features {
+        if required.contains(&feature.as_str()) {
+            continue;
+        }
+        let selected = match feature.as_str() {
+            "csr" => "csr",
+            "hydrate" => "hydrate",
+            "ssr" => "ssr",
+            _ => {
+                return Err(CodegenError::Core(ThemeError::Config(
+                    "dependency plan differs from the generated runtime contract".into(),
+                )));
+            }
+        };
+        if delivery.is_some() {
+            return Err(CodegenError::Core(ThemeError::Config(
+                "dependency plan differs from the generated runtime contract".into(),
+            )));
+        }
+        delivery = Some(selected);
+    }
+    if required
+        .iter()
+        .any(|required| !features.iter().any(|feature| feature == required))
+        || features.len() != required.len() + usize::from(delivery.is_some())
+    {
+        return Err(CodegenError::Core(ThemeError::Config(
+            "dependency plan differs from the generated runtime contract".into(),
+        )));
+    }
+    Ok(delivery)
 }
 
 impl GeneratedArtifact {
@@ -2437,10 +2480,11 @@ fn profile<'a>(
 mod tests {
     use super::{
         ArtifactManifest, ArtifactManifestEntry, ChangeOperation, ChangeScope, ConsumedInput,
-        ConsumedInputRoot, CssMode, DesiredArtifactState, GeneratedArtifact, Ownership,
-        ResolvedAxis, apply_artifacts, apply_transaction, bootstrap_script, csp_source,
-        generate_css, html_exterior_digest, html_exterior_digest_for_index, owned_html_region,
-        patch_index, plan_manifest, remove_owned_html_region, serialize_css,
+        ConsumedInputRoot, CssMode, DependencyState, DesiredArtifactState, GeneratedArtifact,
+        Ownership, ResolvedAxis, apply_artifacts, apply_transaction, bootstrap_script, csp_source,
+        default_dependency_records, generate_css, html_exterior_digest,
+        html_exterior_digest_for_index, owned_html_region, patch_index, plan_manifest,
+        remove_owned_html_region, serialize_css, validate_dependency_records,
         verify_consumed_inputs,
     };
     use crate::ApplyCommand;
@@ -2782,6 +2826,30 @@ mod tests {
             .unwrap();
         assert!(status.success());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dependency_records_allow_neutral_or_one_coherent_delivery_mode() {
+        let neutral = default_dependency_records();
+        validate_dependency_records(DependencyState::Pending, &neutral).unwrap();
+
+        for mode in ["csr", "hydrate", "ssr"] {
+            let mut selected = neutral.clone();
+            selected[0].features.push(mode.to_owned());
+            selected[1].features.push(mode.to_owned());
+            validate_dependency_records(DependencyState::Pending, &selected).unwrap();
+        }
+
+        let mut mismatched = neutral.clone();
+        mismatched[0].features.push("ssr".to_owned());
+        mismatched[1].features.push("hydrate".to_owned());
+        assert!(validate_dependency_records(DependencyState::Pending, &mismatched).is_err());
+
+        let mut conflicting = neutral;
+        conflicting[0]
+            .features
+            .extend(["csr".to_owned(), "ssr".to_owned()]);
+        assert!(validate_dependency_records(DependencyState::Pending, &conflicting).is_err());
     }
 
     #[test]

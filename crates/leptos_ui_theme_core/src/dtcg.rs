@@ -800,9 +800,10 @@ pub fn validate_reserved_members(
             "$description must be a string".into(),
         ));
     }
-    if object.get("$deprecated").is_some_and(|value| {
-        !value.is_boolean() && !value.as_str().is_some_and(|value| !value.is_empty())
-    }) {
+    if object
+        .get("$deprecated")
+        .is_some_and(|value| !value.is_boolean() && value.as_str().is_none_or(str::is_empty))
+    {
         return Err(ThemeError::Resolution(
             "$deprecated must be true or a nonempty string".into(),
         ));
