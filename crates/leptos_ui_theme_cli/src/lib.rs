@@ -6,17 +6,18 @@ use leptos_ui_theme_codegen::{
     ApplyCommand, BuildOptions as CodegenBuildOptions, Change as PlannedChange, ChangeOperation,
     ChangeScope, CodegenError, DependencyRecord, DependencyState, GeneratedArtifact, Ownership,
     apply_artifacts_for_with_wait, apply_with_wait, build_with_options, check,
-    default_dependency_records, seeded_controller, seeded_module, seeded_scope,
+    default_dependency_records, plan_artifacts, seeded_controller, seeded_module, seeded_scope,
 };
 use leptos_ui_theme_core::{
-    CONFIG_FILE, Profile, ProjectConfig, ThemeCompiler, ThemeError, discover_kit,
+    CONFIG_FILE, KitConfig, Profile, ProjectConfig, ThemeCompiler, ThemeError, discover_kit,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -215,6 +216,17 @@ struct DependencyPlan {
     records: Vec<DependencyRecord>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PriorThemeLock {
+    html_integration: PriorHtmlIntegration,
+}
+
+#[derive(Deserialize)]
+struct PriorHtmlIntegration {
+    mode: String,
+}
+
 pub fn run(cli: Cli) -> i32 {
     let json_mode = cli.json;
     let quiet = cli.quiet;
@@ -411,7 +423,11 @@ fn init(
     no_patch_index: bool,
     lock_wait_ms: u64,
 ) -> Result<Outcome, CliError> {
-    let root = discover(start, true)?;
+    let discovered = discover(start, true)?;
+    let root = std::fs::canonicalize(&discovered).map_err(|source| CliError::Io {
+        path: discovered,
+        source,
+    })?;
     if root.join(CONFIG_FILE).exists() {
         return Err(CliError::Conflict(format!("{CONFIG_FILE} already exists")));
     }
@@ -448,48 +464,86 @@ fn init(
             seeded_scope(&config).into_bytes(),
         ),
     ];
-    let mut changes = files
-        .iter()
-        .map(|(path, bytes)| create_change(path, bytes))
-        .collect::<Vec<_>>();
-    if !dry_run {
-        for (path, _) in &files {
-            if root.join(path).exists() {
-                return Err(CliError::Conflict(format!("{path} already exists")));
-            }
+    for (path, _) in &files {
+        if root.join(path).exists() {
+            return Err(CliError::Conflict(format!("{path} already exists")));
         }
-        let artifacts = files
-            .iter()
-            .enumerate()
-            .map(|(index, (path, bytes))| {
-                if index < 4 {
-                    GeneratedArtifact::user_authored(path.clone(), bytes.clone())
-                } else {
-                    GeneratedArtifact::seeded(path.clone(), bytes.clone())
-                }
-            })
-            .collect::<Vec<_>>();
-        let lock_wait = Duration::from_millis(lock_wait_ms);
-        apply_artifacts_for_with_wait(&root, &artifacts, ApplyCommand::Init, None, lock_wait)?;
-        let result = build_with_options(
-            &root,
+    }
+    let mut artifacts = files
+        .iter()
+        .enumerate()
+        .map(|(index, (path, bytes))| {
+            if index < 4 {
+                GeneratedArtifact::user_authored(path.clone(), bytes.clone())
+            } else {
+                GeneratedArtifact::seeded(path.clone(), bytes.clone())
+            }
+        })
+        .collect::<Vec<_>>();
+    let scratch = create_init_scratch()?;
+    let generated = (|| -> Result<_, CliError> {
+        for artifact in &artifacts {
+            write_scratch_file(&scratch, &artifact.path, &artifact.bytes)?;
+        }
+        copy_init_inputs(&root, &scratch, &config)?;
+        build_with_options(
+            &scratch,
             CodegenBuildOptions {
                 patch_index: !no_patch_index,
                 dependency_state: dependency_plan.state,
                 dependencies: dependency_plan.records.clone(),
                 accept_generated: Vec::new(),
             },
-        )?;
-        let applied = apply_with_wait(&root, &result, lock_wait)?;
-        changes.extend(
-            result
-                .plan
-                .changes
-                .iter()
-                .filter(|change| applied.contains(&change.path))
-                .map(|change| change_from_plan(change, &result.accepted_generated)),
-        );
+        )
+        .map_err(CliError::from)
+    })();
+    let cleanup = std::fs::remove_dir_all(&scratch);
+    let generated = match (generated, cleanup) {
+        (Err(error), _) => return Err(error),
+        (Ok(_), Err(source)) => {
+            return Err(CliError::Io {
+                path: scratch,
+                source,
+            });
+        }
+        (Ok(generated), Ok(())) => generated,
+    };
+    for artifact in &generated.artifacts {
+        let target = root.join(&artifact.path);
+        if !target.exists() {
+            continue;
+        }
+        let unchanged_user_input = artifact.ownership == Ownership::UserAuthored
+            && std::fs::read(&target)
+                .map(|bytes| bytes == artifact.bytes)
+                .unwrap_or(false);
+        if artifact.scope != ChangeScope::HtmlOwnedRegion && !unchanged_user_input {
+            return Err(CliError::Conflict(format!(
+                "{} already exists",
+                artifact.path
+            )));
+        }
     }
+    let html_snippet = no_patch_index.then(|| generated.bootstrap.html_snippet.clone());
+    artifacts.extend(generated.artifacts);
+    let plan = plan_artifacts(&root, &artifacts)?;
+    let changed_paths = if dry_run {
+        plan.changed_paths()
+    } else {
+        apply_artifacts_for_with_wait(
+            &root,
+            &artifacts,
+            ApplyCommand::Init,
+            Some(&config.outputs.lock),
+            Duration::from_millis(lock_wait_ms),
+        )?
+    };
+    let changes = plan
+        .changes
+        .iter()
+        .filter(|change| changed_paths.contains(&change.path))
+        .map(|change| change_from_plan(change, &BTreeMap::new()))
+        .collect::<Vec<_>>();
     Ok(Outcome {
         command: "init",
         status: if dry_run {
@@ -505,10 +559,108 @@ fn init(
             "root": ".",
             "config": CONFIG_FILE,
             "htmlMode": if no_patch_index { "manual" } else { "patched" },
+            "htmlSnippet": html_snippet,
             "dependencyState": dependency_plan.state,
             "dependencies": dependency_plan.records,
         }),
     })
+}
+
+fn create_init_scratch() -> Result<PathBuf, CliError> {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    for _ in 0..256 {
+        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "leptos-ui-theme-init-{}-{timestamp}-{sequence}",
+            std::process::id()
+        ));
+        match std::fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(source) => return Err(CliError::Io { path, source }),
+        }
+    }
+    Err(CliError::Conflict(
+        "cannot allocate an initialization planning directory".into(),
+    ))
+}
+
+fn write_scratch_file(root: &Path, relative: &str, bytes: &[u8]) -> Result<(), CliError> {
+    let path = root.join(relative);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| CliError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    std::fs::write(&path, bytes).map_err(|source| CliError::Io { path, source })
+}
+
+fn copy_init_inputs(root: &Path, scratch: &Path, config: &ProjectConfig) -> Result<(), CliError> {
+    let verified = discover_kit(root, &config.kit, config.limits.clone())?;
+    for source in [
+        &verified.contract_path,
+        &verified.capability_path,
+        &verified.stylesheet_path,
+    ] {
+        copy_init_input(root, scratch, source)?;
+    }
+    let lock_path = config
+        .kit
+        .lock_paths
+        .iter()
+        .find(|candidate| {
+            let candidate_config = KitConfig {
+                contract_path: config.kit.contract_path.clone(),
+                lock_paths: vec![(*candidate).clone()],
+            };
+            discover_kit(root, &candidate_config, config.limits.clone()).is_ok()
+        })
+        .ok_or_else(|| ThemeError::Contract("valid kit lock path disappeared".into()))?;
+    copy_init_input(root, scratch, &root.join(lock_path))?;
+    let index_paths = config
+        .html
+        .index_path
+        .iter()
+        .chain(
+            config
+                .html
+                .index_candidates
+                .iter()
+                .flat_map(|paths| paths.iter()),
+        )
+        .collect::<Vec<_>>();
+    for relative in index_paths {
+        let source = root.join(relative);
+        if source.is_file() {
+            copy_init_input(root, scratch, &source)?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_init_input(root: &Path, scratch: &Path, source: &Path) -> Result<(), CliError> {
+    let relative = source.strip_prefix(root).map_err(|_| {
+        ThemeError::Security(format!(
+            "initialization input is outside the project: {}",
+            source.display()
+        ))
+    })?;
+    let relative = relative.to_str().ok_or_else(|| {
+        ThemeError::Security(format!(
+            "initialization input is not UTF-8: {}",
+            source.display()
+        ))
+    })?;
+    let bytes = std::fs::read(source).map_err(|source_error| CliError::Io {
+        path: source.to_path_buf(),
+        source: source_error,
+    })?;
+    write_scratch_file(scratch, relative, &bytes)
 }
 
 fn build_command(
@@ -579,10 +731,11 @@ fn build_command(
 fn check_command(root: &Path) -> Result<Outcome, CliError> {
     let config: ProjectConfig = read_json(&root.join(CONFIG_FILE))?;
     let dependency_plan = dependency_plan(root, &config, false)?;
+    let patch_index = prior_patch_index(root, &config.outputs.lock)?;
     let result = build_with_options(
         root,
         CodegenBuildOptions {
-            patch_index: true,
+            patch_index,
             dependency_state: dependency_plan.state,
             dependencies: dependency_plan.records,
             accept_generated: Vec::new(),
@@ -633,10 +786,11 @@ fn explain_command(root: &Path, token_path: &str, profile: &str) -> Result<Outco
 fn doctor_command(root: &Path) -> Result<Outcome, CliError> {
     let config: ProjectConfig = read_json(&root.join(CONFIG_FILE))?;
     let dependency_plan = dependency_plan(root, &config, true)?;
+    let patch_index = prior_patch_index(root, &config.outputs.lock)?;
     let result = build_with_options(
         root,
         CodegenBuildOptions {
-            patch_index: true,
+            patch_index,
             dependency_state: dependency_plan.state,
             dependencies: dependency_plan.records.clone(),
             accept_generated: Vec::new(),
@@ -827,6 +981,24 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, CliError>
         source,
     })?;
     serde_json::from_slice(&bytes).map_err(CliError::Json)
+}
+
+fn prior_patch_index(root: &Path, lock_path: &str) -> Result<bool, CliError> {
+    let path = root.join(lock_path);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(source) => return Err(CliError::Io { path, source }),
+    };
+    let lock: PriorThemeLock = serde_json::from_slice(&bytes)?;
+    match lock.html_integration.mode.as_str() {
+        "patched" => Ok(true),
+        "manual" => Ok(false),
+        mode => Err(ThemeError::Config(format!(
+            "theme lock has unsupported HTML integration mode `{mode}`"
+        ))
+        .into()),
+    }
 }
 
 fn pretty_json(value: &impl Serialize) -> Result<Vec<u8>, CliError> {
@@ -1024,27 +1196,6 @@ fn doctor_check(id: &str, required: bool, pass: bool, summary: &str) -> serde_js
     })
 }
 
-fn create_change(path: &str, bytes: &[u8]) -> Change {
-    Change {
-        path: path.to_owned(),
-        scope: ChangeScope::WholeFile,
-        action: ChangeOperation::Create,
-        ownership: if path.ends_with(".rs") {
-            Ownership::SeededAppOwned
-        } else {
-            Ownership::UserAuthored
-        },
-        before_digest: None,
-        after_digest: Some(format!("sha256:{}", leptos_ui_theme_core::sha256(bytes))),
-        container_before_digest: None,
-        container_after_digest: None,
-        exterior_before_digest: None,
-        exterior_after_digest: None,
-        backup_path: None,
-        accepted_generated_conflict: false,
-    }
-}
-
 fn change_from_plan(
     change: &PlannedChange,
     accepted_generated: &BTreeMap<String, String>,
@@ -1140,7 +1291,7 @@ fn starter_resolver() -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_command, init, starter_resolver};
+    use super::{build_command, check_command, init, starter_resolver};
     use std::path::PathBuf;
 
     #[test]
@@ -1310,6 +1461,16 @@ checksum = "sha256:test"
                 .changes
                 .is_empty()
         );
+        build_command(&root, false, true, 0, &[]).unwrap();
+        assert_eq!(check_command(&root).unwrap().exit_code, 0);
+        let index = std::fs::read_to_string(root.join("index.html")).unwrap();
+        let start = index.find("<!-- leptos-ui-theme:start -->").unwrap();
+        let end = index.find("<!-- leptos-ui-theme:end -->").unwrap()
+            + "<!-- leptos-ui-theme:end -->\n".len();
+        let mut without_manual_region = index;
+        without_manual_region.replace_range(start..end, "");
+        std::fs::write(root.join("index.html"), without_manual_region).unwrap();
+        assert_eq!(check_command(&root).unwrap().exit_code, 7);
         std::fs::remove_dir_all(root).unwrap();
     }
 

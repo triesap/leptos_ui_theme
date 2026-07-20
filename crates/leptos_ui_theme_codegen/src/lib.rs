@@ -58,6 +58,7 @@ pub struct BuildResult {
     pub plan: PlanV1,
     pub bootstrap: BootstrapMetadata,
     pub accepted_generated: BTreeMap<String, String>,
+    pub manual_html_stale: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -218,8 +219,15 @@ struct ThemeLock<'a> {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct PreviousThemeLock {
     outputs: BTreeMap<String, String>,
+    html_integration: Option<PreviousHtmlIntegration>,
+}
+
+#[derive(Deserialize)]
+struct PreviousHtmlIntegration {
+    mode: String,
 }
 
 #[derive(Serialize)]
@@ -328,19 +336,18 @@ pub fn build_with_options(root: &Path, options: BuildOptions) -> Result<BuildRes
         html_snippet: region.clone(),
     };
     let patched_digest = format!("sha256:{}", sha256(&patched));
-    if options.patch_index {
+    let manual_html_stale = if options.patch_index {
         artifacts.push(GeneratedArtifact::html_region(
             index_relative.clone(),
             patched,
         ));
+        None
     } else {
         let text = std::str::from_utf8(&index_bytes).map_err(|_| {
             CodegenError::Core(ThemeError::Config("index HTML must be UTF-8".into()))
         })?;
-        if text.contains("<!-- leptos-ui-theme:start -->")
-            && normalize_region_line_endings(text) != normalize_region_line_endings(&region)
-            && index_bytes != patch_index(&index_bytes, &region, &kit_href)?
-        {
+        let expected = patch_index(&index_bytes, &region, &kit_href)?;
+        if text.contains("<!-- leptos-ui-theme:start -->") && index_bytes != expected {
             return Err(CodegenError::Core(ThemeError::Config(
                 "manual HTML region is stale".into(),
             )));
@@ -349,7 +356,8 @@ pub fn build_with_options(root: &Path, options: BuildOptions) -> Result<BuildRes
             index_relative.clone(),
             index_bytes.clone(),
         ));
-    }
+        (index_bytes != expected).then_some(index_relative.clone())
+    };
     let config_bytes = std::fs::read(&compiler.config_path).map_err(|source| CodegenError::Io {
         path: compiler.config_path.clone(),
         source,
@@ -361,6 +369,7 @@ pub fn build_with_options(root: &Path, options: BuildOptions) -> Result<BuildRes
         })?;
     let output_digests = artifacts
         .iter()
+        .filter(|artifact| artifact.ownership == Ownership::GeneratedLockOwned)
         .map(|artifact| {
             (
                 artifact.path.as_str(),
@@ -461,6 +470,7 @@ pub fn build_with_options(root: &Path, options: BuildOptions) -> Result<BuildRes
         plan,
         bootstrap,
         accepted_generated,
+        manual_html_stale,
     })
 }
 
@@ -537,7 +547,11 @@ fn protect_generated_ownership(
                 artifact.path
             ))));
         }
-        if previous.is_none()
+        if (previous.is_none()
+            || previous
+                .as_ref()
+                .and_then(|lock| lock.html_integration.as_ref())
+                .is_some_and(|integration| integration.mode == "manual"))
             && artifact.scope == ChangeScope::HtmlOwnedRegion
             && !current
                 .windows(b"<!-- leptos-ui-theme:start -->".len())
@@ -658,7 +672,13 @@ pub fn apply_artifacts_for_with_wait(
 }
 
 pub fn check(_root: &Path, result: &BuildResult) -> Vec<String> {
-    result.plan.changed_paths()
+    let mut stale = result.plan.changed_paths();
+    if let Some(path) = &result.manual_html_stale
+        && !stale.contains(path)
+    {
+        stale.push(path.clone());
+    }
+    stale
 }
 
 pub fn generate_css(
@@ -1351,10 +1371,6 @@ fn patch_index(
     output.extend_from_slice(region.as_bytes());
     output.extend_from_slice(&index[insertion..]);
     Ok(output)
-}
-
-fn normalize_region_line_endings(value: &str) -> String {
-    value.replace("\r\n", "\n")
 }
 
 fn relative_asset(index_path: &str, target_path: &str) -> Result<String, CodegenError> {

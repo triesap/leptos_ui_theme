@@ -422,49 +422,83 @@ mod browser {
         let Some(global) = window() else {
             return;
         };
-        let Some(storage) = local_storage(RuntimeIssue::StorageReadFailed)
+        let storage_listener = local_storage(RuntimeIssue::StorageReadFailed)
             .ok()
             .flatten()
-        else {
-            return;
-        };
-        let listener = Closure::<dyn FnMut(Event)>::new(move |event: Event| {
-            let event = event.as_ref();
-            let Ok(event_storage) = property(event, "storageArea") else {
-                return;
-            };
-            if !js_sys::Object::is(&event_storage, &storage) {
-                return;
-            }
-            let key = property(event, "key").ok();
-            let preference = match key.as_ref().and_then(JsValue::as_string) {
-                None if key.as_ref().is_some_and(JsValue::is_null) => ThemePreference::System,
-                Some(key) if key == STORAGE_KEY => property(event, "newValue")
+            .and_then(|storage| {
+                let listener = Closure::<dyn FnMut(Event)>::new(move |event: Event| {
+                    let event = event.as_ref();
+                    let Ok(event_storage) = property(event, "storageArea") else {
+                        return;
+                    };
+                    if !js_sys::Object::is(&event_storage, &storage) {
+                        return;
+                    }
+                    let key = property(event, "key").ok();
+                    let preference = match key.as_ref().and_then(JsValue::as_string) {
+                        None if key.as_ref().is_some_and(JsValue::is_null) => {
+                            ThemePreference::System
+                        }
+                        Some(key) if key == STORAGE_KEY => property(event, "newValue")
+                            .ok()
+                            .as_ref()
+                            .and_then(JsValue::as_string)
+                            .as_deref()
+                            .and_then(ThemePreference::parse)
+                            .unwrap_or(ThemePreference::System),
+                        _ => return,
+                    };
+                    if controller.preference.get_untracked() != preference {
+                        controller.update_without_persistence(preference);
+                    }
+                });
+                global
+                    .add_event_listener_with_callback(
+                        "storage",
+                        listener.as_ref().unchecked_ref(),
+                    )
                     .ok()
-                    .as_ref()
-                    .and_then(JsValue::as_string)
-                    .as_deref()
-                    .and_then(ThemePreference::parse)
-                    .unwrap_or(ThemePreference::System),
-                _ => return,
-            };
-            if controller.preference.get_untracked() != preference {
-                controller.update_without_persistence(preference);
-            }
+                    .map(|_| listener)
+            });
+        let media_listener = call_method(
+            global.as_ref(),
+            "matchMedia",
+            &[JsValue::from_str("(prefers-color-scheme: dark)")],
+        )
+        .ok()
+        .and_then(|query| {
+            let listener = Closure::<dyn FnMut(Event)>::new(move |_event: Event| {
+                if controller.preference.get_untracked() == ThemePreference::System {
+                    controller.refresh_effective();
+                }
+            });
+            call_method(
+                &query,
+                "addEventListener",
+                &[JsValue::from_str("change"), listener.as_ref().clone()],
+            )
+            .ok()
+            .map(|_| (query, listener))
         });
-        if global
-            .add_event_listener_with_callback("storage", listener.as_ref().unchecked_ref())
-            .is_err()
-        {
+        if storage_listener.is_none() && media_listener.is_none() {
             return;
         }
-        let cleanup = SendWrapper::new((global, listener));
+        let cleanup = SendWrapper::new((global, storage_listener, media_listener));
         on_cleanup(move || {
-            let (global, listener) = cleanup.take();
-            let _ = global.remove_event_listener_with_callback(
-                "storage",
-                listener.as_ref().unchecked_ref(),
-            );
+            let (global, storage_listener, media_listener) = cleanup.take();
+            if let Some(listener) = storage_listener {
+                let _ = global.remove_event_listener_with_callback(
+                    "storage",
+                    listener.as_ref().unchecked_ref(),
+                );
+            }
+            if let Some((query, listener)) = media_listener {
+                let _ = call_method(
+                    &query,
+                    "removeEventListener",
+                    &[JsValue::from_str("change"), listener.as_ref().clone()],
+                );
+            }
         });
     }
 }
