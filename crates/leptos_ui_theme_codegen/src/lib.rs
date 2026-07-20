@@ -498,7 +498,9 @@ pub fn build_with_workspace(
         })?
         .to_string_lossy()
         .into_owned();
-    let kit_href = relative_asset(
+    let kit_href = relative_workspace_asset(
+        &compiler.workspace_root,
+        &root,
         &index_relative,
         compiler.kit_stylesheet.logical_path.as_str(),
     )?;
@@ -609,8 +611,12 @@ pub fn build_with_workspace(
                         "previous selected index `{old_path}` has drifted ownership bytes"
                     )));
                 }
-                let old_kit_href =
-                    relative_asset(old_path, compiler.kit_stylesheet.logical_path.as_str())?;
+                let old_kit_href = relative_workspace_asset(
+                    &compiler.workspace_root,
+                    &root,
+                    old_path,
+                    compiler.kit_stylesheet.logical_path.as_str(),
+                )?;
                 Ok(GeneratedArtifact::html_region(
                     old_path,
                     remove_owned_html_region(&old_bytes, &old_kit_href)?,
@@ -2443,6 +2449,22 @@ fn relative_asset(index_path: &str, target_path: &str) -> Result<String, Codegen
     Ok(parts.join("/"))
 }
 
+fn relative_workspace_asset(
+    workspace_root: &Path,
+    config_root: &Path,
+    index_path: &str,
+    target_path: &str,
+) -> Result<String, CodegenError> {
+    let config_relative = config_root.strip_prefix(workspace_root).map_err(|_| {
+        CodegenError::Core(ThemeError::Security(
+            "app config root is outside the security workspace root".into(),
+        ))
+    })?;
+    let index_logical = LogicalPath::new(index_path.to_owned())?;
+    let workspace_index = config_relative.join(index_logical.to_path_buf());
+    relative_asset(&workspace_index.to_string_lossy(), target_path)
+}
+
 fn html_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -2484,13 +2506,14 @@ mod tests {
         Ownership, ResolvedAxis, apply_artifacts, apply_transaction, bootstrap_script, csp_source,
         default_dependency_records, generate_css, html_exterior_digest,
         html_exterior_digest_for_index, owned_html_region, patch_index, plan_manifest,
-        remove_owned_html_region, serialize_css, validate_dependency_records,
-        verify_consumed_inputs,
+        relative_workspace_asset, remove_owned_html_region, serialize_css,
+        validate_dependency_records, verify_consumed_inputs,
     };
     use crate::ApplyCommand;
     use leptos_ui_theme_core::{
         ColorScheme, ProjectConfig, ResolvedProfile, ResolvedToken, TokenDomain, format_css_number,
     };
+    use std::path::Path;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -2921,6 +2944,28 @@ mod tests {
             std::str::from_utf8(&patched)
                 .unwrap()
                 .contains("<!-- leptos-ui-theme:start -->\r\n")
+        );
+    }
+
+    #[test]
+    fn nested_app_kit_href_uses_the_workspace_path_space() {
+        let workspace = Path::new("/workspace");
+        let app = workspace.join("enterprise/apps/web");
+
+        assert_eq!(
+            relative_workspace_asset(
+                workspace,
+                &app,
+                "index.html",
+                "enterprise/apps/web/styles/kit.css",
+            )
+            .unwrap(),
+            "styles/kit.css"
+        );
+        assert_eq!(
+            relative_workspace_asset(workspace, workspace, "index.html", "styles/kit.css",)
+                .unwrap(),
+            "styles/kit.css"
         );
     }
 
