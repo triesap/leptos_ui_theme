@@ -5,11 +5,12 @@ use crate::{
     expand_group_extends, read_json, validate_contrast, validate_reserved_members,
     validate_token_value,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ResolvedToken {
     pub path: String,
     pub token_type: String,
@@ -20,7 +21,8 @@ pub struct ResolvedToken {
     pub alias_of: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ResolvedProfile {
     pub id: String,
     pub label: Option<String>,

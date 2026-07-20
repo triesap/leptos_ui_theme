@@ -730,7 +730,8 @@ fn build_command(
 
 fn check_command(root: &Path) -> Result<Outcome, CliError> {
     let config: ProjectConfig = read_json(&root.join(CONFIG_FILE))?;
-    let dependency_plan = dependency_plan(root, &config, false)?;
+    let dependency_plan = dependency_plan(root, &config, true)?;
+    let dependencies_resolved = dependency_plan.state == DependencyState::Resolved;
     let patch_index = prior_patch_index(root, &config.outputs.lock)?;
     let result = build_with_options(
         root,
@@ -742,44 +743,144 @@ fn check_command(root: &Path) -> Result<Outcome, CliError> {
         },
     )?;
     let stale = check(root, &result);
+    let fresh = stale.is_empty() && dependencies_resolved;
     Ok(Outcome {
         command: "check",
-        status: if stale.is_empty() {
+        status: if fresh {
             Status::Success
         } else {
             Status::Error
         },
-        exit_code: if stale.is_empty() { 0 } else { 7 },
+        exit_code: if fresh { 0 } else { 7 },
         changes: Vec::new(),
-        data: json!({"fresh": stale.is_empty(), "stale": stale}),
+        data: json!({
+            "fresh": fresh,
+            "stale": stale,
+            "dependencyState": dependency_plan.state,
+        }),
     })
 }
 
 fn list_command(root: &Path) -> Result<Outcome, CliError> {
     let compiler = ThemeCompiler::load(root)?;
     let profiles = compiler.resolve()?;
+    let domains = compiler
+        .contract
+        .tokens
+        .iter()
+        .map(|mapping| mapping.domain)
+        .collect::<std::collections::BTreeSet<_>>();
+    let axes = compiler
+        .config
+        .axes
+        .as_ref()
+        .map(|axes| {
+            [
+                ("density", axes.density.as_ref()),
+                ("motion", axes.motion.as_ref()),
+                ("contrast", axes.contrast.as_ref()),
+            ]
+            .into_iter()
+            .filter_map(|(name, axis)| {
+                axis.map(|axis| {
+                    json!({
+                        "name": name,
+                        "attribute": axis.attribute,
+                        "defaultContext": axis.default_context,
+                        "contexts": axis.contexts,
+                        "system": axis.system,
+                    })
+                })
+            })
+            .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     Ok(Outcome {
         command: "list",
         status: Status::Success,
         exit_code: 0,
         changes: Vec::new(),
-        data: json!({"profiles": profiles.iter().map(|profile| json!({"id": profile.id, "label": profile.label, "colorScheme": profile.color_scheme})).collect::<Vec<_>>() }),
+        data: json!({
+            "profiles": profiles.iter().map(|profile| {
+                let configured = compiler.config.profile(&profile.id).ok();
+                json!({
+                    "id": profile.id,
+                    "label": profile.label,
+                    "colorScheme": profile.color_scheme,
+                    "inputs": configured.map(|profile| &profile.inputs),
+                    "isDefault": profile.id == compiler.config.profiles.default,
+                    "isSystemLight": profile.id == compiler.config.profiles.system.light,
+                    "isSystemDark": profile.id == compiler.config.profiles.system.dark,
+                })
+            }).collect::<Vec<_>>(),
+            "axes": axes,
+            "domains": domains,
+            "contract": {
+                "id": compiler.contract.contract_id,
+                "abiVersion": compiler.contract.abi_version,
+                "revision": compiler.contract.revision,
+                "canonicalDigest": compiler.contract.canonical_digest,
+                "dtcgVersion": compiler.contract.dtcg_version,
+            }
+        }),
     })
 }
 
 fn explain_command(root: &Path, token_path: &str, profile: &str) -> Result<Outcome, CliError> {
-    let resolved = ThemeCompiler::load(root)?.resolve_one(profile)?;
+    let compiler = ThemeCompiler::load(root)?;
+    let resolved = compiler.resolve_one(profile)?;
+    let configured_profile = compiler.config.profile(profile)?;
+    let requested_mapping = compiler
+        .contract
+        .tokens
+        .iter()
+        .find(|mapping| mapping.path == token_path)
+        .ok_or_else(|| ThemeError::Resolution(format!("unknown token `{token_path}`")))?;
+    let terminal = compiler.contract.terminal_mapping(token_path)?;
     let token = resolved
         .values
         .iter()
-        .find(|token| token.path == token_path)
+        .find(|token| token.path == terminal.path)
         .ok_or_else(|| ThemeError::Resolution(format!("unknown token `{token_path}`")))?;
+    let mut redirects = Vec::new();
+    let mut current = requested_mapping;
+    while let Some(deprecation) = &current.deprecation {
+        redirects.push(json!({
+            "from": current.path,
+            "to": deprecation.replacement,
+            "message": deprecation.message,
+        }));
+        current = compiler
+            .contract
+            .tokens
+            .iter()
+            .find(|mapping| mapping.path == deprecation.replacement)
+            .ok_or_else(|| {
+                ThemeError::Contract(format!(
+                    "deprecated token `{}` has no replacement mapping",
+                    current.path
+                ))
+            })?;
+    }
     Ok(Outcome {
         command: "explain",
         status: Status::Success,
         exit_code: 0,
         changes: Vec::new(),
-        data: json!({"profile": profile, "path": token.path, "type": token.token_type, "value": token.value, "provenance": token.provenance, "aliasOf": token.alias_of}),
+        data: json!({
+            "requestedTokenPath": token_path,
+            "terminalTokenPath": terminal.path,
+            "profileId": profile,
+            "status": "resolved",
+            "type": token.token_type,
+            "value": token.value,
+            "domain": token.domain,
+            "cssCustomProperty": token.css_custom_property,
+            "profileInputs": configured_profile.inputs,
+            "provenance": token.provenance,
+            "redirects": redirects,
+            "absenceReason": null,
+        }),
     })
 }
 
