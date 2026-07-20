@@ -324,7 +324,11 @@ fn validate_action(
             scope == ChangeScope::WholeFile && operation == ChangeOperation::Create
         }
         Ownership::UserAuthored => {
-            scope == ChangeScope::WholeFile && operation == ChangeOperation::Create
+            scope == ChangeScope::WholeFile
+                && matches!(
+                    operation,
+                    ChangeOperation::Create | ChangeOperation::Replace
+                )
         }
         Ownership::ExternalKitOwned => false,
     };

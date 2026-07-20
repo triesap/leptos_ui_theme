@@ -6,7 +6,8 @@ use leptos_ui_theme_codegen::{
     ApplyCommand, BuildOptions as CodegenBuildOptions, Change as PlannedChange, ChangeOperation,
     ChangeScope, CodegenError, DependencyRecord, DependencyState, GeneratedArtifact, Ownership,
     apply_artifacts_for_with_wait, apply_with_wait, build_with_options, check,
-    default_dependency_records, plan_artifacts, seeded_controller, seeded_module, seeded_scope,
+    default_dependency_records, ensure_no_active_transaction, plan_artifacts, seeded_controller,
+    seeded_module, seeded_scope,
 };
 use leptos_ui_theme_core::{
     CONFIG_FILE, KitConfig, LogicalPath, Profile, ProjectConfig, SourceLoader, SourceRole,
@@ -197,8 +198,6 @@ struct Change {
     ownership: Ownership,
     before_digest: Option<String>,
     after_digest: Option<String>,
-    before_mode: Option<u32>,
-    after_mode: Option<u32>,
     container_before_digest: Option<String>,
     container_after_digest: Option<String>,
     exterior_before_digest: Option<String>,
@@ -363,42 +362,90 @@ fn execute(cli: &Cli) -> Result<Outcome, CliError> {
         path: cli.cwd.clone(),
         source,
     })?;
+    if !cwd.is_dir() {
+        return Err(CliError::Usage(
+            "--cwd must name an existing directory".into(),
+        ));
+    }
+    let writes = match &cli.command {
+        Command::Init(options) => !options.dry_run,
+        Command::Build(options) => !options.dry_run,
+        Command::Add { dry_run, .. } => !dry_run,
+        Command::Check | Command::List | Command::Explain { .. } | Command::Doctor { .. } => false,
+    };
+    if cli.lock_wait_ms != 0 && !writes {
+        return Err(CliError::Usage(
+            "--lock-wait-ms is valid only for an applying write command".into(),
+        ));
+    }
     match &cli.command {
-        Command::Init(options) => init(
-            &cwd,
-            options.dry_run,
-            options.no_patch_index,
-            cli.lock_wait_ms,
-        ),
-        Command::Build(options) => build_command(
-            &discover(&cwd, false)?,
-            options.dry_run,
-            options.no_patch_index,
-            cli.lock_wait_ms,
-            &options.accept_generated,
-        ),
-        Command::Check => check_command(&discover(&cwd, false)?),
-        Command::List => list_command(&discover(&cwd, false)?),
+        Command::Init(options) => {
+            let root = discover(&cwd, true)?;
+            if options.dry_run {
+                ensure_no_active_transaction(&root)?;
+            }
+            init(
+                &root,
+                options.dry_run,
+                options.no_patch_index,
+                cli.lock_wait_ms,
+            )
+        }
+        Command::Build(options) => {
+            let root = discover(&cwd, false)?;
+            if options.dry_run {
+                ensure_no_active_transaction(&root)?;
+            }
+            build_command(
+                &root,
+                options.dry_run,
+                options.no_patch_index,
+                cli.lock_wait_ms,
+                &options.accept_generated,
+            )
+        }
+        Command::Check => {
+            let root = discover(&cwd, false)?;
+            ensure_no_active_transaction(&root)?;
+            check_command(&root)
+        }
+        Command::List => {
+            let root = discover(&cwd, false)?;
+            ensure_no_active_transaction(&root)?;
+            list_command(&root)
+        }
         Command::Explain {
             token_path,
             profile,
-        } => explain_command(&discover(&cwd, false)?, token_path, profile),
+        } => {
+            let root = discover(&cwd, false)?;
+            ensure_no_active_transaction(&root)?;
+            explain_command(&root, token_path, profile)
+        }
         Command::Add {
             id,
             base,
             from_contract_defaults,
             dry_run,
-        } => add_command(
-            &discover(&cwd, false)?,
-            id,
-            base.as_deref(),
-            *from_contract_defaults,
-            *dry_run,
-            cli.lock_wait_ms,
-        ),
+        } => {
+            let root = discover(&cwd, false)?;
+            if *dry_run {
+                ensure_no_active_transaction(&root)?;
+            }
+            add_command(
+                &root,
+                id,
+                base.as_deref(),
+                *from_contract_defaults,
+                *dry_run,
+                cli.lock_wait_ms,
+            )
+        }
         Command::Doctor { strict } => {
             debug_assert!(*strict);
-            doctor_command(&discover(&cwd, false)?)
+            let root = discover(&cwd, false)?;
+            ensure_no_active_transaction(&root)?;
+            doctor_command(&root)
         }
     }
 }
@@ -406,11 +453,41 @@ fn execute(cli: &Cli) -> Result<Outcome, CliError> {
 fn discover(start: &Path, init: bool) -> Result<PathBuf, CliError> {
     let mut matches = Vec::new();
     for ancestor in start.ancestors().take(256) {
-        if ancestor.join(CONFIG_FILE).is_file() {
-            matches.push(ancestor.to_path_buf());
+        let config = ancestor.join(CONFIG_FILE);
+        match std::fs::symlink_metadata(&config) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(ThemeError::Security(format!(
+                    "{CONFIG_FILE} cannot be a symbolic link"
+                ))
+                .into());
+            }
+            Ok(metadata) if metadata.is_file() => matches.push(ancestor.to_path_buf()),
+            Ok(_) => {
+                return Err(
+                    ThemeError::Security(format!("{CONFIG_FILE} is not a regular file")).into(),
+                );
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(CliError::Io {
+                    path: config,
+                    source,
+                });
+            }
         }
-        if ancestor.join(".git").exists() {
-            break;
+        let git = ancestor.join(".git");
+        match std::fs::symlink_metadata(&git) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(ThemeError::Security(".git cannot be a symbolic link".into()).into());
+            }
+            Ok(metadata) if metadata.is_file() || metadata.is_dir() => break,
+            Ok(_) => {
+                return Err(
+                    ThemeError::Security(".git has an unsupported file type".into()).into(),
+                );
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => return Err(CliError::Io { path: git, source }),
         }
     }
     match matches.as_slice() {
@@ -562,12 +639,12 @@ fn init(
         exit_code: 0,
         changes,
         data: json!({
-            "root": ".",
-            "config": CONFIG_FILE,
-            "htmlMode": if no_patch_index { "manual" } else { "patched" },
+            "kind": "init",
+            "planDigest": plan.digest,
+            "dependencyPlan": dependency_plan.records,
+            "cspSource": generated.bootstrap.csp_source,
+            "htmlIntegrationMode": if no_patch_index { "manual" } else { "patched" },
             "htmlSnippet": html_snippet,
-            "dependencyState": dependency_plan.state,
-            "dependencies": dependency_plan.records,
         }),
     })
 }
@@ -707,16 +784,13 @@ fn build_command(
         exit_code: 0,
         changes,
         data: json!({
-            "profiles": result.profiles.iter().map(|profile| &profile.id).collect::<Vec<_>>(),
-            "bootstrap": {
-                "mode": result.bootstrap.mode,
-                "scriptDigest": result.bootstrap.script_digest,
-                "cspSource": result.bootstrap.csp_source,
-            },
-            "htmlMode": if no_patch_index { "manual" } else { "patched" },
+            "kind": "build",
+            "planDigest": result.plan.digest,
+            "cspSource": result.bootstrap.csp_source,
+            "htmlIntegrationMode": if no_patch_index { "manual" } else { "patched" },
             "htmlSnippet": no_patch_index.then_some(result.bootstrap.html_snippet),
             "dependencyState": dependency_plan.state,
-            "dependencies": dependency_plan.records,
+            "dependencyPlan": dependency_plan.records,
             "acceptedGenerated": result.accepted_generated,
         }),
     })
@@ -972,10 +1046,39 @@ fn add_command(
     if config.profiles.named.iter().any(|profile| profile.id == id) {
         return Err(CliError::Conflict(format!("profile `{id}` already exists")));
     }
-    let mut resolver: serde_json::Value = read_json(&root.join(&config.resolver))?;
+    let resolver_path = root.join(&config.resolver);
+    let resolver_bytes = std::fs::read(&resolver_path).map_err(|source| CliError::Io {
+        path: resolver_path,
+        source,
+    })?;
+    let mut resolver =
+        leptos_ui_theme_core::parse_json_strict(&resolver_bytes, config.limits.json_depth)?;
     let source_path = format!("{}/themes/{id}.tokens.json", config.token_root);
-    if root.join(&source_path).exists() {
-        return Err(CliError::Conflict(format!("{source_path} already exists")));
+    let source_target = root.join(&source_path);
+    match std::fs::symlink_metadata(&source_target) {
+        Ok(_) => return Err(CliError::Conflict(format!("{source_path} already exists"))),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(CliError::Io {
+                path: source_target,
+                source,
+            });
+        }
+    }
+    let source_parent = source_target
+        .parent()
+        .ok_or_else(|| ThemeError::Security(source_path.clone()))?;
+    let parent_metadata =
+        std::fs::symlink_metadata(source_parent).map_err(|source| CliError::Io {
+            path: source_parent.to_path_buf(),
+            source,
+        })?;
+    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+        return Err(ThemeError::Security(format!(
+            "theme source parent is not a real directory: {}",
+            source_parent.display()
+        ))
+        .into());
     }
     let (profile, sources) = if let Some(base) = base {
         let base_profile = config.profile(base)?.clone();
@@ -1016,41 +1119,19 @@ fn add_command(
     let files = [
         (CONFIG_FILE.into(), pretty_json(&config)?),
         (config.resolver.clone(), pretty_json(&resolver)?),
-        (source_path, b"{}\n".to_vec()),
+        (source_path.clone(), b"{}\n".to_vec()),
     ];
-    let changes = files
+    let artifacts = files
         .iter()
-        .map(|(path, bytes)| {
-            let before = std::fs::read(root.join(path)).ok();
-            Change {
-                path: path.clone(),
-                scope: ChangeScope::WholeFile,
-                action: if before.is_some() {
-                    ChangeOperation::Replace
-                } else {
-                    ChangeOperation::Create
-                },
-                ownership: Ownership::UserAuthored,
-                before_digest: before
-                    .as_ref()
-                    .map(|bytes| format!("sha256:{}", leptos_ui_theme_core::sha256(bytes))),
-                after_digest: Some(format!("sha256:{}", leptos_ui_theme_core::sha256(bytes))),
-                before_mode: None,
-                after_mode: None,
-                container_before_digest: None,
-                container_after_digest: None,
-                exterior_before_digest: None,
-                exterior_after_digest: None,
-                backup_path: None,
-                accepted_generated_conflict: false,
-            }
-        })
+        .map(|(path, bytes)| GeneratedArtifact::user_authored(path.clone(), bytes.clone()))
+        .collect::<Vec<_>>();
+    let plan = plan_artifacts(root, &artifacts)?;
+    let changes = plan
+        .changes
+        .iter()
+        .map(|change| change_from_plan(change, &BTreeMap::new()))
         .collect();
     if !dry_run {
-        let artifacts = files
-            .iter()
-            .map(|(path, bytes)| GeneratedArtifact::user_authored(path.clone(), bytes.clone()))
-            .collect::<Vec<_>>();
         apply_artifacts_for_with_wait(
             root,
             &artifacts,
@@ -1068,7 +1149,14 @@ fn add_command(
         },
         exit_code: 0,
         changes,
-        data: json!({"profile": id}),
+        data: json!({
+            "kind": "add",
+            "planDigest": plan.digest,
+            "profileId": id,
+            "sourcePath": source_path,
+            "configPath": CONFIG_FILE,
+            "resolverPath": config.resolver,
+        }),
     })
 }
 
@@ -1315,8 +1403,6 @@ fn change_from_plan(
         ownership: change.ownership,
         before_digest: change.before_digest.clone(),
         after_digest: change.after_digest.clone(),
-        before_mode: change.before_mode,
-        after_mode: change.after_mode,
         container_before_digest: change.container_before_digest.clone(),
         container_after_digest: change.container_after_digest.clone(),
         exterior_before_digest: change.exterior_before_digest.clone(),
@@ -1401,7 +1487,8 @@ fn starter_resolver() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_command, check_command, explain_command, init, list_command, starter_resolver,
+        add_command, build_command, check_command, explain_command, init, list_command,
+        starter_resolver,
     };
     use std::path::PathBuf;
 
@@ -1637,6 +1724,30 @@ checksum = "sha256:test"
             ))
         ));
         assert_eq!(check_command(&root).unwrap().exit_code, 0);
+        let config_before = std::fs::read(root.join(leptos_ui_theme_core::CONFIG_FILE)).unwrap();
+        let resolver_before = std::fs::read(root.join("tokens/theme.resolver.json")).unwrap();
+        let add_plan = add_command(&root, "ocean", Some("light"), false, true, 0).unwrap();
+        assert_eq!(add_plan.data["kind"], "add");
+        assert!(
+            add_plan.data["planDigest"]
+                .as_str()
+                .unwrap()
+                .starts_with("sha256:")
+        );
+        assert_eq!(
+            std::fs::read(root.join(leptos_ui_theme_core::CONFIG_FILE)).unwrap(),
+            config_before
+        );
+        assert_eq!(
+            std::fs::read(root.join("tokens/theme.resolver.json")).unwrap(),
+            resolver_before
+        );
+        assert!(!root.join("tokens/themes/ocean.tokens.json").exists());
+        add_command(&root, "ocean", Some("light"), false, false, 0).unwrap();
+        assert_eq!(
+            std::fs::read(root.join("tokens/themes/ocean.tokens.json")).unwrap(),
+            b"{}\n"
+        );
 
         let config_path = root.join(leptos_ui_theme_core::CONFIG_FILE);
         let mut config: serde_json::Value =

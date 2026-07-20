@@ -267,6 +267,40 @@ fn build_journal(
     theme_lock_path: Option<&str>,
     artifacts: &BTreeMap<&str, &GeneratedArtifact>,
 ) -> Result<Journal, CodegenError> {
+    let user_replacements = plan
+        .changes
+        .iter()
+        .filter(|change| {
+            change.ownership == Ownership::UserAuthored
+                && change.operation == ChangeOperation::Replace
+        })
+        .count();
+    if command == ApplyCommand::Add && user_replacements != 0 {
+        let user_creates = plan
+            .changes
+            .iter()
+            .filter(|change| {
+                change.ownership == Ownership::UserAuthored
+                    && change.operation == ChangeOperation::Create
+            })
+            .count();
+        if plan.changes.len() != 3
+            || user_replacements != 2
+            || user_creates != 1
+            || plan.changes.iter().any(|change| {
+                change.scope != ChangeScope::WholeFile
+                    || change.ownership != Ownership::UserAuthored
+            })
+        {
+            return Err(CodegenError::Conflict(
+                "add requires exactly two user-authored replacements and one creation".into(),
+            ));
+        }
+    } else if user_replacements != 0 {
+        return Err(CodegenError::Conflict(
+            "user-authored replacement is authorized only for add".into(),
+        ));
+    }
     let commit_kind = if matches!(command, ApplyCommand::Init | ApplyCommand::Build) {
         CommitKind::Lock
     } else {
@@ -895,7 +929,9 @@ fn validate_journal(journal: &Journal) -> Result<(), CodegenError> {
             }
             Ownership::UserAuthored => {
                 operation.scope == ChangeScope::WholeFile
-                    && operation.operation == ChangeOperation::Create
+                    && (operation.operation == ChangeOperation::Create
+                        || (journal.command == ApplyCommand::Add
+                            && operation.operation == ChangeOperation::Replace))
             }
             Ownership::ExternalKitOwned => false,
         };
