@@ -284,12 +284,27 @@ fn build_journal(
             .filter(|change| theme_lock_path == Some(change.path.as_str())),
     );
     for (ordinal, change) in ordered_changes.into_iter().enumerate() {
+        let journal_operation = if change.scope == ChangeScope::HtmlOwnedRegion {
+            ChangeOperation::Replace
+        } else {
+            change.operation
+        };
         let expected_digest = artifacts
             .get(change.path.as_str())
             .map(|artifact| format!("sha256:{}", sha256(&artifact.bytes)));
-        match change.operation {
+        let pre_digest = if change.scope == ChangeScope::HtmlOwnedRegion {
+            change.container_before_digest.clone()
+        } else {
+            change.before_digest.clone()
+        };
+        match journal_operation {
             ChangeOperation::Create | ChangeOperation::Replace => {
-                if change.after_digest != expected_digest {
+                let planned_container = if change.scope == ChangeScope::HtmlOwnedRegion {
+                    &change.container_after_digest
+                } else {
+                    &change.after_digest
+                };
+                if *planned_container != expected_digest {
                     return Err(CodegenError::Conflict(change.path.clone()));
                 }
             }
@@ -302,7 +317,7 @@ fn build_journal(
                 }
             }
         }
-        let stage_path = (change.operation != ChangeOperation::Remove)
+        let stage_path = (journal_operation != ChangeOperation::Remove)
             .then(|| {
                 sibling_relative(
                     &change.path,
@@ -310,8 +325,7 @@ fn build_journal(
                 )
             })
             .transpose()?;
-        let backup_path = change
-            .before_digest
+        let backup_path = pre_digest
             .as_ref()
             .map(|_| {
                 sibling_relative(
@@ -322,11 +336,11 @@ fn build_journal(
             .transpose()?;
         operations.push(Operation {
             ordinal,
-            operation: change.operation,
+            operation: journal_operation,
             scope: change.scope,
             ownership: change.ownership,
             path: change.path.clone(),
-            pre_digest: change.before_digest.clone(),
+            pre_digest,
             expected_digest,
             target_mode: change.after_mode,
             stage_path,

@@ -15,7 +15,9 @@ workspace = true
 [dependencies]
 fs2.workspace = true
 getrandom.workspace = true
+html5ever.workspace = true
 leptos_ui_theme_core.workspace = true
+markup5ever_rcdom.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_json_canonicalizer.workspace = true

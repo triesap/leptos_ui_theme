@@ -15,12 +15,17 @@ pub use transaction::{
     recover,
 };
 
+use html5ever::{
+    ParseOpts, parse_document, tendril::TendrilSink, tokenizer::TokenizerOpts,
+    tree_builder::TreeBuilderOpts,
+};
 use leptos_ui_theme_core::{
     BootstrapMode, COMPILED_LIMITS, CONFIG_FILE, ColorScheme, LogicalPath, OpenedSource,
     ProjectConfig, ResolvedProfile, ResolvedToken, SourceLoader, SourceRole, ThemeCompiler,
     ThemeError, TokenDomain, format_css_number, serialize_color_fallback, serialize_color_modern,
     sha256,
 };
+use markup5ever_rcdom::{Handle, NodeData, RcDom};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -306,8 +311,17 @@ impl PreviousOutputLock {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct PreviousHtmlIntegration {
     mode: String,
+    #[serde(default)]
+    selected_index_path: Option<String>,
+    #[serde(default)]
+    region_digest: Option<String>,
+    #[serde(default)]
+    container_digest: Option<String>,
+    #[serde(default)]
+    exterior_digest: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -365,9 +379,9 @@ struct HtmlIntegrationLock {
     mode: &'static str,
     selected_index_path: String,
     snippet_digest: String,
-    container_input_digest: String,
     region_digest: Option<String>,
     container_digest: Option<String>,
+    exterior_digest: Option<String>,
 }
 
 pub fn build(root: &Path) -> Result<BuildResult, CodegenError> {
@@ -435,6 +449,10 @@ pub fn build_with_workspace(
         })?
         .to_string_lossy()
         .into_owned();
+    let kit_href = relative_asset(
+        &index_relative,
+        compiler.kit_stylesheet.logical_path.as_str(),
+    )?;
     let script = bootstrap_script(&compiler.config, &profiles)?;
     if compiler.config.bootstrap.mode == BootstrapMode::ExternalSync {
         let external = compiler.config.bootstrap.external.as_ref().ok_or_else(|| {
@@ -453,9 +471,23 @@ pub fn build_with_workspace(
         path: selected_index.clone(),
         source,
     })?;
-    let index_exterior_digest = format!("sha256:{}", sha256(&html_exterior(&index_bytes)?));
     let region = html_region(&compiler.config, &profiles, &index_relative, &script)?;
-    let patched = patch_index(&index_bytes, &region)?;
+    let input_exterior_digest = html_exterior_digest_for_index(&index_bytes, &kit_href)?;
+    let patched = patch_index(&index_bytes, &region, &kit_href)?;
+    let patched_region_digest = format!(
+        "sha256:{}",
+        sha256(owned_html_region(&patched)?.ok_or_else(|| {
+            CodegenError::Core(ThemeError::Config(
+                "patched index has no owned theme region".into(),
+            ))
+        })?)
+    );
+    let patched_exterior_digest = html_exterior_digest(&patched)?;
+    if patched_exterior_digest != input_exterior_digest {
+        return Err(CodegenError::Core(ThemeError::Security(
+            "HTML patch changed bytes outside the owned region".into(),
+        )));
+    }
     let script_digest = (compiler.config.bootstrap.mode != BootstrapMode::Disabled)
         .then(|| format!("sha256:{}", sha256(script.as_bytes())));
     let csp_source = (compiler.config.bootstrap.mode == BootstrapMode::InlineCspHash)
@@ -467,6 +499,78 @@ pub fn build_with_workspace(
         html_snippet: region.clone(),
     };
     let patched_digest = format!("sha256:{}", sha256(&patched));
+    let previous = read_previous_theme_lock(
+        &root,
+        &compiler.config.outputs.lock,
+        compiler.config.limits.file_bytes,
+    )?;
+    if !options.patch_index
+        && previous
+            .as_ref()
+            .and_then(|lock| lock.html_integration.as_ref())
+            .is_some_and(|html| html.mode == "patched")
+    {
+        return Err(CodegenError::Conflict(
+            "--no-patch-index cannot release an owned HTML region".into(),
+        ));
+    }
+    let migration_artifact = if options.patch_index {
+        previous
+            .as_ref()
+            .and_then(|lock| lock.html_integration.as_ref())
+            .filter(|html| html.mode == "patched")
+            .and_then(|html| html.selected_index_path.as_deref())
+            .filter(|old_path| *old_path != index_relative)
+            .map(|old_path| {
+                let old_logical = LogicalPath::new(old_path.to_owned())?;
+                let old_bytes =
+                    std::fs::read(root.join(old_logical.to_path_buf())).map_err(|source| {
+                        CodegenError::Io {
+                            path: PathBuf::from(old_path),
+                            source,
+                        }
+                    })?;
+                let old_html = previous
+                    .as_ref()
+                    .and_then(|lock| lock.html_integration.as_ref())
+                    .ok_or_else(|| {
+                        CodegenError::Conflict("previous HTML integration is missing".into())
+                    })?;
+                if old_html.container_digest.as_deref()
+                    != Some(format!("sha256:{}", sha256(&old_bytes)).as_str())
+                {
+                    return Err(CodegenError::Conflict(format!(
+                        "previous selected index `{old_path}` differs from its lock record"
+                    )));
+                }
+                let old_region = owned_html_region(&old_bytes)?.ok_or_else(|| {
+                    CodegenError::Conflict(format!(
+                        "previous selected index `{old_path}` has no owned region"
+                    ))
+                })?;
+                let old_exterior_digest = html_exterior_digest(&old_bytes)?;
+                if old_html.region_digest.as_deref()
+                    != Some(format!("sha256:{}", sha256(old_region)).as_str())
+                    || old_html
+                        .exterior_digest
+                        .as_deref()
+                        .is_some_and(|digest| digest != old_exterior_digest)
+                {
+                    return Err(CodegenError::Conflict(format!(
+                        "previous selected index `{old_path}` has drifted ownership bytes"
+                    )));
+                }
+                let old_kit_href =
+                    relative_asset(old_path, compiler.kit_stylesheet.logical_path.as_str())?;
+                Ok(GeneratedArtifact::html_region(
+                    old_path,
+                    remove_owned_html_region(&old_bytes, &old_kit_href)?,
+                ))
+            })
+            .transpose()?
+    } else {
+        None
+    };
     let manual_html_stale = if options.patch_index {
         artifacts.push(GeneratedArtifact::html_region(
             index_relative.clone(),
@@ -477,7 +581,7 @@ pub fn build_with_workspace(
         let text = std::str::from_utf8(&index_bytes).map_err(|_| {
             CodegenError::Core(ThemeError::Config("index HTML must be UTF-8".into()))
         })?;
-        let expected = patch_index(&index_bytes, &region)?;
+        let expected = patch_index(&index_bytes, &region, &kit_href)?;
         if text.contains("<!-- leptos-ui-theme:start -->") && index_bytes != expected {
             return Err(CodegenError::Core(ThemeError::Config(
                 "manual HTML region is stale".into(),
@@ -495,16 +599,27 @@ pub fn build_with_workspace(
         .iter()
         .filter(|artifact| artifact.ownership == Ownership::GeneratedLockOwned)
         .map(|artifact| {
-            (
+            let digest = if artifact.scope == ChangeScope::HtmlOwnedRegion {
+                let region = owned_html_region(&artifact.bytes)?.ok_or_else(|| {
+                    CodegenError::Core(ThemeError::Config("owned HTML output has no region".into()))
+                })?;
+                format!("sha256:{}", sha256(region))
+            } else {
+                format!("sha256:{}", sha256(&artifact.bytes))
+            };
+            Ok((
                 artifact.path.clone(),
                 OutputLock {
-                    digest: format!("sha256:{}", sha256(&artifact.bytes)),
+                    digest,
                     ownership: artifact.ownership,
                     scope: artifact.scope,
                 },
-            )
+            ))
         })
-        .collect();
+        .collect::<Result<BTreeMap<_, _>, CodegenError>>()?;
+    if let Some(migration_artifact) = migration_artifact {
+        artifacts.push(migration_artifact);
+    }
     let input_digests = collect_input_digests(&compiler)?;
     let installation_input = input_lock(InputRoot::Workspace, &compiler.kit_installation);
     let capability_input = input_lock(InputRoot::Workspace, &compiler.kit_capability);
@@ -597,14 +712,18 @@ pub fn build_with_workspace(
                 .to_string_lossy()
                 .into_owned(),
             snippet_digest: format!("sha256:{}", sha256(region.as_bytes())),
-            container_input_digest: index_exterior_digest,
             region_digest: if options.patch_index {
-                Some(format!("sha256:{}", sha256(region.as_bytes())))
+                Some(patched_region_digest)
             } else {
                 None
             },
             container_digest: if options.patch_index {
                 Some(patched_digest)
+            } else {
+                None
+            },
+            exterior_digest: if options.patch_index {
+                Some(patched_exterior_digest)
             } else {
                 None
             },
@@ -699,6 +818,43 @@ fn consumed_root_order(root: ConsumedInputRoot) -> u8 {
         ConsumedInputRoot::AppConfig => 0,
         ConsumedInputRoot::Workspace => 1,
     }
+}
+
+fn read_previous_theme_lock(
+    root: &Path,
+    lock_relative: &str,
+    file_limit: u64,
+) -> Result<Option<PreviousThemeLock>, CodegenError> {
+    let path = root.join(lock_relative);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(CodegenError::Io {
+                path: PathBuf::from(lock_relative),
+                source,
+            });
+        }
+    };
+    if bytes.len() as u64 > file_limit {
+        return Err(CodegenError::Core(ThemeError::Limit {
+            resource: "fileBytes",
+            limit: file_limit,
+            observed: bytes.len() as u64,
+        }));
+    }
+    let lock = serde_json::from_slice::<PreviousThemeLock>(&bytes).map_err(|source| {
+        CodegenError::Core(ThemeError::Json {
+            path: PathBuf::from(lock_relative),
+            source,
+        })
+    })?;
+    if lock.schema_version != "1.0.0" {
+        return Err(CodegenError::Core(ThemeError::Config(
+            "existing theme lock has an unsupported schema".into(),
+        )));
+    }
+    Ok(Some(lock))
 }
 
 fn desired_manifest(
@@ -932,12 +1088,10 @@ fn protect_generated_ownership(
                 artifact.path
             ))));
         }
-        if (previous.is_none()
-            || previous
+        if artifact.scope == ChangeScope::HtmlOwnedRegion
+            && previous
                 .as_ref()
-                .and_then(|lock| lock.html_integration.as_ref())
-                .is_some_and(|integration| integration.mode == "manual"))
-            && artifact.scope == ChangeScope::HtmlOwnedRegion
+                .is_none_or(|lock| !lock.outputs.contains_key(&artifact.path))
             && !current
                 .windows(b"<!-- leptos-ui-theme:start -->".len())
                 .any(|window| window == b"<!-- leptos-ui-theme:start -->")
@@ -947,7 +1101,19 @@ fn protect_generated_ownership(
         {
             continue;
         }
-        let current_digest = format!("sha256:{}", sha256(&current));
+        let current_container_digest = format!("sha256:{}", sha256(&current));
+        let current_digest = if artifact.scope == ChangeScope::HtmlOwnedRegion {
+            owned_html_region(&current)?
+                .map(|region| format!("sha256:{}", sha256(region)))
+                .ok_or_else(|| {
+                    CodegenError::Conflict(format!(
+                        "owned HTML output `{}` has no theme region",
+                        artifact.path
+                    ))
+                })?
+        } else {
+            current_container_digest.clone()
+        };
         let expected_previous = previous
             .as_ref()
             .and_then(|lock| lock.outputs.get(&artifact.path))
@@ -968,7 +1134,7 @@ fn protect_generated_ownership(
             let backup_path = format!(
                 ".leptos-ui-theme/backups/{}-{}.bak",
                 sha256(artifact.path.as_bytes()),
-                current_digest.trim_start_matches("sha256:")
+                current_container_digest.trim_start_matches("sha256:")
             );
             let physical_backup = root.join(&backup_path);
             match std::fs::read(&physical_backup) {
@@ -1818,7 +1984,41 @@ fn select_index(root: &Path, config: &ProjectConfig) -> Result<PathBuf, CodegenE
     }
 }
 
-fn patch_index(index: &[u8], canonical_region: &str) -> Result<Vec<u8>, CodegenError> {
+struct HtmlLayout {
+    newline: &'static str,
+    insertion_offset: usize,
+    owned_region: Option<(usize, usize)>,
+}
+
+fn patch_index(
+    index: &[u8],
+    canonical_region: &str,
+    kit_href: &str,
+) -> Result<Vec<u8>, CodegenError> {
+    let layout = inspect_html(index, kit_href)?;
+    let region = canonical_region.replace('\n', layout.newline);
+    let (start, end) = layout
+        .owned_region
+        .unwrap_or((layout.insertion_offset, layout.insertion_offset));
+    let mut output = Vec::with_capacity(index.len() - (end - start) + region.len());
+    output.extend_from_slice(&index[..start]);
+    output.extend_from_slice(region.as_bytes());
+    output.extend_from_slice(&index[end..]);
+    Ok(output)
+}
+
+fn remove_owned_html_region(index: &[u8], kit_href: &str) -> Result<Vec<u8>, CodegenError> {
+    let layout = inspect_html(index, kit_href)?;
+    let (start, end) = layout.owned_region.ok_or_else(|| {
+        CodegenError::Conflict("selected index has no owned theme region to remove".into())
+    })?;
+    let mut output = Vec::with_capacity(index.len() - (end - start));
+    output.extend_from_slice(&index[..start]);
+    output.extend_from_slice(&index[end..]);
+    Ok(output)
+}
+
+fn inspect_html(index: &[u8], kit_href: &str) -> Result<HtmlLayout, CodegenError> {
     let text = std::str::from_utf8(index)
         .map_err(|_| CodegenError::Core(ThemeError::Config("index HTML must be UTF-8".into())))?;
     if text.contains('\0') || text.starts_with('\u{feff}') {
@@ -1834,40 +2034,289 @@ fn patch_index(index: &[u8], canonical_region: &str) -> Result<Vec<u8>, CodegenE
         )));
     }
     let newline = if crlf { "\r\n" } else { "\n" };
-    let region = canonical_region.replace('\n', newline);
-    let start = format!("<!-- leptos-ui-theme:start -->{newline}");
-    let end = format!("<!-- leptos-ui-theme:end -->{newline}");
-    let anchor = format!("{HTML_INSERTION_ANCHOR}{newline}");
-    let anchors: Vec<_> = text.match_indices(&anchor).collect();
-    if anchors.len() != 1 {
+    validate_parsed_document(text)?;
+
+    let escaped_kit_href = html_escape(kit_href);
+    let mut offset = 0usize;
+    let mut kit_lines = Vec::new();
+    let mut starts = Vec::new();
+    let mut ends = Vec::new();
+    for line in text.split_inclusive(newline) {
+        let content = line.strip_suffix(newline).unwrap_or(line);
+        if exact_kit_link_line(content, &escaped_kit_href) {
+            if !line.ends_with(newline) {
+                return Err(CodegenError::Core(ThemeError::Config(
+                    "verified kit stylesheet link must end at a line boundary".into(),
+                )));
+            }
+            kit_lines.push((offset, offset + line.len()));
+        }
+        if content == "<!-- leptos-ui-theme:start -->" {
+            starts.push(offset);
+        }
+        if content == "<!-- leptos-ui-theme:end -->" {
+            if !line.ends_with(newline) {
+                return Err(CodegenError::Core(ThemeError::Config(
+                    "theme end marker must include the selected line ending".into(),
+                )));
+            }
+            ends.push(offset + line.len());
+        }
+        offset += line.len();
+    }
+    if kit_lines.len() != 1 {
         return Err(CodegenError::Core(ThemeError::Config(
-            "index HTML must contain exactly one line-bounded theme insertion anchor".into(),
+            "index HTML must contain exactly one verified kit stylesheet line".into(),
         )));
     }
-    let starts: Vec<_> = text.match_indices(&start).collect();
-    let ends: Vec<_> = text.match_indices(&end).collect();
-    if starts.len() == 1 && ends.len() == 1 && starts[0].0 < ends[0].0 {
-        let end_offset = ends[0].0 + end.len();
-        let mut output = Vec::with_capacity(index.len() + region.len());
-        output.extend_from_slice(&index[..starts[0].0]);
-        output.extend_from_slice(region.as_bytes());
-        output.extend_from_slice(&index[end_offset..]);
-        return Ok(output);
-    }
-    if !starts.is_empty() || !ends.is_empty() {
+    validate_kit_node_and_order(text, kit_href)?;
+    let insertion_offset = kit_lines[0].1;
+    let owned_region = match (starts.as_slice(), ends.as_slice()) {
+        ([], []) => None,
+        ([start], [end]) if *start == insertion_offset && start < end => Some((*start, *end)),
+        _ => {
+            return Err(CodegenError::Core(ThemeError::Config(
+                "index HTML has ambiguous or misplaced theme markers".into(),
+            )));
+        }
+    };
+    if text.matches("<!-- leptos-ui-theme:start -->").count() != starts.len()
+        || text.matches("<!-- leptos-ui-theme:end -->").count() != ends.len()
+    {
         return Err(CodegenError::Core(ThemeError::Config(
-            "index HTML has ambiguous theme markers".into(),
+            "theme markers must be complete line contents".into(),
         )));
     }
-    let insertion = anchors[0].0 + anchor.len();
-    let mut output = Vec::with_capacity(index.len() + region.len());
-    output.extend_from_slice(&index[..insertion]);
-    output.extend_from_slice(region.as_bytes());
-    output.extend_from_slice(&index[insertion..]);
-    Ok(output)
+    Ok(HtmlLayout {
+        newline,
+        insertion_offset,
+        owned_region,
+    })
 }
 
-fn html_exterior(index: &[u8]) -> Result<Vec<u8>, CodegenError> {
+fn validate_parsed_document(text: &str) -> Result<(), CodegenError> {
+    let options = ParseOpts {
+        tokenizer: TokenizerOpts {
+            exact_errors: true,
+            discard_bom: false,
+            profile: false,
+            initial_state: None,
+            last_start_tag_name: None,
+        },
+        tree_builder: TreeBuilderOpts {
+            exact_errors: true,
+            scripting_enabled: true,
+            iframe_srcdoc: false,
+            drop_doctype: false,
+            quirks_mode: html5ever::tree_builder::QuirksMode::NoQuirks,
+        },
+    };
+    let dom = parse_document(RcDom::default(), options).one(text);
+    if !dom.errors.borrow().is_empty() {
+        return Err(CodegenError::Core(ThemeError::Config(
+            "index HTML is outside the strict parser profile".into(),
+        )));
+    }
+    let mut elements = Vec::new();
+    collect_elements(&dom.document, &mut elements);
+    for forbidden in ["template", "svg", "math"] {
+        if elements
+            .iter()
+            .any(|node| element_name(node) == Some(forbidden))
+        {
+            return Err(CodegenError::Core(ThemeError::Config(format!(
+                "index HTML cannot contain `{forbidden}`"
+            ))));
+        }
+    }
+    let unique = |name: &str| {
+        elements
+            .iter()
+            .filter(|node| element_name(node) == Some(name))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let html = unique("html");
+    let head = unique("head");
+    let body = unique("body");
+    if html.len() != 1
+        || head.len() != 1
+        || body.len() != 1
+        || !is_parent(&head[0], &html[0])
+        || !is_parent(&body[0], &html[0])
+        || !has_explicit_tag_pair(text, "html")
+        || !has_explicit_tag_pair(text, "head")
+        || !has_explicit_tag_pair(text, "body")
+    {
+        return Err(CodegenError::Core(ThemeError::Config(
+            "index HTML requires explicit unique html, head, and body elements".into(),
+        )));
+    }
+    let child_elements = html[0]
+        .children
+        .borrow()
+        .iter()
+        .filter(|node| element_name(node).is_some())
+        .cloned()
+        .collect::<Vec<_>>();
+    if child_elements.len() != 2
+        || !std::rc::Rc::ptr_eq(&child_elements[0], &head[0])
+        || !std::rc::Rc::ptr_eq(&child_elements[1], &body[0])
+    {
+        return Err(CodegenError::Core(ThemeError::Config(
+            "head and body must be explicit ordered children of html".into(),
+        )));
+    }
+    Ok(())
+}
+
+fn collect_elements(node: &Handle, output: &mut Vec<Handle>) {
+    if matches!(node.data, NodeData::Element { .. }) {
+        output.push(node.clone());
+    }
+    let children = node.children.borrow().clone();
+    for child in children {
+        collect_elements(&child, output);
+    }
+}
+
+fn element_name(node: &Handle) -> Option<&str> {
+    match &node.data {
+        NodeData::Element { name, .. } => Some(name.local.as_ref()),
+        _ => None,
+    }
+}
+
+fn is_parent(child: &Handle, parent: &Handle) -> bool {
+    child
+        .parent
+        .take()
+        .and_then(|weak| {
+            child.parent.set(Some(weak.clone()));
+            weak.upgrade()
+        })
+        .is_some_and(|actual| std::rc::Rc::ptr_eq(&actual, parent))
+}
+
+fn has_explicit_tag_pair(text: &str, name: &str) -> bool {
+    source_tag_count(text, name, false) == 1 && source_tag_count(text, name, true) == 1
+}
+
+fn source_tag_count(text: &str, name: &str, end: bool) -> usize {
+    let needle = if end {
+        format!("</{name}")
+    } else {
+        format!("<{name}")
+    };
+    text.match_indices(&needle)
+        .filter(|(offset, _)| {
+            text.as_bytes()
+                .get(offset + needle.len())
+                .is_some_and(|byte| byte.is_ascii_whitespace() || *byte == b'>')
+        })
+        .count()
+}
+
+fn exact_kit_link_line(line: &str, escaped_href: &str) -> bool {
+    let line = line.trim_matches([' ', '\t']);
+    let attributes = [
+        "data-trunk".to_owned(),
+        "rel=\"css\"".to_owned(),
+        format!("href=\"{escaped_href}\""),
+    ];
+    [
+        [0usize, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ]
+    .iter()
+    .any(|order| {
+        format!(
+            "<link {} {} {}>",
+            attributes[order[0]], attributes[order[1]], attributes[order[2]]
+        ) == line
+    })
+}
+
+fn validate_kit_node_and_order(text: &str, kit_href: &str) -> Result<(), CodegenError> {
+    let dom = parse_document(RcDom::default(), ParseOpts::default()).one(text);
+    let head = dom
+        .document
+        .children
+        .borrow()
+        .iter()
+        .find_map(find_head)
+        .ok_or_else(|| CodegenError::Core(ThemeError::Config("index head is missing".into())))?;
+    let children = head.children.borrow();
+    let mut kit_index = None;
+    for (index, node) in children.iter().enumerate() {
+        let NodeData::Element { name, attrs, .. } = &node.data else {
+            continue;
+        };
+        if name.local.as_ref() != "link" {
+            continue;
+        }
+        let attrs = attrs.borrow();
+        let data_trunk = attribute(&attrs, "data-trunk");
+        let rel = attribute(&attrs, "rel");
+        let href = attribute(&attrs, "href");
+        if attrs.len() == 3
+            && data_trunk == Some("")
+            && rel == Some("css")
+            && href == Some(kit_href)
+            && kit_index.replace(index).is_some()
+        {
+            return Err(CodegenError::Core(ThemeError::Config(
+                "index HTML contains duplicate verified kit stylesheet links".into(),
+            )));
+        }
+    }
+    let kit_index = kit_index.ok_or_else(|| {
+        CodegenError::Core(ThemeError::Config(
+            "verified kit stylesheet is not a direct child of head".into(),
+        ))
+    })?;
+    if children[..kit_index].iter().any(is_application_stylesheet) {
+        return Err(CodegenError::Core(ThemeError::Config(
+            "verified kit stylesheet must precede application stylesheets".into(),
+        )));
+    }
+    Ok(())
+}
+
+fn find_head(node: &Handle) -> Option<Handle> {
+    if element_name(node) == Some("head") {
+        return Some(node.clone());
+    }
+    node.children.borrow().iter().find_map(find_head)
+}
+
+fn attribute<'a>(attrs: &'a [html5ever::Attribute], name: &str) -> Option<&'a str> {
+    attrs
+        .iter()
+        .find(|attribute| attribute.name.local.as_ref() == name)
+        .map(|attribute| attribute.value.as_ref())
+}
+
+fn is_application_stylesheet(node: &Handle) -> bool {
+    let NodeData::Element { name, attrs, .. } = &node.data else {
+        return false;
+    };
+    if name.local.as_ref() == "style" {
+        return true;
+    }
+    if name.local.as_ref() != "link" {
+        return false;
+    }
+    let attrs = attrs.borrow();
+    attribute(&attrs, "rel") == Some("stylesheet")
+        || (attribute(&attrs, "rel") == Some("css") && attribute(&attrs, "data-trunk").is_some())
+}
+
+fn marker_offsets(index: &[u8]) -> Result<Option<(usize, usize)>, CodegenError> {
     let text = std::str::from_utf8(index)
         .map_err(|_| CodegenError::Core(ThemeError::Config("index HTML must be UTF-8".into())))?;
     let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
@@ -1876,18 +2325,42 @@ fn html_exterior(index: &[u8]) -> Result<Vec<u8>, CodegenError> {
     let starts: Vec<_> = text.match_indices(&start).collect();
     let ends: Vec<_> = text.match_indices(&end).collect();
     match (starts.as_slice(), ends.as_slice()) {
-        ([], []) => Ok(index.to_vec()),
+        ([], []) => Ok(None),
         ([(start_offset, _)], [(end_offset, _)]) if start_offset < end_offset => {
             let end_offset = end_offset + end.len();
-            let mut exterior = Vec::with_capacity(index.len() - (end_offset - start_offset));
-            exterior.extend_from_slice(&index[..*start_offset]);
-            exterior.extend_from_slice(&index[end_offset..]);
-            Ok(exterior)
+            Ok(Some((*start_offset, end_offset)))
         }
         _ => Err(CodegenError::Core(ThemeError::Config(
             "index HTML has ambiguous theme markers".into(),
         ))),
     }
+}
+
+fn owned_html_region(index: &[u8]) -> Result<Option<&[u8]>, CodegenError> {
+    Ok(marker_offsets(index)?.map(|(start, end)| &index[start..end]))
+}
+
+fn html_exterior_digest(index: &[u8]) -> Result<String, CodegenError> {
+    let (prefix, suffix) = marker_offsets(index)?.map_or((index, &[][..]), |(start, end)| {
+        (&index[..start], &index[end..])
+    });
+    Ok(hash_html_exterior(prefix, suffix))
+}
+
+fn html_exterior_digest_for_index(index: &[u8], kit_href: &str) -> Result<String, CodegenError> {
+    let layout = inspect_html(index, kit_href)?;
+    let (start, end) = layout
+        .owned_region
+        .unwrap_or((layout.insertion_offset, layout.insertion_offset));
+    Ok(hash_html_exterior(&index[..start], &index[end..]))
+}
+
+fn hash_html_exterior(prefix: &[u8], suffix: &[u8]) -> String {
+    let mut domain = b"leptos-ui-theme/html-exterior/v1\0".to_vec();
+    domain.extend_from_slice(&(prefix.len() as u64).to_be_bytes());
+    domain.extend_from_slice(prefix);
+    domain.extend_from_slice(suffix);
+    format!("sha256:{}", sha256(&domain))
 }
 
 fn relative_asset(index_path: &str, target_path: &str) -> Result<String, CodegenError> {
@@ -1953,7 +2426,9 @@ mod tests {
         ArtifactManifest, ArtifactManifestEntry, ChangeOperation, ChangeScope, ConsumedInput,
         ConsumedInputRoot, CssMode, DesiredArtifactState, GeneratedArtifact, Ownership,
         ResolvedAxis, apply_artifacts, apply_transaction, bootstrap_script, csp_source,
-        generate_css, plan_manifest, serialize_css, verify_consumed_inputs,
+        generate_css, html_exterior_digest, html_exterior_digest_for_index, owned_html_region,
+        patch_index, plan_manifest, remove_owned_html_region, serialize_css,
+        verify_consumed_inputs,
     };
     use crate::ApplyCommand;
     use leptos_ui_theme_core::{
@@ -2273,6 +2748,55 @@ mod tests {
         assert!(source.starts_with("'sha256-"));
         assert!(source.ends_with('\''));
         assert_eq!(source.len(), "'sha256-'".len() + 44);
+    }
+
+    #[test]
+    fn html_region_is_inserted_after_kit_and_preserves_the_exterior() {
+        let index = b"<!doctype html>\n<html>\n<head>\n<link href=\"styles/kit.css\" data-trunk rel=\"css\">\n<link data-trunk rel=\"css\" href=\"styles/app.css\">\n</head>\n<body></body>\n</html>\n";
+        let region = "<!-- leptos-ui-theme:start -->\n<meta name=\"color-scheme\" content=\"light dark\">\n<link data-trunk rel=\"css\" href=\"styles/themes.css\">\n<!-- leptos-ui-theme:end -->\n";
+        let before_exterior = html_exterior_digest_for_index(index, "styles/kit.css").unwrap();
+        let patched = patch_index(index, region, "styles/kit.css").unwrap();
+        let text = std::str::from_utf8(&patched).unwrap();
+
+        assert!(
+            text.find("styles/kit.css").unwrap()
+                < text.find("<!-- leptos-ui-theme:start -->").unwrap()
+        );
+        assert!(
+            text.find("<!-- leptos-ui-theme:end -->").unwrap()
+                < text.find("styles/app.css").unwrap()
+        );
+        assert_eq!(
+            owned_html_region(&patched).unwrap().unwrap(),
+            region.as_bytes()
+        );
+        assert_eq!(html_exterior_digest(&patched).unwrap(), before_exterior);
+        assert_eq!(
+            remove_owned_html_region(&patched, "styles/kit.css").unwrap(),
+            index
+        );
+    }
+
+    #[test]
+    fn html_validation_rejects_application_css_before_the_kit() {
+        let index = b"<!doctype html>\n<html>\n<head>\n<link data-trunk rel=\"css\" href=\"styles/app.css\">\n<link data-trunk rel=\"css\" href=\"styles/kit.css\">\n</head>\n<body></body>\n</html>\n";
+        let region = "<!-- leptos-ui-theme:start -->\n<!-- leptos-ui-theme:end -->\n";
+
+        assert!(patch_index(index, region, "styles/kit.css").is_err());
+    }
+
+    #[test]
+    fn html_patching_preserves_uniform_crlf() {
+        let index = b"<!doctype html>\r\n<html>\r\n<head>\r\n<link data-trunk rel=\"css\" href=\"styles/kit.css\">\r\n</head>\r\n<body></body>\r\n</html>\r\n";
+        let region = "<!-- leptos-ui-theme:start -->\n<!-- leptos-ui-theme:end -->\n";
+        let patched = patch_index(index, region, "styles/kit.css").unwrap();
+
+        assert!(!patched.windows(2).any(|window| window == b"\n\n"));
+        assert!(
+            std::str::from_utf8(&patched)
+                .unwrap()
+                .contains("<!-- leptos-ui-theme:start -->\r\n")
+        );
     }
 
     #[test]

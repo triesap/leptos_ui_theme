@@ -1317,10 +1317,10 @@ fn change_from_plan(
         after_digest: change.after_digest.clone(),
         before_mode: change.before_mode,
         after_mode: change.after_mode,
-        container_before_digest: None,
-        container_after_digest: None,
-        exterior_before_digest: None,
-        exterior_after_digest: None,
+        container_before_digest: change.container_before_digest.clone(),
+        container_after_digest: change.container_after_digest.clone(),
+        exterior_before_digest: change.exterior_before_digest.clone(),
+        exterior_after_digest: change.exterior_after_digest.clone(),
         accepted_generated_conflict: backup_path.is_some(),
         backup_path,
     }
@@ -1540,11 +1540,28 @@ checksum = "sha256:test"
         .unwrap();
         std::fs::write(
             root.join("index.html"),
-            "<!doctype html>\n<html>\n<head>\n<link data-trunk rel=\"css\" href=\"styles/app.css\">\n<!-- leptos-ui-theme:anchor -->\n<link data-trunk rel=\"css\" href=\"styles/kit.css\">\n</head>\n<body></body>\n</html>\n",
+            "<!doctype html>\n<html>\n<head>\n<link data-trunk rel=\"css\" href=\"styles/kit.css\">\n<!-- leptos-ui-theme:anchor -->\n<link data-trunk rel=\"css\" href=\"styles/app.css\">\n</head>\n<body></body>\n</html>\n",
         )
         .unwrap();
         let outcome = init(&root, false, false, 0).unwrap();
         assert!(outcome.changes.len() >= 10);
+        let html_change = outcome
+            .changes
+            .iter()
+            .find(|change| change.path == "index.html")
+            .unwrap();
+        assert_eq!(
+            html_change.scope,
+            leptos_ui_theme_codegen::ChangeScope::HtmlOwnedRegion
+        );
+        assert!(html_change.before_digest.is_none());
+        assert!(html_change.after_digest.is_some());
+        assert!(html_change.container_before_digest.is_some());
+        assert!(html_change.container_after_digest.is_some());
+        assert_eq!(
+            html_change.exterior_before_digest,
+            html_change.exterior_after_digest
+        );
         let listed = list_command(&root).unwrap();
         assert_eq!(listed.data["contract"]["id"], "leptos-ui-kit");
         assert_eq!(listed.data["profiles"][0]["isDefault"], true);
@@ -1613,16 +1630,57 @@ checksum = "sha256:test"
                 .changes
                 .is_empty()
         );
-        build_command(&root, false, true, 0, &[]).unwrap();
+        assert!(matches!(
+            build_command(&root, false, true, 0, &[]),
+            Err(super::CliError::Codegen(
+                leptos_ui_theme_codegen::CodegenError::Conflict(_)
+            ))
+        ));
         assert_eq!(check_command(&root).unwrap().exit_code, 0);
-        let index = std::fs::read_to_string(root.join("index.html")).unwrap();
-        let start = index.find("<!-- leptos-ui-theme:start -->").unwrap();
-        let end = index.find("<!-- leptos-ui-theme:end -->").unwrap()
-            + "<!-- leptos-ui-theme:end -->\n".len();
-        let mut without_manual_region = index;
-        without_manual_region.replace_range(start..end, "");
-        std::fs::write(root.join("index.html"), without_manual_region).unwrap();
-        assert_eq!(check_command(&root).unwrap().exit_code, 7);
+
+        let config_path = root.join(leptos_ui_theme_core::CONFIG_FILE);
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        config["html"]["indexPath"] = serde_json::Value::String("nested/index.html".into());
+        config["html"]["indexCandidates"] = serde_json::Value::Null;
+        let mut config_bytes = serde_json::to_vec_pretty(&config).unwrap();
+        config_bytes.push(b'\n');
+        std::fs::write(&config_path, config_bytes).unwrap();
+        std::fs::create_dir(root.join("nested")).unwrap();
+        std::fs::write(
+            root.join("nested/index.html"),
+            "<!doctype html>\n<html>\n<head>\n<link data-trunk rel=\"css\" href=\"../styles/kit.css\">\n<link data-trunk rel=\"css\" href=\"../styles/app.css\">\n</head>\n<body></body>\n</html>\n",
+        )
+        .unwrap();
+        let migration = build_command(&root, false, false, 0, &[]).unwrap();
+        let removed = migration
+            .changes
+            .iter()
+            .find(|change| change.path == "index.html")
+            .unwrap();
+        let created = migration
+            .changes
+            .iter()
+            .find(|change| change.path == "nested/index.html")
+            .unwrap();
+        assert_eq!(
+            removed.action,
+            leptos_ui_theme_codegen::ChangeOperation::Remove
+        );
+        assert_eq!(
+            created.action,
+            leptos_ui_theme_codegen::ChangeOperation::Create
+        );
+        assert!(
+            !std::fs::read_to_string(root.join("index.html"))
+                .unwrap()
+                .contains("<!-- leptos-ui-theme:start -->")
+        );
+        assert!(
+            std::fs::read_to_string(root.join("nested/index.html"))
+                .unwrap()
+                .contains("<!-- leptos-ui-theme:start -->")
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

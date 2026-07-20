@@ -109,6 +109,10 @@ pub struct Change {
     pub after_digest: Option<String>,
     pub before_mode: Option<u32>,
     pub after_mode: Option<u32>,
+    pub container_before_digest: Option<String>,
+    pub container_after_digest: Option<String>,
+    pub exterior_before_digest: Option<String>,
+    pub exterior_after_digest: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -200,10 +204,46 @@ pub fn plan_manifest(
                 }
                 let expected_mode = publication_mode(artifact, &snapshot);
                 if snapshot.digest.as_deref() != Some(&expected) || snapshot.mode != expected_mode {
-                    let operation = if snapshot.exists {
-                        ChangeOperation::Replace
+                    let (
+                        operation,
+                        before_digest,
+                        after_digest,
+                        container_before_digest,
+                        container_after_digest,
+                        exterior_before_digest,
+                        exterior_after_digest,
+                    ) = if artifact.scope == ChangeScope::HtmlOwnedRegion {
+                        if !snapshot.exists {
+                            return Err(CodegenError::Conflict(format!(
+                                "HTML container `{}` is missing",
+                                artifact.path
+                            )));
+                        }
+                        let current = read_snapshot_bytes(root, &artifact.path)?;
+                        let html = html_change(&current, &artifact.bytes)?;
+                        (
+                            html.operation,
+                            html.before_digest,
+                            html.after_digest,
+                            snapshot.digest.clone(),
+                            Some(expected),
+                            Some(html.exterior_digest.clone()),
+                            Some(html.exterior_digest),
+                        )
                     } else {
-                        ChangeOperation::Create
+                        (
+                            if snapshot.exists {
+                                ChangeOperation::Replace
+                            } else {
+                                ChangeOperation::Create
+                            },
+                            snapshot.digest.clone(),
+                            Some(expected),
+                            None,
+                            None,
+                            None,
+                            None,
+                        )
                     };
                     validate_action(artifact.ownership, artifact.scope, operation)?;
                     changes.push(Change {
@@ -211,10 +251,14 @@ pub fn plan_manifest(
                         scope: artifact.scope,
                         path: artifact.path.clone(),
                         ownership: artifact.ownership,
-                        before_digest: snapshot.digest.clone(),
-                        after_digest: Some(expected),
+                        before_digest,
+                        after_digest,
                         before_mode: snapshot.mode,
                         after_mode: expected_mode,
+                        container_before_digest,
+                        container_after_digest,
+                        exterior_before_digest,
+                        exterior_after_digest,
                     });
                 }
             }
@@ -230,6 +274,10 @@ pub fn plan_manifest(
                         after_digest: None,
                         before_mode: snapshot.mode,
                         after_mode: None,
+                        container_before_digest: None,
+                        container_after_digest: None,
+                        exterior_before_digest: None,
+                        exterior_after_digest: None,
                     });
                 }
             }
@@ -310,6 +358,88 @@ fn valid_digest(value: &str) -> bool {
             && value
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+struct HtmlChange {
+    operation: ChangeOperation,
+    before_digest: Option<String>,
+    after_digest: Option<String>,
+    exterior_digest: String,
+}
+
+fn html_change(before: &[u8], after: &[u8]) -> Result<HtmlChange, CodegenError> {
+    let before_region = html_region_offsets(before)?;
+    let after_region = html_region_offsets(after)?;
+    let (operation, before_parts, after_parts) = match (before_region, after_region) {
+        (None, Some((start, end))) => (
+            ChangeOperation::Create,
+            (&before[..start], &before[start..]),
+            (&after[..start], &after[end..]),
+        ),
+        (Some((before_start, before_end)), Some((after_start, after_end))) => (
+            ChangeOperation::Replace,
+            (&before[..before_start], &before[before_end..]),
+            (&after[..after_start], &after[after_end..]),
+        ),
+        (Some((start, end)), None) => (
+            ChangeOperation::Remove,
+            (&before[..start], &before[end..]),
+            (&after[..start], &after[start..]),
+        ),
+        (None, None) => {
+            return Err(CodegenError::Conflict(
+                "HTML change has no owned region boundary".into(),
+            ));
+        }
+    };
+    if before_parts != after_parts {
+        return Err(CodegenError::Conflict(
+            "HTML change would modify bytes outside the owned region".into(),
+        ));
+    }
+    let before_digest =
+        before_region.map(|(start, end)| format!("sha256:{}", sha256(&before[start..end])));
+    let after_digest =
+        after_region.map(|(start, end)| format!("sha256:{}", sha256(&after[start..end])));
+    let exterior_digest = hash_html_exterior(before_parts.0, before_parts.1);
+    Ok(HtmlChange {
+        operation,
+        before_digest,
+        after_digest,
+        exterior_digest,
+    })
+}
+
+fn html_region_offsets(bytes: &[u8]) -> Result<Option<(usize, usize)>, CodegenError> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| CodegenError::Conflict("HTML container is not UTF-8".into()))?;
+    let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let start_marker = format!("<!-- leptos-ui-theme:start -->{newline}");
+    let end_marker = format!("<!-- leptos-ui-theme:end -->{newline}");
+    let starts = text.match_indices(&start_marker).collect::<Vec<_>>();
+    let ends = text.match_indices(&end_marker).collect::<Vec<_>>();
+    match (starts.as_slice(), ends.as_slice()) {
+        ([], []) => Ok(None),
+        ([(start, _)], [(end, _)]) if start < end => Ok(Some((*start, *end + end_marker.len()))),
+        _ => Err(CodegenError::Conflict(
+            "HTML container has ambiguous owned markers".into(),
+        )),
+    }
+}
+
+fn hash_html_exterior(prefix: &[u8], suffix: &[u8]) -> String {
+    let mut domain = b"leptos-ui-theme/html-exterior/v1\0".to_vec();
+    domain.extend_from_slice(&(prefix.len() as u64).to_be_bytes());
+    domain.extend_from_slice(prefix);
+    domain.extend_from_slice(suffix);
+    format!("sha256:{}", sha256(&domain))
+}
+
+fn read_snapshot_bytes(root: &Path, relative: &str) -> Result<Vec<u8>, CodegenError> {
+    std::fs::read(root.join(relative)).map_err(|source| CodegenError::Io {
+        path: PathBuf::from(relative),
+        source,
     })
 }
 
