@@ -1,4 +1,4 @@
-use crate::{CodegenError, GeneratedArtifact, PlanV1};
+use crate::{ChangeOperation, ChangeScope, CodegenError, GeneratedArtifact, Ownership, PlanV1};
 use fs2::FileExt;
 use leptos_ui_theme_core::{LogicalPath, ThemeError, sha256};
 use serde::{Deserialize, Serialize};
@@ -42,11 +42,14 @@ struct Journal {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct Operation {
     ordinal: usize,
+    operation: ChangeOperation,
+    scope: ChangeScope,
+    ownership: Ownership,
     path: String,
     pre_digest: Option<String>,
-    expected_digest: String,
+    expected_digest: Option<String>,
     target_mode: Option<u32>,
-    stage_path: String,
+    stage_path: Option<String>,
     backup_path: Option<String>,
     commit_role: CommitRole,
 }
@@ -103,7 +106,28 @@ pub fn apply_transaction_with_wait(
     theme_lock_path: Option<&str>,
     lock_wait: Duration,
 ) -> Result<Vec<String>, CodegenError> {
+    apply_transaction_with_wait_checked(
+        root,
+        artifacts,
+        plan,
+        command,
+        theme_lock_path,
+        lock_wait,
+        || Ok(()),
+    )
+}
+
+pub(crate) fn apply_transaction_with_wait_checked(
+    root: &Path,
+    artifacts: &[GeneratedArtifact],
+    plan: &PlanV1,
+    command: ApplyCommand,
+    theme_lock_path: Option<&str>,
+    lock_wait: Duration,
+    revalidate_inputs: impl FnOnce() -> Result<(), CodegenError>,
+) -> Result<Vec<String>, CodegenError> {
     if plan.changes.is_empty() {
+        revalidate_inputs()?;
         return Ok(Vec::new());
     }
     plan.revalidate(root)?;
@@ -117,6 +141,7 @@ pub fn apply_transaction_with_wait(
     let result = (|| {
         ensure_private_directory(&transactions)?;
         recover_locked(root, &transactions)?;
+        revalidate_inputs()?;
         plan.revalidate(root)?;
         let artifacts = artifacts
             .iter()
@@ -127,20 +152,10 @@ pub fn apply_transaction_with_wait(
         let active = publish_journal(&transactions, &journal)?;
         let mut sequence = 0;
         for operation in &journal.operations {
-            let artifact = artifacts.get(operation.path.as_str()).ok_or_else(|| {
-                CodegenError::Core(ThemeError::Config(format!(
-                    "journal operation has no payload for `{}`",
-                    operation.path
-                )))
-            })?;
-            install_operation(
-                root,
-                &active,
-                &journal,
-                operation,
-                &artifact.bytes,
-                &mut sequence,
-            )?;
+            let bytes = artifacts
+                .get(operation.path.as_str())
+                .map(|artifact| artifact.bytes.as_slice());
+            install_operation(root, &active, &journal, operation, bytes, &mut sequence)?;
         }
         verify_final_tree(root, &journal)?;
         if journal.commit_kind == CommitKind::Journal {
@@ -258,21 +273,43 @@ fn build_journal(
         CommitKind::Journal
     };
     let mut operations = Vec::with_capacity(plan.changes.len());
-    for (ordinal, change) in plan.changes.iter().enumerate() {
-        let artifact = artifacts.get(change.path.as_str()).ok_or_else(|| {
-            CodegenError::Core(ThemeError::Config(format!(
-                "plan change has no payload for `{}`",
-                change.path
-            )))
-        })?;
-        let expected_digest = format!("sha256:{}", sha256(&artifact.bytes));
-        if change.after_digest.as_deref() != Some(&expected_digest) {
-            return Err(CodegenError::Conflict(change.path.clone()));
+    let mut ordered_changes = plan
+        .changes
+        .iter()
+        .filter(|change| theme_lock_path != Some(change.path.as_str()))
+        .collect::<Vec<_>>();
+    ordered_changes.extend(
+        plan.changes
+            .iter()
+            .filter(|change| theme_lock_path == Some(change.path.as_str())),
+    );
+    for (ordinal, change) in ordered_changes.into_iter().enumerate() {
+        let expected_digest = artifacts
+            .get(change.path.as_str())
+            .map(|artifact| format!("sha256:{}", sha256(&artifact.bytes)));
+        match change.operation {
+            ChangeOperation::Create | ChangeOperation::Replace => {
+                if change.after_digest != expected_digest {
+                    return Err(CodegenError::Conflict(change.path.clone()));
+                }
+            }
+            ChangeOperation::Remove => {
+                if expected_digest.is_some()
+                    || change.after_digest.is_some()
+                    || change.before_digest.is_none()
+                {
+                    return Err(CodegenError::Conflict(change.path.clone()));
+                }
+            }
         }
-        let stage_path = sibling_relative(
-            &change.path,
-            &format!(".leptos-ui-theme-{transaction_id}-{ordinal:06}.stage"),
-        )?;
+        let stage_path = (change.operation != ChangeOperation::Remove)
+            .then(|| {
+                sibling_relative(
+                    &change.path,
+                    &format!(".leptos-ui-theme-{transaction_id}-{ordinal:06}.stage"),
+                )
+            })
+            .transpose()?;
         let backup_path = change
             .before_digest
             .as_ref()
@@ -285,6 +322,9 @@ fn build_journal(
             .transpose()?;
         operations.push(Operation {
             ordinal,
+            operation: change.operation,
+            scope: change.scope,
+            ownership: change.ownership,
             path: change.path.clone(),
             pre_digest: change.before_digest.clone(),
             expected_digest,
@@ -298,14 +338,16 @@ fn build_journal(
             },
         });
     }
-    Ok(Journal {
+    let journal = Journal {
         schema_version: "1.0.0".into(),
         transaction_id: transaction_id.into(),
         command,
         commit_kind,
         plan_digest: plan.digest.clone(),
         operations,
-    })
+    };
+    validate_journal(&journal)?;
+    Ok(journal)
 }
 
 fn install_operation(
@@ -313,11 +355,15 @@ fn install_operation(
     active: &Path,
     journal: &Journal,
     operation: &Operation,
-    bytes: &[u8],
+    bytes: Option<&[u8]>,
     sequence: &mut usize,
 ) -> Result<(), CodegenError> {
     let target = project_path(root, &operation.path)?;
-    let stage = project_path(root, &operation.stage_path)?;
+    let stage = operation
+        .stage_path
+        .as_deref()
+        .map(|path| project_path(root, path))
+        .transpose()?;
     let backup = operation
         .backup_path
         .as_deref()
@@ -325,11 +371,51 @@ fn install_operation(
         .transpose()?;
     ensure_parent_chain(root, &target)?;
     verify_pre_state(&target, operation.pre_digest.as_deref(), &operation.path)?;
-    require_absent(&stage, &operation.stage_path)?;
+    if let (Some(stage), Some(relative)) = (&stage, &operation.stage_path) {
+        require_absent(stage, relative)?;
+    }
     if let (Some(backup), Some(relative)) = (&backup, &operation.backup_path) {
         require_absent(backup, relative)?;
     }
 
+    if operation.operation == ChangeOperation::Remove {
+        let backup = backup.ok_or_else(|| CodegenError::Conflict(operation.path.clone()))?;
+        std::fs::rename(&target, &backup).map_err(|source| CodegenError::Io {
+            path: PathBuf::from(&operation.path),
+            source,
+        })?;
+        sync_parent(&target)?;
+        append_state(
+            active,
+            journal,
+            Some(operation.ordinal),
+            OperationState::BackedUp,
+            sequence,
+        )?;
+        verify_pre_state(&target, None, &operation.path)?;
+        return append_state(
+            active,
+            journal,
+            Some(operation.ordinal),
+            OperationState::Installed,
+            sequence,
+        );
+    }
+    let stage = stage.ok_or_else(|| CodegenError::Conflict(operation.path.clone()))?;
+    let stage_path = operation
+        .stage_path
+        .as_deref()
+        .ok_or_else(|| CodegenError::Conflict(operation.path.clone()))?;
+    let bytes = bytes.ok_or_else(|| {
+        CodegenError::Core(ThemeError::Config(format!(
+            "journal operation has no payload for `{}`",
+            operation.path
+        )))
+    })?;
+    let expected_digest = operation
+        .expected_digest
+        .as_deref()
+        .ok_or_else(|| CodegenError::Conflict(operation.path.clone()))?;
     let mut stage_file = create_private_file(&stage)?;
     sync_parent(&stage)?;
     append_state(
@@ -342,17 +428,17 @@ fn install_operation(
     stage_file
         .write_all(bytes)
         .map_err(|source| CodegenError::Io {
-            path: PathBuf::from(&operation.stage_path),
+            path: PathBuf::from(stage_path),
             source,
         })?;
     set_file_mode(&stage, operation.target_mode)?;
     stage_file.sync_all().map_err(|source| CodegenError::Io {
-        path: PathBuf::from(&operation.stage_path),
+        path: PathBuf::from(stage_path),
         source,
     })?;
     drop(stage_file);
-    verify_digest(&stage, &operation.expected_digest, &operation.stage_path)?;
-    verify_file_mode(&stage, operation.target_mode, &operation.stage_path)?;
+    verify_digest(&stage, expected_digest, stage_path)?;
+    verify_file_mode(&stage, operation.target_mode, stage_path)?;
     append_state(
         active,
         journal,
@@ -380,7 +466,7 @@ fn install_operation(
         source,
     })?;
     sync_parent(&target)?;
-    verify_digest(&target, &operation.expected_digest, &operation.path)?;
+    verify_digest(&target, expected_digest, &operation.path)?;
     verify_file_mode(&target, operation.target_mode, &operation.path)?;
     append_state(
         active,
@@ -443,8 +529,11 @@ fn transaction_committed(
                 .find(|operation| operation.commit_role == CommitRole::ThemeLock)
                 .or_else(|| journal.operations.last())
                 .ok_or_else(|| CodegenError::Conflict("lock journal has no operations".into()))?;
+            let expected = lock_operation.expected_digest.as_deref().ok_or_else(|| {
+                CodegenError::Conflict("lock operation has no final digest".into())
+            })?;
             let target = project_path(root, &lock_operation.path)?;
-            Ok(path_digest(&target)?.as_deref() == Some(&lock_operation.expected_digest))
+            Ok(path_digest(&target)?.as_deref() == Some(expected))
         }
     }
 }
@@ -452,7 +541,11 @@ fn transaction_committed(
 fn rollback_operations(root: &Path, journal: &Journal) -> Result<(), CodegenError> {
     for operation in journal.operations.iter().rev() {
         let target = project_path(root, &operation.path)?;
-        let stage = project_path(root, &operation.stage_path)?;
+        let stage = operation
+            .stage_path
+            .as_deref()
+            .map(|path| project_path(root, path))
+            .transpose()?;
         let target_digest = path_digest(&target)?;
         if let Some(backup_path) = &operation.backup_path {
             let backup = project_path(root, backup_path)?;
@@ -461,8 +554,10 @@ fn rollback_operations(root: &Path, journal: &Journal) -> Result<(), CodegenErro
                 if backup_digest != operation.pre_digest {
                     return Err(CodegenError::Conflict(operation.path.clone()));
                 }
-                if target_digest.as_deref() == Some(&operation.expected_digest) {
-                    remove_regular(&target, &operation.path)?;
+                if target_digest == operation.expected_digest {
+                    if target_digest.is_some() {
+                        remove_regular(&target, &operation.path)?;
+                    }
                 } else if target_digest.is_some() {
                     return Err(CodegenError::Conflict(operation.path.clone()));
                 }
@@ -474,13 +569,17 @@ fn rollback_operations(root: &Path, journal: &Journal) -> Result<(), CodegenErro
             } else if target_digest != operation.pre_digest {
                 return Err(CodegenError::Conflict(operation.path.clone()));
             }
-        } else if target_digest.as_deref() == Some(&operation.expected_digest) {
-            remove_regular(&target, &operation.path)?;
-        } else if target_digest.is_some() {
+        } else if target_digest == operation.expected_digest {
+            if target_digest.is_some() {
+                remove_regular(&target, &operation.path)?;
+            }
+        } else if target_digest != operation.pre_digest {
             return Err(CodegenError::Conflict(operation.path.clone()));
         }
-        if stage.exists() {
-            remove_regular(&stage, &operation.stage_path)?;
+        if let (Some(stage), Some(relative)) = (&stage, &operation.stage_path)
+            && stage.exists()
+        {
+            remove_regular(stage, relative)?;
         }
     }
     Ok(())
@@ -489,8 +588,12 @@ fn rollback_operations(root: &Path, journal: &Journal) -> Result<(), CodegenErro
 fn verify_final_tree(root: &Path, journal: &Journal) -> Result<(), CodegenError> {
     for operation in &journal.operations {
         let target = project_path(root, &operation.path)?;
-        verify_digest(&target, &operation.expected_digest, &operation.path)?;
-        verify_file_mode(&target, operation.target_mode, &operation.path)?;
+        if let Some(expected) = &operation.expected_digest {
+            verify_digest(&target, expected, &operation.path)?;
+            verify_file_mode(&target, operation.target_mode, &operation.path)?;
+        } else {
+            verify_pre_state(&target, None, &operation.path)?;
+        }
     }
     Ok(())
 }
@@ -629,9 +732,11 @@ fn finish_cleanup(
                 remove_regular(&physical, path)?;
             }
         }
-        let stage = project_path(root, &operation.stage_path)?;
-        if stage.exists() {
-            return Err(CodegenError::Conflict(operation.stage_path.clone()));
+        if let Some(stage_path) = &operation.stage_path {
+            let stage = project_path(root, stage_path)?;
+            if stage.exists() {
+                return Err(CodegenError::Conflict(stage_path.clone()));
+            }
         }
     }
     for entry in std::fs::read_dir(&cleanup).map_err(|source| CodegenError::Io {
@@ -694,7 +799,132 @@ fn cleanup_bootstrap(transactions: &Path, entry: &LifecycleEntry) -> Result<(), 
 
 fn read_journal(directory: &Path) -> Result<Journal, CodegenError> {
     let bytes = read_regular(&directory.join("journal.json"), "transaction journal")?;
-    serde_json::from_slice(&bytes).map_err(CodegenError::Json)
+    let journal: Journal = serde_json::from_slice(&bytes)?;
+    validate_journal(&journal)?;
+    Ok(journal)
+}
+
+fn validate_journal(journal: &Journal) -> Result<(), CodegenError> {
+    if journal.schema_version != "1.0.0"
+        || !valid_transaction_id(&journal.transaction_id)
+        || !valid_wire_digest(&journal.plan_digest)
+        || journal.operations.is_empty()
+        || (matches!(journal.command, ApplyCommand::Init | ApplyCommand::Build)
+            != (journal.commit_kind == CommitKind::Lock))
+    {
+        return Err(CodegenError::Conflict(
+            "transaction journal identity is invalid".into(),
+        ));
+    }
+    let mut paths = std::collections::BTreeSet::new();
+    for (ordinal, operation) in journal.operations.iter().enumerate() {
+        LogicalPath::new(operation.path.clone()).map_err(CodegenError::Core)?;
+        if operation.ordinal != ordinal
+            || !paths.insert(operation.path.as_str())
+            || operation
+                .pre_digest
+                .as_deref()
+                .is_some_and(|digest| !valid_wire_digest(digest))
+            || operation
+                .expected_digest
+                .as_deref()
+                .is_some_and(|digest| !valid_wire_digest(digest))
+        {
+            return Err(CodegenError::Conflict(
+                "transaction journal operation is invalid".into(),
+            ));
+        }
+        let expected_stage = (operation.operation != ChangeOperation::Remove)
+            .then(|| {
+                sibling_relative(
+                    &operation.path,
+                    &format!(
+                        ".leptos-ui-theme-{}-{ordinal:06}.stage",
+                        journal.transaction_id
+                    ),
+                )
+            })
+            .transpose()?;
+        let expected_backup = operation
+            .pre_digest
+            .as_ref()
+            .map(|_| {
+                sibling_relative(
+                    &operation.path,
+                    &format!(
+                        ".leptos-ui-theme-{}-{ordinal:06}.backup",
+                        journal.transaction_id
+                    ),
+                )
+            })
+            .transpose()?;
+        let shape_valid = match operation.operation {
+            ChangeOperation::Create => {
+                operation.pre_digest.is_none()
+                    && operation.expected_digest.is_some()
+                    && operation.target_mode.is_some() == cfg!(unix)
+            }
+            ChangeOperation::Replace => {
+                operation.pre_digest.is_some() && operation.expected_digest.is_some()
+            }
+            ChangeOperation::Remove => {
+                operation.pre_digest.is_some()
+                    && operation.expected_digest.is_none()
+                    && operation.target_mode.is_none()
+            }
+        };
+        let ownership_valid = match operation.ownership {
+            Ownership::GeneratedLockOwned => operation.scope != ChangeScope::Directory,
+            Ownership::SeededAppOwned => {
+                operation.scope == ChangeScope::WholeFile
+                    && operation.operation == ChangeOperation::Create
+            }
+            Ownership::UserAuthored => {
+                operation.scope == ChangeScope::WholeFile
+                    && operation.operation == ChangeOperation::Create
+            }
+            Ownership::ExternalKitOwned => false,
+        };
+        if !shape_valid
+            || !ownership_valid
+            || operation.stage_path != expected_stage
+            || operation.backup_path != expected_backup
+            || (operation.commit_role == CommitRole::ThemeLock
+                && operation.expected_digest.is_none())
+        {
+            return Err(CodegenError::Conflict(format!(
+                "transaction journal operation {} has an invalid shape",
+                operation.ordinal
+            )));
+        }
+    }
+    let theme_locks = journal
+        .operations
+        .iter()
+        .filter(|operation| operation.commit_role == CommitRole::ThemeLock)
+        .count();
+    if theme_locks > 1
+        || (theme_locks == 1
+            && journal
+                .operations
+                .last()
+                .is_none_or(|operation| operation.commit_role != CommitRole::ThemeLock))
+        || (journal.commit_kind == CommitKind::Journal && theme_locks != 0)
+    {
+        return Err(CodegenError::Conflict(
+            "transaction commit boundary is invalid".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn valid_wire_digest(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|value| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
 }
 
 fn read_states(directory: &Path, journal: &Journal) -> Result<Vec<StateRecord>, CodegenError> {
@@ -894,6 +1124,21 @@ fn validate_directory(path: &Path) -> Result<(), CodegenError> {
 }
 
 fn open_lock(path: &Path) -> Result<File, CodegenError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(CodegenError::Core(ThemeError::Security(
+                "apply lock path is unsafe".into(),
+            )));
+        }
+        Ok(_) => {}
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(CodegenError::Io {
+                path: PathBuf::from(format!("{STATE_DIRECTORY}/{APPLY_LOCK}")),
+                source,
+            });
+        }
+    }
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true);
     #[cfg(unix)]
@@ -905,13 +1150,7 @@ fn open_lock(path: &Path) -> Result<File, CodegenError> {
         path: PathBuf::from(format!("{STATE_DIRECTORY}/{APPLY_LOCK}")),
         source,
     })?;
-    validate_regular_metadata(
-        &file.metadata().map_err(|source| CodegenError::Io {
-            path: PathBuf::from(format!("{STATE_DIRECTORY}/{APPLY_LOCK}")),
-            source,
-        })?,
-        APPLY_LOCK,
-    )?;
+    validate_open_lock_identity(path, &file)?;
     Ok(file)
 }
 
@@ -933,14 +1172,48 @@ fn open_existing_lock(path: &Path) -> Result<File, CodegenError> {
             path: PathBuf::from(format!("{STATE_DIRECTORY}/{APPLY_LOCK}")),
             source,
         })?;
-    validate_regular_metadata(
-        &file.metadata().map_err(|source| CodegenError::Io {
-            path: PathBuf::from(format!("{STATE_DIRECTORY}/{APPLY_LOCK}")),
-            source,
-        })?,
-        APPLY_LOCK,
-    )?;
+    validate_open_lock_identity(path, &file)?;
     Ok(file)
+}
+
+fn validate_open_lock_identity(path: &Path, file: &File) -> Result<(), CodegenError> {
+    let opened = file.metadata().map_err(|source| CodegenError::Io {
+        path: PathBuf::from(format!("{STATE_DIRECTORY}/{APPLY_LOCK}")),
+        source,
+    })?;
+    validate_regular_metadata(&opened, APPLY_LOCK)?;
+    let linked = std::fs::symlink_metadata(path).map_err(|source| CodegenError::Io {
+        path: PathBuf::from(format!("{STATE_DIRECTORY}/{APPLY_LOCK}")),
+        source,
+    })?;
+    if linked.file_type().is_symlink() || !linked.is_file() || !same_file_identity(&opened, &linked)
+    {
+        return Err(CodegenError::Core(ThemeError::Security(
+            "apply lock changed while opening".into(),
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if linked.permissions().mode() & 0o077 != 0 {
+            return Err(CodegenError::Core(ThemeError::Security(
+                "apply lock permissions are too broad".into(),
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn same_file_identity(first: &std::fs::Metadata, second: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        first.dev() == second.dev() && first.ino() == second.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        first.is_file() && second.is_file() && first.len() == second.len()
+    }
 }
 
 fn create_private_file(path: &Path) -> Result<File, CodegenError> {
@@ -1153,7 +1426,10 @@ mod tests {
         ensure_private_directory, ensure_state_directory, install_operation, open_lock,
         publish_journal, recover,
     };
-    use crate::{GeneratedArtifact, plan_artifacts};
+    use crate::{
+        ArtifactManifest, ArtifactManifestEntry, ChangeScope, DesiredArtifactState,
+        GeneratedArtifact, Ownership, plan_artifacts, plan_manifest,
+    };
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1207,7 +1483,7 @@ mod tests {
             &active,
             &journal,
             first,
-            &artifact_map[first.path.as_str()].bytes,
+            Some(&artifact_map[first.path.as_str()].bytes),
             &mut sequence,
         )
         .unwrap();
@@ -1235,6 +1511,116 @@ mod tests {
             );
         }
         assert_eq!(std::fs::read_dir(&transactions).unwrap().count(), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_restores_an_uncommitted_removal() {
+        let root = std::env::temp_dir().join(format!(
+            "leptos-ui-theme-remove-recovery-{}-{}",
+            std::process::id(),
+            NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("stale.css"), b"owned\n").unwrap();
+        let manifest = ArtifactManifest::new(vec![ArtifactManifestEntry {
+            path: "stale.css".into(),
+            scope: ChangeScope::WholeFile,
+            ownership: Ownership::GeneratedLockOwned,
+            state: DesiredArtifactState::Absent,
+            digest: None,
+        }])
+        .unwrap();
+        let plan = plan_manifest(&root, &[], &manifest).unwrap();
+        let state = root.join(STATE_DIRECTORY);
+        ensure_state_directory(&state).unwrap();
+        drop(open_lock(&state.join(APPLY_LOCK)).unwrap());
+        let transactions = state.join(TRANSACTIONS_DIRECTORY);
+        ensure_private_directory(&transactions).unwrap();
+        let journal = build_journal(
+            "00000000000000000000000000000002",
+            &plan,
+            ApplyCommand::Add,
+            None,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let active = publish_journal(&transactions, &journal).unwrap();
+        let mut sequence = 0;
+        install_operation(
+            &root,
+            &active,
+            &journal,
+            &journal.operations[0],
+            None,
+            &mut sequence,
+        )
+        .unwrap();
+        assert!(!root.join("stale.css").exists());
+        assert!(recover(&root).unwrap());
+        assert_eq!(std::fs::read(root.join("stale.css")).unwrap(), b"owned\n");
+        assert_eq!(std::fs::read_dir(&transactions).unwrap().count(), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_rejects_a_journal_path_outside_the_project() {
+        let root = std::env::temp_dir().join(format!(
+            "leptos-ui-theme-hostile-journal-{}-{}",
+            std::process::id(),
+            NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("owned.txt"), b"before\n").unwrap();
+        let artifacts = [GeneratedArtifact::generated(
+            "owned.txt",
+            b"after\n".to_vec(),
+        )];
+        let plan = plan_artifacts(&root, &artifacts).unwrap();
+        let state = root.join(STATE_DIRECTORY);
+        ensure_state_directory(&state).unwrap();
+        drop(open_lock(&state.join(APPLY_LOCK)).unwrap());
+        let transactions = state.join(TRANSACTIONS_DIRECTORY);
+        ensure_private_directory(&transactions).unwrap();
+        let map = artifacts
+            .iter()
+            .map(|artifact| (artifact.path.as_str(), artifact))
+            .collect();
+        let journal = build_journal(
+            "00000000000000000000000000000003",
+            &plan,
+            ApplyCommand::Add,
+            None,
+            &map,
+        )
+        .unwrap();
+        let active = publish_journal(&transactions, &journal).unwrap();
+        let journal_path = active.join("journal.json");
+        let mut hostile: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&journal_path).unwrap()).unwrap();
+        hostile["operations"][0]["path"] = "../outside.txt".into();
+        std::fs::write(&journal_path, serde_json::to_vec(&hostile).unwrap()).unwrap();
+        assert!(recover(&root).is_err());
+        assert_eq!(std::fs::read(root.join("owned.txt")).unwrap(), b"before\n");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_lock_never_follows_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "leptos-ui-theme-lock-link-{}-{}",
+            std::process::id(),
+            NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let state = root.join(STATE_DIRECTORY);
+        ensure_state_directory(&state).unwrap();
+        std::fs::write(root.join("outside.lock"), b"do not lock").unwrap();
+        symlink(root.join("outside.lock"), state.join(APPLY_LOCK)).unwrap();
+        assert!(open_lock(&state.join(APPLY_LOCK)).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 }

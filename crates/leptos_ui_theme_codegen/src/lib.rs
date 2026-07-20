@@ -16,9 +16,10 @@ pub use transaction::{
 };
 
 use leptos_ui_theme_core::{
-    BootstrapMode, CONFIG_FILE, ColorScheme, LogicalPath, OpenedSource, ProjectConfig,
-    ResolvedProfile, ResolvedToken, SourceRole, ThemeCompiler, ThemeError, TokenDomain,
-    format_css_number, serialize_color_fallback, serialize_color_modern, sha256,
+    BootstrapMode, COMPILED_LIMITS, CONFIG_FILE, ColorScheme, LogicalPath, OpenedSource,
+    ProjectConfig, ResolvedProfile, ResolvedToken, SourceLoader, SourceRole, ThemeCompiler,
+    ThemeError, TokenDomain, format_css_number, serialize_color_fallback, serialize_color_modern,
+    sha256,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -61,11 +62,28 @@ pub struct GeneratedArtifact {
 pub struct BuildResult {
     pub artifacts: Vec<GeneratedArtifact>,
     pub manifest: ArtifactManifest,
+    pub consumed_inputs: Vec<ConsumedInput>,
+    pub workspace_root: PathBuf,
     pub profiles: Vec<ResolvedProfile>,
     pub plan: PlanV1,
     pub bootstrap: BootstrapMetadata,
     pub accepted_generated: BTreeMap<String, String>,
     pub manual_html_stale: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConsumedInputRoot {
+    AppConfig,
+    Workspace,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ConsumedInput {
+    pub root: ConsumedInputRoot,
+    pub path: String,
+    pub digest: String,
 }
 
 #[derive(Clone, Debug)]
@@ -249,6 +267,7 @@ struct KitProvenanceLock {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PreviousThemeLock {
+    schema_version: String,
     outputs: BTreeMap<String, PreviousOutputLock>,
     html_integration: Option<PreviousHtmlIntegration>,
 }
@@ -302,7 +321,7 @@ struct ContractLock {
     installed_bytes_digest: String,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct InputLock {
     root: InputRoot,
@@ -498,6 +517,36 @@ pub fn build_with_workspace(
             semantic_digest: profile.semantic_digest.clone(),
         })
         .collect();
+    let mut consumed_inputs = input_digests
+        .iter()
+        .map(|input| ConsumedInput {
+            root: ConsumedInputRoot::AppConfig,
+            path: input.path.clone(),
+            digest: input.bytes_digest.clone(),
+        })
+        .collect::<Vec<_>>();
+    consumed_inputs.push(ConsumedInput {
+        root: ConsumedInputRoot::AppConfig,
+        path: CONFIG_FILE.into(),
+        digest: format!("sha256:{}", sha256(config_bytes)),
+    });
+    for input in [
+        &installation_input,
+        &capability_input,
+        &contract_input,
+        &stylesheet_input,
+    ] {
+        consumed_inputs.push(ConsumedInput {
+            root: ConsumedInputRoot::Workspace,
+            path: input.path.clone(),
+            digest: input.bytes_digest.clone(),
+        });
+    }
+    consumed_inputs.sort_by(|left, right| {
+        consumed_root_order(left.root)
+            .cmp(&consumed_root_order(right.root))
+            .then_with(|| left.path.as_bytes().cmp(right.path.as_bytes()))
+    });
     let lock = ThemeLock {
         schema_version: "1.0.0",
         tool: ToolLock {
@@ -525,7 +574,7 @@ pub fn build_with_workspace(
             path: CONFIG_FILE.into(),
             bytes_digest: format!("sha256:{}", sha256(config_bytes)),
         },
-        inputs: input_digests,
+        inputs: input_digests.clone(),
         profiles: profile_digests,
         dependency_state: options.dependency_state,
         dependencies: options.dependencies.clone(),
@@ -624,12 +673,19 @@ pub fn build_with_workspace(
         &root,
         &compiler.config.outputs.lock,
         compiler.config.limits.file_bytes,
+        &input_digests
+            .iter()
+            .map(|input| input.path.as_str())
+            .chain(std::iter::once(CONFIG_FILE))
+            .collect::<std::collections::BTreeSet<_>>(),
         &artifacts,
     )?;
     let plan = plan_manifest(&root, &artifacts, &manifest)?;
     Ok(BuildResult {
         artifacts,
         manifest,
+        consumed_inputs,
+        workspace_root: compiler.workspace_root,
         profiles,
         plan,
         bootstrap,
@@ -638,10 +694,18 @@ pub fn build_with_workspace(
     })
 }
 
+fn consumed_root_order(root: ConsumedInputRoot) -> u8 {
+    match root {
+        ConsumedInputRoot::AppConfig => 0,
+        ConsumedInputRoot::Workspace => 1,
+    }
+}
+
 fn desired_manifest(
     root: &Path,
     lock_relative: &str,
     file_limit: u64,
+    protected_inputs: &std::collections::BTreeSet<&str>,
     artifacts: &[GeneratedArtifact],
 ) -> Result<ArtifactManifest, CodegenError> {
     let mut entries = artifacts
@@ -666,14 +730,19 @@ fn desired_manifest(
                     "existing theme lock exceeds the configured file limit".into(),
                 )));
             }
-            Some(
+            let previous =
                 serde_json::from_slice::<PreviousThemeLock>(&bytes).map_err(|source| {
                     CodegenError::Core(ThemeError::Json {
                         path: PathBuf::from(lock_relative),
                         source,
                     })
-                })?,
-            )
+                })?;
+            if previous.schema_version != "1.0.0" {
+                return Err(CodegenError::Core(ThemeError::Config(
+                    "existing theme lock has an unsupported schema".into(),
+                )));
+            }
+            Some(previous)
         }
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => None,
         Err(source) => {
@@ -688,11 +757,20 @@ fn desired_manifest(
             if present.contains(path.as_str()) {
                 continue;
             }
+            if output.scope() == ChangeScope::HtmlOwnedRegion {
+                continue;
+            }
+            if protected_inputs.contains(path.as_str()) {
+                return Err(CodegenError::Core(ThemeError::Security(format!(
+                    "stale generated output `{path}` is now a consumed input"
+                ))));
+            }
             if output.ownership() != Ownership::GeneratedLockOwned {
                 return Err(CodegenError::Core(ThemeError::Config(format!(
                     "previous output `{path}` has invalid ownership"
                 ))));
             }
+            verify_stale_output(root, &path, output.digest(), file_limit)?;
             entries.push(ArtifactManifestEntry {
                 path,
                 scope: output.scope(),
@@ -703,6 +781,52 @@ fn desired_manifest(
         }
     }
     ArtifactManifest::new(entries)
+}
+
+fn verify_stale_output(
+    root: &Path,
+    relative: &str,
+    expected_digest: &str,
+    file_limit: u64,
+) -> Result<(), CodegenError> {
+    let logical = LogicalPath::new(relative.to_owned())?;
+    let path = root.join(logical.to_path_buf());
+    let metadata = std::fs::symlink_metadata(&path).map_err(|source| CodegenError::Io {
+        path: PathBuf::from(relative),
+        source,
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(CodegenError::Core(ThemeError::Security(format!(
+            "stale generated output `{relative}` is not a regular file"
+        ))));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err(CodegenError::Core(ThemeError::Security(format!(
+                "stale generated output `{relative}` has multiple hard links"
+            ))));
+        }
+    }
+    if metadata.len() > file_limit {
+        return Err(CodegenError::Core(ThemeError::Limit {
+            resource: "fileBytes",
+            limit: file_limit,
+            observed: metadata.len(),
+        }));
+    }
+    let bytes = std::fs::read(&path).map_err(|source| CodegenError::Io {
+        path: PathBuf::from(relative),
+        source,
+    })?;
+    let digest = format!("sha256:{}", sha256(&bytes));
+    if digest != expected_digest {
+        return Err(CodegenError::Conflict(format!(
+            "stale generated output `{relative}` differs from its lock record"
+        )));
+    }
+    Ok(())
 }
 
 fn protect_workspace_inputs(
@@ -762,14 +886,19 @@ fn protect_generated_ownership(
                     "existing theme lock exceeds the configured file limit".into(),
                 )));
             }
-            Some(
+            let previous =
                 serde_json::from_slice::<PreviousThemeLock>(&bytes).map_err(|source| {
                     CodegenError::Core(ThemeError::Json {
                         path: PathBuf::from(lock_relative),
                         source,
                     })
-                })?,
-            )
+                })?;
+            if previous.schema_version != "1.0.0" {
+                return Err(CodegenError::Core(ThemeError::Config(
+                    "existing theme lock has an unsupported schema".into(),
+                )));
+            }
+            Some(previous)
         }
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => None,
         Err(source) => {
@@ -955,14 +1084,42 @@ pub fn apply_with_wait(
         .artifacts
         .last()
         .map(|artifact| artifact.path.as_str());
-    apply_transaction_with_wait(
+    transaction::apply_transaction_with_wait_checked(
         root,
         &result.artifacts,
         &result.plan,
         ApplyCommand::Build,
         lock_path,
         lock_wait,
+        || verify_consumed_inputs(root, &result.workspace_root, &result.consumed_inputs),
     )
+}
+
+fn verify_consumed_inputs(
+    config_root: &Path,
+    workspace_root: &Path,
+    inputs: &[ConsumedInput],
+) -> Result<(), CodegenError> {
+    let app_loader = SourceLoader::new(config_root, COMPILED_LIMITS)?;
+    let workspace_loader = SourceLoader::new(workspace_root, COMPILED_LIMITS)?;
+    for input in inputs {
+        let logical = LogicalPath::new(input.path.clone())?;
+        let source = match input.root {
+            ConsumedInputRoot::AppConfig => {
+                app_loader.read_source(&logical, SourceRole::General)?
+            }
+            ConsumedInputRoot::Workspace => {
+                workspace_loader.read_source(&logical, SourceRole::General)?
+            }
+        };
+        if source.bytes_digest != input.digest {
+            return Err(CodegenError::Conflict(format!(
+                "consumed input `{}` changed after planning",
+                input.path
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub fn apply_artifacts(
@@ -1791,10 +1948,12 @@ fn profile<'a>(
 #[cfg(test)]
 mod tests {
     use super::{
-        ArtifactManifest, ArtifactManifestEntry, ChangeOperation, ChangeScope, CssMode,
-        DesiredArtifactState, GeneratedArtifact, Ownership, ResolvedAxis, apply_artifacts,
-        bootstrap_script, csp_source, generate_css, plan_manifest, serialize_css,
+        ArtifactManifest, ArtifactManifestEntry, ChangeOperation, ChangeScope, ConsumedInput,
+        ConsumedInputRoot, CssMode, DesiredArtifactState, GeneratedArtifact, Ownership,
+        ResolvedAxis, apply_artifacts, apply_transaction, bootstrap_script, csp_source,
+        generate_css, plan_manifest, serialize_css, verify_consumed_inputs,
     };
+    use crate::ApplyCommand;
     use leptos_ui_theme_core::{
         ColorScheme, ProjectConfig, ResolvedProfile, ResolvedToken, TokenDomain, format_css_number,
     };
@@ -1946,6 +2105,26 @@ mod tests {
         assert_eq!(plan.changes.len(), 1);
         assert_eq!(plan.changes[0].operation, ChangeOperation::Remove);
         assert!(plan.changes[0].after_digest.is_none());
+        assert_eq!(
+            apply_transaction(&root, &[], &plan, ApplyCommand::Add, None).unwrap(),
+            ["stale.css"]
+        );
+        assert!(!root.join("stale.css").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn consumed_inputs_are_revalidated_from_secure_handles() {
+        let root = temporary_directory();
+        std::fs::write(root.join("input.json"), b"{}\n").unwrap();
+        let input = ConsumedInput {
+            root: ConsumedInputRoot::AppConfig,
+            path: "input.json".into(),
+            digest: format!("sha256:{}", leptos_ui_theme_core::sha256(b"{}\n")),
+        };
+        verify_consumed_inputs(&root, &root, std::slice::from_ref(&input)).unwrap();
+        std::fs::write(root.join("input.json"), b"{\"changed\":true}\n").unwrap();
+        assert!(verify_consumed_inputs(&root, &root, &[input]).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1984,7 +2163,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn generated_modes_converge_and_seeded_modes_are_preserved() {
+    fn generated_modes_converge_and_seeded_replacements_are_rejected() {
         use std::os::unix::fs::PermissionsExt;
 
         let root = temporary_directory();
@@ -2000,13 +2179,13 @@ mod tests {
             std::fs::Permissions::from_mode(0o600),
         )
         .unwrap();
-        let artifacts = vec![
-            GeneratedArtifact::generated("generated.txt", b"same".to_vec()),
-            GeneratedArtifact::seeded("seeded.txt", b"after".to_vec()),
-        ];
+        let artifacts = vec![GeneratedArtifact::generated(
+            "generated.txt",
+            b"same".to_vec(),
+        )];
         assert_eq!(
             apply_artifacts(&root, &artifacts).unwrap(),
-            ["generated.txt", "seeded.txt"]
+            ["generated.txt"]
         );
         assert_eq!(
             std::fs::metadata(root.join("generated.txt"))
@@ -2016,6 +2195,9 @@ mod tests {
                 & 0o777,
             0o644
         );
+        let seeded = [GeneratedArtifact::seeded("seeded.txt", b"after".to_vec())];
+        assert!(apply_artifacts(&root, &seeded).is_err());
+        assert_eq!(std::fs::read(root.join("seeded.txt")).unwrap(), b"before");
         assert_eq!(
             std::fs::metadata(root.join("seeded.txt"))
                 .unwrap()

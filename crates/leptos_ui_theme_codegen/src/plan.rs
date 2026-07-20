@@ -200,12 +200,14 @@ pub fn plan_manifest(
                 }
                 let expected_mode = publication_mode(artifact, &snapshot);
                 if snapshot.digest.as_deref() != Some(&expected) || snapshot.mode != expected_mode {
+                    let operation = if snapshot.exists {
+                        ChangeOperation::Replace
+                    } else {
+                        ChangeOperation::Create
+                    };
+                    validate_action(artifact.ownership, artifact.scope, operation)?;
                     changes.push(Change {
-                        operation: if snapshot.exists {
-                            ChangeOperation::Replace
-                        } else {
-                            ChangeOperation::Create
-                        },
+                        operation,
                         scope: artifact.scope,
                         path: artifact.path.clone(),
                         ownership: artifact.ownership,
@@ -218,6 +220,7 @@ pub fn plan_manifest(
             }
             DesiredArtifactState::Absent => {
                 if snapshot.exists {
+                    validate_action(entry.ownership, entry.scope, ChangeOperation::Remove)?;
                     changes.push(Change {
                         operation: ChangeOperation::Remove,
                         scope: entry.scope,
@@ -260,6 +263,29 @@ pub fn plan_manifest(
     let bytes = serde_json_canonicalizer::to_vec(&semantic)?;
     plan.digest = format!("sha256:{}", sha256(&bytes));
     Ok(plan)
+}
+
+fn validate_action(
+    ownership: Ownership,
+    scope: ChangeScope,
+    operation: ChangeOperation,
+) -> Result<(), CodegenError> {
+    let allowed = match ownership {
+        Ownership::GeneratedLockOwned => scope != ChangeScope::Directory,
+        Ownership::SeededAppOwned => {
+            scope == ChangeScope::WholeFile && operation == ChangeOperation::Create
+        }
+        Ownership::UserAuthored => {
+            scope == ChangeScope::WholeFile && operation == ChangeOperation::Create
+        }
+        Ownership::ExternalKitOwned => false,
+    };
+    if !allowed {
+        return Err(CodegenError::Conflict(format!(
+            "{ownership:?} does not permit {operation:?} for {scope:?}"
+        )));
+    }
+    Ok(())
 }
 
 fn scope_order(scope: ChangeScope) -> u8 {
