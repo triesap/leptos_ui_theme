@@ -28,8 +28,9 @@ pub use diagnostic::{
     SourceLocation,
 };
 pub use dtcg::{
-    DtcgType, alias_target as dtcg_alias_target, expand_group_extends, validate_extensions,
-    validate_reserved_members, validate_token_value,
+    DtcgDeprecation, DtcgDocument, DtcgGroup, DtcgNode, DtcgToken, DtcgType,
+    alias_target as dtcg_alias_target, apply_shallow_reference_overrides, expand_group_extends,
+    parse_json_strict, validate_extensions, validate_reserved_members, validate_token_value,
 };
 pub use identity::{
     AbiVersion, ContractId, ContractRevision, FileIdentity, IdentityPlatform, Sha256Digest,

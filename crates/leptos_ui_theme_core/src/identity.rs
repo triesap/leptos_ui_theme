@@ -78,6 +78,12 @@ impl TokenPath {
     }
 }
 
+impl fmt::Display for TokenPath {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
 impl<'de> Deserialize<'de> for TokenPath {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
