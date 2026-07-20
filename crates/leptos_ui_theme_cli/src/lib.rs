@@ -1131,12 +1131,12 @@ fn dependency_plan(
         .into());
     };
     let leptos_declared =
-        validate_dependency_declaration(&manifest, "leptos", "=0.9.0-alpha", "csr")?;
+        validate_dependency_declaration(&manifest, "leptos", "=0.9.0-alpha", &["csr"])?;
     let primitives_declared = validate_dependency_declaration(
         &manifest,
         "web_ui_primitives",
         ">=0.2.0,<0.3.0",
-        "leptos",
+        &["core", "leptos"],
     )?;
     if !leptos_declared || !primitives_declared {
         if allow_pending {
@@ -1208,7 +1208,7 @@ fn validate_dependency_declaration(
     manifest: &toml::Value,
     package: &str,
     requirement: &str,
-    feature: &str,
+    expected_features: &[&str],
 ) -> Result<bool, CliError> {
     let Some(entry) = manifest
         .get("dependencies")
@@ -1233,7 +1233,17 @@ fn validate_dependency_declaration(
         || table
             .get("features")
             .and_then(toml::Value::as_array)
-            .is_none_or(|features| features.len() != 1 || features[0].as_str() != Some(feature))
+            .is_none_or(|features| {
+                let actual = features
+                    .iter()
+                    .filter_map(toml::Value::as_str)
+                    .collect::<std::collections::BTreeSet<_>>();
+                let expected = expected_features
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::BTreeSet<_>>();
+                features.len() != expected_features.len() || actual != expected
+            })
     {
         return Err(ThemeError::Config(format!(
             "dependency `{package}` differs from the generated runtime requirement"
@@ -1392,7 +1402,9 @@ fn starter_resolver() -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_command, check_command, init, starter_resolver};
+    use super::{
+        build_command, check_command, explain_command, init, list_command, starter_resolver,
+    };
     use std::path::PathBuf;
 
     #[test]
@@ -1416,7 +1428,7 @@ edition = "2024"
 
 [dependencies]
 leptos = { version = "=0.9.0-alpha", default-features = false, features = ["csr"] }
-web_ui_primitives = { version = ">=0.2.0,<0.3.0", default-features = false, features = ["leptos"] }
+web_ui_primitives = { version = ">=0.2.0,<0.3.0", default-features = false, features = ["core", "leptos"] }
 "#,
         )
         .unwrap();
@@ -1524,9 +1536,29 @@ checksum = "sha256:test"
         .unwrap();
         let outcome = init(&root, false, false, 0).unwrap();
         assert!(outcome.changes.len() >= 10);
+        let listed = list_command(&root).unwrap();
+        assert_eq!(listed.data["contract"]["id"], "leptos-ui-kit");
+        assert_eq!(listed.data["profiles"][0]["isDefault"], true);
+        let explained = explain_command(&root, "color.surface", "light").unwrap();
+        assert_eq!(explained.data["requestedTokenPath"], "color.surface");
+        assert_eq!(explained.data["terminalTokenPath"], "color.surface");
+        assert_eq!(explained.data["status"], "resolved");
         let css = std::fs::read_to_string(root.join("styles/themes.css")).unwrap();
         assert!(css.contains("@layer leptos-ui-kit.themes"));
         assert!(css.contains("--kit-color-surface: #ffffff"));
+        let lock: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("src/theme/theme.lock.json")).unwrap())
+                .unwrap();
+        assert_eq!(lock["toolVersion"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(lock["dtcgVersion"], "2025.10");
+        assert_eq!(lock["contract"]["contractId"], "leptos-ui-kit");
+        assert!(
+            lock["inputs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|input| input["path"] == "tokens/theme.resolver.json")
+        );
         let index = std::fs::read_to_string(root.join("index.html")).unwrap();
         assert!(index.contains("<!-- leptos-ui-theme:start -->"));
         let build = build_command(&root, false, false, 0, &[]).unwrap();

@@ -120,7 +120,7 @@ pub fn default_dependency_records() -> Vec<DependencyRecord> {
         DependencyRecord {
             package: "web_ui_primitives".into(),
             requirement: ">=0.2.0,<0.3.0".into(),
-            features: vec!["leptos".into()],
+            features: vec!["core".into(), "leptos".into()],
             default_features: false,
             resolved_version: None,
             checksum: None,
@@ -139,7 +139,7 @@ fn validate_dependency_records(
         || dependencies[0].default_features
         || dependencies[1].package != "web_ui_primitives"
         || dependencies[1].requirement != ">=0.2.0,<0.3.0"
-        || dependencies[1].features != ["leptos"]
+        || dependencies[1].features != ["core", "leptos"]
         || dependencies[1].default_features
     {
         return Err(CodegenError::Core(ThemeError::Config(
@@ -304,7 +304,11 @@ pub fn build(root: &Path) -> Result<BuildResult, CodegenError> {
 
 pub fn build_with_options(root: &Path, options: BuildOptions) -> Result<BuildResult, CodegenError> {
     validate_dependency_records(options.dependency_state, &options.dependencies)?;
-    let compiler = ThemeCompiler::load(root)?;
+    let root = std::fs::canonicalize(root).map_err(|source| CodegenError::Io {
+        path: root.to_path_buf(),
+        source,
+    })?;
+    let compiler = ThemeCompiler::load(&root)?;
     let profiles = compiler.resolve()?;
     let mut axes = Vec::new();
     if let Some(configured) = &compiler.config.axes {
@@ -345,9 +349,9 @@ pub fn build_with_options(root: &Path, options: BuildOptions) -> Result<BuildRes
         GeneratedArtifact::generated(compiler.config.outputs.css.clone(), css.into_bytes()),
         GeneratedArtifact::generated(compiler.config.outputs.rust.clone(), rust.into_bytes()),
     ];
-    let selected_index = select_index(root, &compiler.config)?;
+    let selected_index = select_index(&root, &compiler.config)?;
     let index_relative = selected_index
-        .strip_prefix(root)
+        .strip_prefix(&root)
         .map_err(|_| {
             CodegenError::Core(ThemeError::Security(selected_index.display().to_string()))
         })?
@@ -355,7 +359,7 @@ pub fn build_with_options(root: &Path, options: BuildOptions) -> Result<BuildRes
         .into_owned();
     let kit_stylesheet_relative = compiler
         .kit_stylesheet_path
-        .strip_prefix(root)
+        .strip_prefix(&root)
         .map_err(|_| {
             CodegenError::Core(ThemeError::Security(
                 compiler.kit_stylesheet_path.display().to_string(),
@@ -440,7 +444,7 @@ pub fn build_with_options(root: &Path, options: BuildOptions) -> Result<BuildRes
             )
         })
         .collect();
-    let input_digests = collect_input_digests(root, &compiler.config)?;
+    let input_digests = collect_input_digests(&root, &compiler.config)?;
     let profile_digests = profiles
         .iter()
         .map(|profile| {
@@ -482,7 +486,7 @@ pub fn build_with_options(root: &Path, options: BuildOptions) -> Result<BuildRes
                 "manual"
             },
             selected_index_path: selected_index
-                .strip_prefix(root)
+                .strip_prefix(&root)
                 .map_err(|_| {
                     CodegenError::Core(ThemeError::Security(selected_index.display().to_string()))
                 })?
@@ -505,7 +509,7 @@ pub fn build_with_options(root: &Path, options: BuildOptions) -> Result<BuildRes
     let mut lock_bytes = serde_json::to_vec_pretty(&lock)?;
     lock_bytes.push(b'\n');
     let (backup_artifacts, accepted_generated) = protect_generated_ownership(
-        root,
+        &root,
         &artifacts,
         &compiler.config.outputs.lock,
         compiler.config.limits.file_bytes,
@@ -549,7 +553,7 @@ pub fn build_with_options(root: &Path, options: BuildOptions) -> Result<BuildRes
     }
     ordered_artifacts.push(lock_artifact);
     artifacts = ordered_artifacts;
-    let plan = plan_artifacts(root, &artifacts)?;
+    let plan = plan_artifacts(&root, &artifacts)?;
     Ok(BuildResult {
         artifacts,
         profiles,
@@ -712,6 +716,11 @@ fn collect_input_digests(
     root: &Path,
     config: &ProjectConfig,
 ) -> Result<Vec<InputLock>, CodegenError> {
+    let root = std::fs::canonicalize(root).map_err(|source| CodegenError::Io {
+        path: root.to_path_buf(),
+        source,
+    })?;
+
     fn visit(
         root: &Path,
         directory: &Path,
@@ -783,7 +792,7 @@ fn collect_input_digests(
 
     let mut inputs = BTreeMap::new();
     let token_root = root.join(&config.token_root);
-    visit(root, &token_root, config, &mut inputs)?;
+    visit(&root, &token_root, config, &mut inputs)?;
     if !inputs.contains_key(&config.resolver) {
         let resolver = root.join(&config.resolver);
         let bytes = std::fs::read(&resolver).map_err(|source| CodegenError::Io {
