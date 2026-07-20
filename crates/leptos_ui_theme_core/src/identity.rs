@@ -17,7 +17,7 @@ impl ThemeId {
                 .iter()
                 .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
             && !value.contains("--");
-        if valid {
+        if valid && value != "system" {
             Ok(Self(value))
         } else {
             Err(ThemeError::Config(format!("invalid theme ID `{value}`")))

@@ -1,6 +1,9 @@
 use crate::contract::{KitTokenContract, TokenDomain};
 use crate::model::{ColorScheme, Profile, ProjectConfig};
-use crate::{CONFIG_FILE, ThemeError, discover_kit, read_json, validate_contrast};
+use crate::{
+    CONFIG_FILE, DtcgType, LogicalPath, SourceLoader, ThemeError, discover_kit, dtcg_alias_target,
+    read_json, validate_contrast, validate_reserved_members, validate_token_value,
+};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -31,6 +34,7 @@ pub struct ThemeCompiler {
     pub config: ProjectConfig,
     pub contract_path: PathBuf,
     pub contract: KitTokenContract,
+    loader: SourceLoader,
 }
 
 #[derive(Debug, Deserialize)]
@@ -60,19 +64,22 @@ impl ThemeCompiler {
         let kit = discover_kit(&root, &config.kit)?;
         let contract_path = kit.contract_path;
         let contract = kit.contract;
+        let loader = SourceLoader::new(&root, config.limits.clone())?;
         Ok(Self {
             root,
             config_path,
             config,
             contract_path,
             contract,
+            loader,
         })
     }
 
     pub fn resolve(&self) -> Result<Vec<ResolvedProfile>, ThemeError> {
-        let resolver_path = self.root.join(&self.config.resolver);
-        let resolver: ResolverDocument = read_json(&resolver_path)?;
-        validate_resolver(&resolver)?;
+        let resolver_logical = LogicalPath::new(self.config.resolver.clone())?;
+        let resolver_path = self.loader.resolve_file(&resolver_logical)?;
+        let resolver: ResolverDocument = self.loader.read_json(&resolver_logical)?;
+        validate_resolver(&resolver, &self.config)?;
         self.config
             .profiles
             .named
@@ -93,9 +100,10 @@ impl ThemeCompiler {
         modifier: &str,
         contexts: &[String],
     ) -> Result<Vec<ResolvedProfile>, ThemeError> {
-        let resolver_path = self.root.join(&self.config.resolver);
-        let resolver: ResolverDocument = read_json(&resolver_path)?;
-        validate_resolver(&resolver)?;
+        let resolver_logical = LogicalPath::new(self.config.resolver.clone())?;
+        let resolver_path = self.loader.resolve_file(&resolver_logical)?;
+        let resolver: ResolverDocument = self.loader.read_json(&resolver_logical)?;
+        validate_resolver(&resolver, &self.config)?;
         let base = self.config.profile(&self.config.profiles.default)?;
         contexts
             .iter()
@@ -149,7 +157,7 @@ impl ThemeCompiler {
                 let set = resolver.sets.get(name).ok_or_else(|| {
                     ThemeError::Resolution(format!("unknown resolver set `{name}`"))
                 })?;
-                apply_sources(set.get("sources"), resolver_path, &mut raw)?;
+                apply_sources(set.get("sources"), resolver_path, &mut raw, &self.config)?;
             } else if let Some(modifier_name) = reference.strip_prefix("#/modifiers/") {
                 self.apply_modifier(profile, resolver, modifier_name, resolver_path, &mut raw)?;
             } else {
@@ -245,11 +253,14 @@ impl ThemeCompiler {
         let sources = modifier
             .get("contexts")
             .and_then(|value| value.get(context));
-        apply_sources(sources, resolver_path, raw)
+        apply_sources(sources, resolver_path, raw, &self.config)
     }
 }
 
-fn validate_resolver(resolver: &ResolverDocument) -> Result<(), ThemeError> {
+fn validate_resolver(
+    resolver: &ResolverDocument,
+    config: &ProjectConfig,
+) -> Result<(), ThemeError> {
     if resolver.version != "2025.10" {
         return Err(ThemeError::Resolution(format!(
             "unsupported resolver version `{}`",
@@ -261,6 +272,20 @@ fn validate_resolver(resolver: &ResolverDocument) -> Result<(), ThemeError> {
             "resolver resolutionOrder is empty".into(),
         ));
     }
+    let context_count = resolver
+        .modifiers
+        .values()
+        .filter_map(|modifier| modifier.get("contexts")?.as_object())
+        .map(serde_json::Map::len)
+        .sum::<usize>();
+    let nodes = resolver.sets.len() + resolver.modifiers.len() + context_count;
+    if nodes > config.limits.resolver_nodes as usize
+        || context_count > config.limits.resolver_contexts as usize
+    {
+        return Err(ThemeError::Resolution(
+            "resolver exceeds configured node or context limits".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -268,6 +293,7 @@ fn apply_sources(
     sources: Option<&serde_json::Value>,
     resolver_path: &Path,
     raw: &mut BTreeMap<String, RawToken>,
+    config: &ProjectConfig,
 ) -> Result<(), ThemeError> {
     let Some(sources) = sources.and_then(serde_json::Value::as_array) else {
         return Err(ThemeError::Resolution(
@@ -319,6 +345,13 @@ fn apply_sources(
         };
         let mut flattened = BTreeMap::new();
         flatten_tokens(value, None, "", &path, &mut flattened)?;
+        if flattened.len() > config.limits.tokens as usize
+            || raw.len().saturating_add(flattened.len()) > config.limits.tokens as usize
+        {
+            return Err(ThemeError::Resolution(
+                "token inventory exceeds limits.tokens".into(),
+            ));
+        }
         raw.extend(flattened);
     }
     Ok(())
@@ -337,6 +370,7 @@ fn flatten_tokens(
             path.display()
         ))
     })?;
+    validate_reserved_members(object, object.contains_key("$value"))?;
     let declared_type = object
         .get("$type")
         .and_then(serde_json::Value::as_str)
@@ -358,10 +392,12 @@ fn flatten_tokens(
             .and_then(serde_json::Value::as_str)
             .or(declared_type)
             .ok_or_else(|| ThemeError::Resolution(format!("token `{prefix}` has no type")))?;
+        let token_type = DtcgType::parse(token_type)?;
+        validate_token_value(token_type, token_value)?;
         output.insert(
             prefix.into(),
             RawToken {
-                token_type: token_type.into(),
+                token_type: token_type.as_str().into(),
                 value: token_value.clone(),
                 provenance: path.display().to_string(),
             },
@@ -380,6 +416,7 @@ fn flatten_tokens(
             ThemeError::Resolution(format!("token `{token_path}` must be an object"))
         })?;
         if let Some(token_value) = child_object.get("$value") {
+            validate_reserved_members(child_object, true)?;
             let token_type = child_object
                 .get("$type")
                 .and_then(serde_json::Value::as_str)
@@ -387,10 +424,12 @@ fn flatten_tokens(
                 .ok_or_else(|| {
                     ThemeError::Resolution(format!("token `{token_path}` has no type"))
                 })?;
+            let token_type = DtcgType::parse(token_type)?;
+            validate_token_value(token_type, token_value)?;
             output.insert(
                 token_path,
                 RawToken {
-                    token_type: token_type.into(),
+                    token_type: token_type.as_str().into(),
                     value: token_value.clone(),
                     provenance: path.display().to_string(),
                 },
@@ -420,7 +459,7 @@ fn resolve_aliases(
                     "unknown alias target `{current}`"
                 )));
             };
-            let Some(alias) = raw.value.as_str().and_then(alias_target) else {
+            let Some(alias) = dtcg_alias_target(&raw.value)? else {
                 if current != key {
                     let target = values
                         .get(&current)
@@ -437,7 +476,7 @@ fn resolve_aliases(
                 resolved = true;
                 break;
             };
-            current = alias.into();
+            current = alias.as_str().into();
         }
         if !resolved {
             return Err(ThemeError::Resolution(format!(
@@ -485,13 +524,6 @@ fn apply_deprecations(
         }
     }
     Ok(())
-}
-
-fn alias_target(value: &str) -> Option<&str> {
-    value
-        .strip_prefix('{')?
-        .strip_suffix('}')
-        .filter(|value| !value.is_empty())
 }
 
 #[cfg(test)]
@@ -619,7 +651,7 @@ mod tests {
             "resolutionOrder": [{"$ref": "#/sets/base"}]
         }))
         .expect("resolver fixture");
-        assert!(validate_resolver(&resolver).is_err());
+        assert!(validate_resolver(&resolver, &crate::ProjectConfig::default()).is_err());
     }
 
     #[test]
