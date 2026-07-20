@@ -16,7 +16,7 @@ pub enum Ownership {
     ExternalKitOwned,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ChangeScope {
     WholeFile,
@@ -30,6 +30,63 @@ pub enum ChangeOperation {
     Create,
     Replace,
     Remove,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DesiredArtifactState {
+    Present,
+    Absent,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ArtifactManifestEntry {
+    pub path: String,
+    pub scope: ChangeScope,
+    pub ownership: Ownership,
+    pub state: DesiredArtifactState,
+    pub digest: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ArtifactManifest {
+    pub schema_version: String,
+    pub entries: Vec<ArtifactManifestEntry>,
+}
+
+impl ArtifactManifest {
+    pub fn new(mut entries: Vec<ArtifactManifestEntry>) -> Result<Self, CodegenError> {
+        entries.sort_by(|left, right| {
+            left.path
+                .as_bytes()
+                .cmp(right.path.as_bytes())
+                .then_with(|| scope_order(left.scope).cmp(&scope_order(right.scope)))
+        });
+        let mut seen = BTreeSet::new();
+        for entry in &entries {
+            LogicalPath::new(entry.path.clone()).map_err(CodegenError::Core)?;
+            if !seen.insert((entry.path.as_str(), entry.scope))
+                || (entry.state == DesiredArtifactState::Present) != entry.digest.is_some()
+                || (entry.state == DesiredArtifactState::Absent
+                    && entry.ownership != Ownership::GeneratedLockOwned)
+                || entry
+                    .digest
+                    .as_deref()
+                    .is_some_and(|digest| !valid_digest(digest))
+            {
+                return Err(CodegenError::Core(ThemeError::Config(format!(
+                    "invalid desired artifact `{}`",
+                    entry.path
+                ))));
+            }
+        }
+        Ok(Self {
+            schema_version: "1.0.0".into(),
+            entries,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -87,39 +144,108 @@ pub fn plan_artifacts(
     root: &Path,
     artifacts: &[GeneratedArtifact],
 ) -> Result<PlanV1, CodegenError> {
-    let mut seen = BTreeSet::new();
-    let mut snapshots = Vec::with_capacity(artifacts.len());
-    let mut changes = Vec::new();
-    for artifact in artifacts {
-        LogicalPath::new(artifact.path.clone()).map_err(CodegenError::Core)?;
-        if !seen.insert(artifact.path.as_str()) {
-            return Err(CodegenError::Core(ThemeError::Config(format!(
-                "duplicate planned artifact `{}`",
-                artifact.path
-            ))));
-        }
-        let snapshot = snapshot_path(root, &artifact.path)?;
-        let expected = format!("sha256:{}", sha256(&artifact.bytes));
-        let expected_mode = publication_mode(artifact, &snapshot);
-        if snapshot.digest.as_deref() != Some(&expected) || snapshot.mode != expected_mode {
-            changes.push(Change {
-                operation: if snapshot.exists {
-                    ChangeOperation::Replace
-                } else {
-                    ChangeOperation::Create
-                },
-                scope: artifact.scope,
+    let manifest = ArtifactManifest::new(
+        artifacts
+            .iter()
+            .map(|artifact| ArtifactManifestEntry {
                 path: artifact.path.clone(),
+                scope: artifact.scope,
                 ownership: artifact.ownership,
-                before_digest: snapshot.digest.clone(),
-                after_digest: Some(expected),
-                before_mode: snapshot.mode,
-                after_mode: expected_mode,
-            });
+                state: DesiredArtifactState::Present,
+                digest: Some(format!("sha256:{}", sha256(&artifact.bytes))),
+            })
+            .collect(),
+    )?;
+    plan_manifest(root, artifacts, &manifest)
+}
+
+pub fn plan_manifest(
+    root: &Path,
+    artifacts: &[GeneratedArtifact],
+    manifest: &ArtifactManifest,
+) -> Result<PlanV1, CodegenError> {
+    let payloads = artifacts
+        .iter()
+        .map(|artifact| ((artifact.path.as_str(), artifact.scope), artifact))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    if payloads.len() != artifacts.len() {
+        return Err(CodegenError::Core(ThemeError::Config(
+            "duplicate artifact payload".into(),
+        )));
+    }
+    let mut consumed = BTreeSet::new();
+    let mut snapshots = Vec::with_capacity(manifest.entries.len());
+    let mut changes = Vec::new();
+    for entry in &manifest.entries {
+        let snapshot = snapshot_path(root, &entry.path)?;
+        match entry.state {
+            DesiredArtifactState::Present => {
+                let artifact = payloads
+                    .get(&(entry.path.as_str(), entry.scope))
+                    .ok_or_else(|| {
+                        CodegenError::Core(ThemeError::Config(format!(
+                            "desired artifact `{}` has no payload",
+                            entry.path
+                        )))
+                    })?;
+                consumed.insert((entry.path.as_str(), entry.scope));
+                let expected = format!("sha256:{}", sha256(&artifact.bytes));
+                if entry.digest.as_deref() != Some(&expected)
+                    || entry.ownership != artifact.ownership
+                {
+                    return Err(CodegenError::Core(ThemeError::Config(format!(
+                        "desired artifact `{}` differs from its payload",
+                        entry.path
+                    ))));
+                }
+                let expected_mode = publication_mode(artifact, &snapshot);
+                if snapshot.digest.as_deref() != Some(&expected) || snapshot.mode != expected_mode {
+                    changes.push(Change {
+                        operation: if snapshot.exists {
+                            ChangeOperation::Replace
+                        } else {
+                            ChangeOperation::Create
+                        },
+                        scope: artifact.scope,
+                        path: artifact.path.clone(),
+                        ownership: artifact.ownership,
+                        before_digest: snapshot.digest.clone(),
+                        after_digest: Some(expected),
+                        before_mode: snapshot.mode,
+                        after_mode: expected_mode,
+                    });
+                }
+            }
+            DesiredArtifactState::Absent => {
+                if snapshot.exists {
+                    changes.push(Change {
+                        operation: ChangeOperation::Remove,
+                        scope: entry.scope,
+                        path: entry.path.clone(),
+                        ownership: entry.ownership,
+                        before_digest: snapshot.digest.clone(),
+                        after_digest: None,
+                        before_mode: snapshot.mode,
+                        after_mode: None,
+                    });
+                }
+            }
         }
         snapshots.push(snapshot);
     }
+    if consumed.len() != payloads.len() {
+        return Err(CodegenError::Core(ThemeError::Config(
+            "artifact payload is outside the desired manifest".into(),
+        )));
+    }
     snapshots.sort_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
+    changes.sort_by(|left, right| {
+        left.path
+            .as_bytes()
+            .cmp(right.path.as_bytes())
+            .then_with(|| scope_order(left.scope).cmp(&scope_order(right.scope)))
+            .then_with(|| operation_order(left.operation).cmp(&operation_order(right.operation)))
+    });
     let mut plan = PlanV1 {
         schema_version: "1.0.0".into(),
         snapshots,
@@ -134,6 +260,31 @@ pub fn plan_artifacts(
     let bytes = serde_json_canonicalizer::to_vec(&semantic)?;
     plan.digest = format!("sha256:{}", sha256(&bytes));
     Ok(plan)
+}
+
+fn scope_order(scope: ChangeScope) -> u8 {
+    match scope {
+        ChangeScope::Directory => 0,
+        ChangeScope::WholeFile => 1,
+        ChangeScope::HtmlOwnedRegion => 2,
+    }
+}
+
+fn operation_order(operation: ChangeOperation) -> u8 {
+    match operation {
+        ChangeOperation::Create => 0,
+        ChangeOperation::Replace => 1,
+        ChangeOperation::Remove => 2,
+    }
+}
+
+fn valid_digest(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|value| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
 }
 
 fn snapshot_path(root: &Path, relative: &str) -> Result<Snapshot, CodegenError> {

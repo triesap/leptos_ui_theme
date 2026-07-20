@@ -5,7 +5,10 @@ mod plan;
 mod runtime;
 mod transaction;
 
-pub use plan::{Change, ChangeOperation, ChangeScope, Ownership, PlanV1, Snapshot, plan_artifacts};
+pub use plan::{
+    ArtifactManifest, ArtifactManifestEntry, Change, ChangeOperation, ChangeScope,
+    DesiredArtifactState, Ownership, PlanV1, Snapshot, plan_artifacts, plan_manifest,
+};
 pub use runtime::{seeded_controller, seeded_module, seeded_scope};
 pub use transaction::{
     ApplyCommand, apply_transaction, apply_transaction_with_wait, ensure_no_active_transaction,
@@ -57,6 +60,7 @@ pub struct GeneratedArtifact {
 #[derive(Clone, Debug)]
 pub struct BuildResult {
     pub artifacts: Vec<GeneratedArtifact>,
+    pub manifest: ArtifactManifest,
     pub profiles: Vec<ResolvedProfile>,
     pub plan: PlanV1,
     pub bootstrap: BootstrapMetadata,
@@ -253,13 +257,31 @@ struct PreviousThemeLock {
 #[serde(untagged)]
 enum PreviousOutputLock {
     Digest(String),
-    Record { digest: String },
+    Record {
+        digest: String,
+        ownership: Ownership,
+        scope: ChangeScope,
+    },
 }
 
 impl PreviousOutputLock {
     fn digest(&self) -> &str {
         match self {
-            Self::Digest(digest) | Self::Record { digest } => digest,
+            Self::Digest(digest) | Self::Record { digest, .. } => digest,
+        }
+    }
+
+    fn ownership(&self) -> Ownership {
+        match self {
+            Self::Digest(_) => Ownership::GeneratedLockOwned,
+            Self::Record { ownership, .. } => *ownership,
+        }
+    }
+
+    fn scope(&self) -> ChangeScope {
+        match self {
+            Self::Digest(_) => ChangeScope::WholeFile,
+            Self::Record { scope, .. } => *scope,
         }
     }
 }
@@ -361,6 +383,7 @@ pub fn build_with_workspace(
                 axes.push(ResolvedAxis {
                     domain,
                     attribute: axis.attribute.clone(),
+                    default_context: axis.default_context.clone(),
                     system: axis
                         .system
                         .as_ref()
@@ -597,15 +620,89 @@ pub fn build_with_workspace(
     }
     ordered_artifacts.push(lock_artifact);
     artifacts = ordered_artifacts;
-    let plan = plan_artifacts(&root, &artifacts)?;
+    let manifest = desired_manifest(
+        &root,
+        &compiler.config.outputs.lock,
+        compiler.config.limits.file_bytes,
+        &artifacts,
+    )?;
+    let plan = plan_manifest(&root, &artifacts, &manifest)?;
     Ok(BuildResult {
         artifacts,
+        manifest,
         profiles,
         plan,
         bootstrap,
         accepted_generated,
         manual_html_stale,
     })
+}
+
+fn desired_manifest(
+    root: &Path,
+    lock_relative: &str,
+    file_limit: u64,
+    artifacts: &[GeneratedArtifact],
+) -> Result<ArtifactManifest, CodegenError> {
+    let mut entries = artifacts
+        .iter()
+        .map(|artifact| ArtifactManifestEntry {
+            path: artifact.path.clone(),
+            scope: artifact.scope,
+            ownership: artifact.ownership,
+            state: DesiredArtifactState::Present,
+            digest: Some(format!("sha256:{}", sha256(&artifact.bytes))),
+        })
+        .collect::<Vec<_>>();
+    let present = artifacts
+        .iter()
+        .map(|artifact| artifact.path.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let lock_path = root.join(lock_relative);
+    let previous = match std::fs::read(&lock_path) {
+        Ok(bytes) => {
+            if bytes.len() as u64 > file_limit {
+                return Err(CodegenError::Core(ThemeError::Config(
+                    "existing theme lock exceeds the configured file limit".into(),
+                )));
+            }
+            Some(
+                serde_json::from_slice::<PreviousThemeLock>(&bytes).map_err(|source| {
+                    CodegenError::Core(ThemeError::Json {
+                        path: PathBuf::from(lock_relative),
+                        source,
+                    })
+                })?,
+            )
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => None,
+        Err(source) => {
+            return Err(CodegenError::Io {
+                path: PathBuf::from(lock_relative),
+                source,
+            });
+        }
+    };
+    if let Some(previous) = previous {
+        for (path, output) in previous.outputs {
+            if present.contains(path.as_str()) {
+                continue;
+            }
+            if output.ownership() != Ownership::GeneratedLockOwned {
+                return Err(CodegenError::Core(ThemeError::Config(format!(
+                    "previous output `{path}` has invalid ownership"
+                ))));
+            }
+            entries.push(ArtifactManifestEntry {
+                path,
+                scope: output.scope(),
+                ownership: output.ownership(),
+                state: DesiredArtifactState::Absent,
+                digest: None,
+            });
+        }
+    }
+    ArtifactManifest::new(entries)
 }
 
 fn protect_workspace_inputs(
@@ -922,6 +1019,7 @@ pub fn generate_css(
         css.push_str("  }\n");
     }
     css.push_str("}\n");
+    validate_css_output(&css)?;
     Ok(css)
 }
 
@@ -941,13 +1039,24 @@ fn generate_theme_blocks(
     let default = profile(profiles, &config.profiles.default)?;
     let dark = profile(profiles, &config.profiles.system.dark)?;
     let mut blocks = Vec::new();
+    let mut root_values = default
+        .values
+        .iter()
+        .filter(|token| token.domain == TokenDomain::Theme)
+        .collect::<Vec<_>>();
+    for axis in axes {
+        let default_axis = profile(&axis.contexts, &axis.default_context)?;
+        root_values.extend(
+            default_axis
+                .values
+                .iter()
+                .filter(|token| token.domain == axis.domain),
+        );
+    }
     if let Some(block) = selector_block(
         ":root",
-        Some(ColorScheme::Light),
-        default
-            .values
-            .iter()
-            .filter(|token| emitted_root_domain(token.domain)),
+        Some(default.color_scheme),
+        root_values.into_iter(),
         indent,
         mode,
     )? {
@@ -955,7 +1064,7 @@ fn generate_theme_blocks(
     }
     if let Some(dark_block) = selector_block(
         &format!(":root:not([{}])", config.selectors.theme),
-        Some(ColorScheme::Dark),
+        Some(dark.color_scheme),
         dark.values
             .iter()
             .filter(|token| token.domain == TokenDomain::Theme),
@@ -969,7 +1078,7 @@ fn generate_theme_blocks(
     }
     for current in profiles {
         if let Some(block) = selector_block(
-            &format!("[{}=\"{}\"]", config.selectors.theme, current.id),
+            &format!(":root[{}=\"{}\"]", config.selectors.theme, current.id),
             Some(current.color_scheme),
             current
                 .values
@@ -1022,15 +1131,24 @@ fn generate_theme_blocks(
 pub struct ResolvedAxis {
     pub domain: TokenDomain,
     pub attribute: String,
+    pub default_context: String,
     pub system: Option<(String, String)>,
     pub contexts: Vec<ResolvedProfile>,
 }
 
-fn emitted_root_domain(domain: TokenDomain) -> bool {
-    matches!(
-        domain,
-        TokenDomain::Theme | TokenDomain::Density | TokenDomain::Motion | TokenDomain::Contrast
-    )
+fn validate_css_output(css: &str) -> Result<(), CodegenError> {
+    if css.contains('\r')
+        || !css.ends_with('\n')
+        || css.contains("!important")
+        || css.contains("forced-color-adjust")
+        || css.contains("@import")
+        || css.matches("@supports (color: oklch(0 0 0))").count() > 1
+    {
+        return Err(CodegenError::Core(ThemeError::Security(
+            "generated CSS violates the closed output grammar".into(),
+        )));
+    }
+    Ok(())
 }
 
 fn selector_block<'a>(
@@ -1171,11 +1289,16 @@ fn serialize_cubic_bezier(value: &serde_json::Value) -> Result<String, String> {
         .ok_or_else(|| "cubicBezier must contain four values".to_owned())?;
     let values = values
         .iter()
-        .map(|value| {
-            value
+        .enumerate()
+        .map(|(index, value)| {
+            let value = value
                 .as_f64()
-                .ok_or_else(|| "cubicBezier value must be numeric".to_owned())
-                .and_then(|value| format_css_number(value).map_err(|error| error.to_string()))
+                .filter(|value| value.is_finite())
+                .ok_or_else(|| "cubicBezier value must be finite".to_owned())?;
+            if matches!(index, 0 | 2) && !(0.0..=1.0).contains(&value) {
+                return Err("cubicBezier x components must be within 0..1".into());
+            }
+            format_css_number(value).map_err(|error| error.to_string())
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(format!(
@@ -1247,7 +1370,8 @@ fn serialize_shadow_entry(value: &serde_json::Value, mode: CssMode) -> Result<St
             .get(name)
             .ok_or_else(|| ThemeError::Resolution(format!("shadow `{name}` is missing")))
             .and_then(|value| {
-                serialize_unit(value, &["px", "rem"], 1.0, false).map_err(ThemeError::Resolution)
+                serialize_unit(value, &["px", "rem"], 1.0, name == "blur")
+                    .map_err(ThemeError::Resolution)
             })
     };
     let color_value = object
@@ -1667,8 +1791,9 @@ fn profile<'a>(
 #[cfg(test)]
 mod tests {
     use super::{
-        CssMode, GeneratedArtifact, apply_artifacts, bootstrap_script, csp_source, generate_css,
-        serialize_css,
+        ArtifactManifest, ArtifactManifestEntry, ChangeOperation, ChangeScope, CssMode,
+        DesiredArtifactState, GeneratedArtifact, Ownership, ResolvedAxis, apply_artifacts,
+        bootstrap_script, csp_source, generate_css, plan_manifest, serialize_css,
     };
     use leptos_ui_theme_core::{
         ColorScheme, ProjectConfig, ResolvedProfile, ResolvedToken, TokenDomain, format_css_number,
@@ -1751,6 +1876,77 @@ mod tests {
         assert!(css[..supports].contains("--kit-color-primary: #"));
         assert!(!css[..supports].contains("--kit-color-primary: oklch("));
         assert!(css[supports..].contains("--kit-color-primary: oklch("));
+    }
+
+    #[test]
+    fn css_emits_root_axis_defaults_and_root_scoped_explicit_selectors() {
+        let config = ProjectConfig::default();
+        let profiles = [
+            ResolvedProfile {
+                id: "light".into(),
+                label: None,
+                color_scheme: ColorScheme::Light,
+                inputs: Default::default(),
+                values: vec![oklch_token()],
+                semantic_digest: String::new(),
+            },
+            ResolvedProfile {
+                id: "dark".into(),
+                label: None,
+                color_scheme: ColorScheme::Dark,
+                inputs: Default::default(),
+                values: vec![oklch_token()],
+                semantic_digest: String::new(),
+            },
+        ];
+        let axis_token = |id: &str, value: f64| ResolvedProfile {
+            id: id.into(),
+            label: None,
+            color_scheme: ColorScheme::Light,
+            inputs: Default::default(),
+            values: vec![ResolvedToken {
+                path: "density.scale".into(),
+                token_type: "number".into(),
+                css_custom_property: "--kit-density-scale".into(),
+                domain: TokenDomain::Density,
+                value: value.into(),
+                provenance: Vec::new(),
+                alias_of: None,
+            }],
+            semantic_digest: String::new(),
+        };
+        let axes = [ResolvedAxis {
+            domain: TokenDomain::Density,
+            attribute: config.selectors.density.clone(),
+            default_context: "comfortable".into(),
+            system: None,
+            contexts: vec![axis_token("compact", 0.8), axis_token("comfortable", 1.0)],
+        }];
+        let css = generate_css(&config, &profiles, &axes).unwrap();
+        let root_end = css.find("  }\n\n").unwrap();
+        assert!(css[..root_end].contains("--kit-density-scale: 1;"));
+        assert!(css.contains(&format!(":root[{}=\"light\"]", config.selectors.theme)));
+        assert!(css.contains(&format!(":root[{}=\"compact\"]", config.selectors.density)));
+        assert!(!css.contains(&format!("\n  [{}=", config.selectors.theme)));
+    }
+
+    #[test]
+    fn desired_manifest_plans_stale_generated_removal() {
+        let root = temporary_directory();
+        std::fs::write(root.join("stale.css"), b"old\n").unwrap();
+        let manifest = ArtifactManifest::new(vec![ArtifactManifestEntry {
+            path: "stale.css".into(),
+            scope: ChangeScope::WholeFile,
+            ownership: Ownership::GeneratedLockOwned,
+            state: DesiredArtifactState::Absent,
+            digest: None,
+        }])
+        .unwrap();
+        let plan = plan_manifest(&root, &[], &manifest).unwrap();
+        assert_eq!(plan.changes.len(), 1);
+        assert_eq!(plan.changes[0].operation, ChangeOperation::Remove);
+        assert!(plan.changes[0].after_digest.is_none());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
