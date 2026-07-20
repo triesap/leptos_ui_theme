@@ -22,8 +22,8 @@ pub use diagnostic::{
     SourceLocation,
 };
 pub use dtcg::{
-    DtcgType, alias_target as dtcg_alias_target, validate_extensions, validate_reserved_members,
-    validate_token_value,
+    DtcgType, alias_target as dtcg_alias_target, expand_group_extends, validate_extensions,
+    validate_reserved_members, validate_token_value,
 };
 pub use identity::{AbiVersion, ContractId, ContractRevision, Sha256Digest, ThemeId, TokenPath};
 pub use kit::{KitCapability, KitLock, VerifiedKit, discover_kit};

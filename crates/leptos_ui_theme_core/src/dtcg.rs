@@ -73,6 +73,157 @@ pub fn alias_target(value: &Value) -> Result<Option<TokenPath>, ThemeError> {
     TokenPath::new(target.to_owned()).map(Some)
 }
 
+pub fn expand_group_extends(document: &Value) -> Result<Value, ThemeError> {
+    let root = document
+        .as_object()
+        .ok_or_else(|| ThemeError::Resolution("a DTCG document must be an object".into()))?;
+    let mut stack = Vec::new();
+    expand_group(root, root, "#", &mut stack).map(Value::Object)
+}
+
+fn expand_group(
+    root: &Map<String, Value>,
+    group: &Map<String, Value>,
+    location: &str,
+    stack: &mut Vec<String>,
+) -> Result<Map<String, Value>, ThemeError> {
+    if group.contains_key("$value") {
+        return Err(ThemeError::Resolution(format!(
+            "`{location}` is a token, not a group"
+        )));
+    }
+    validate_reserved_members(group, false)?;
+    if stack.iter().any(|entry| entry == location) {
+        return Err(ThemeError::Resolution(format!(
+            "group extension cycle at `{location}`"
+        )));
+    }
+    stack.push(location.to_owned());
+
+    let mut expanded = if let Some(reference) = group.get("$extends") {
+        let reference = group_reference(reference)?;
+        let target = group_at(root, &reference)?;
+        expand_group(root, target, &reference, stack)?
+    } else {
+        Map::new()
+    };
+    for (name, value) in group {
+        if name != "$extends" {
+            expanded.insert(name.clone(), value.clone());
+        }
+    }
+
+    let child_names = expanded
+        .iter()
+        .filter_map(|(name, value)| {
+            (!name.starts_with('$')
+                && value
+                    .as_object()
+                    .is_some_and(|object| !object.contains_key("$value")))
+            .then(|| name.clone())
+        })
+        .collect::<Vec<_>>();
+    for name in child_names {
+        let child = expanded
+            .get(&name)
+            .and_then(Value::as_object)
+            .ok_or_else(|| ThemeError::Resolution("group expansion changed shape".into()))?;
+        let child_location = if location == "#" {
+            format!("#/{}", pointer_escape(&name))
+        } else {
+            format!("{location}/{}", pointer_escape(&name))
+        };
+        let child = expand_group(root, child, &child_location, stack)?;
+        expanded.insert(name, Value::Object(child));
+    }
+
+    let removed = stack.pop();
+    debug_assert_eq!(removed.as_deref(), Some(location));
+    Ok(expanded)
+}
+
+fn group_reference(value: &Value) -> Result<String, ThemeError> {
+    let value = value
+        .as_str()
+        .ok_or_else(|| ThemeError::Resolution("$extends must be a group reference".into()))?;
+    if value.starts_with("#/") {
+        return Ok(value.to_owned());
+    }
+    let path = value
+        .strip_prefix('{')
+        .and_then(|value| value.strip_suffix('}'))
+        .ok_or_else(|| ThemeError::Resolution(format!("invalid group reference `{value}`")))?;
+    let path = TokenPath::new(path.to_owned())?;
+    Ok(format!(
+        "#/{}",
+        path.as_str()
+            .split('.')
+            .map(pointer_escape)
+            .collect::<Vec<_>>()
+            .join("/")
+    ))
+}
+
+fn group_at<'a>(
+    root: &'a Map<String, Value>,
+    reference: &str,
+) -> Result<&'a Map<String, Value>, ThemeError> {
+    let pointer = reference
+        .strip_prefix('#')
+        .ok_or_else(|| ThemeError::Resolution(format!("invalid group reference `{reference}`")))?;
+    let mut current = root;
+    let segments = pointer
+        .strip_prefix('/')
+        .ok_or_else(|| ThemeError::Resolution(format!("invalid group reference `{reference}`")))?;
+    let segments = segments.split('/').collect::<Vec<_>>();
+    for (index, segment) in segments.iter().enumerate() {
+        let segment = pointer_unescape(segment)?;
+        let child = current.get(&segment).ok_or_else(|| {
+            ThemeError::Resolution(format!("unknown group reference `{reference}`"))
+        })?;
+        let object = child.as_object().ok_or_else(|| {
+            ThemeError::Resolution(format!("group reference `{reference}` is not an object"))
+        })?;
+        if index + 1 == segments.len() {
+            if object.contains_key("$value") {
+                return Err(ThemeError::Resolution(format!(
+                    "group reference `{reference}` targets a token"
+                )));
+            }
+            return Ok(object);
+        }
+        current = object;
+    }
+    Err(ThemeError::Resolution(format!(
+        "invalid group reference `{reference}`"
+    )))
+}
+
+fn pointer_escape(value: &str) -> String {
+    value.replace('~', "~0").replace('/', "~1")
+}
+
+fn pointer_unescape(value: &str) -> Result<String, ThemeError> {
+    let mut output = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(character) = chars.next() {
+        if character != '~' {
+            output.push(character);
+            continue;
+        }
+        match chars.next() {
+            Some('0') => output.push('~'),
+            Some('1') => output.push('/'),
+            _ => {
+                return Err(ThemeError::Resolution(
+                    "group reference contains an invalid JSON Pointer escape".into(),
+                ));
+            }
+        }
+    }
+    Ok(output)
+}
+
 pub fn validate_token_value(token_type: DtcgType, value: &Value) -> Result<(), ThemeError> {
     if alias_target(value)?.is_some() {
         return Ok(());
@@ -421,4 +572,44 @@ fn finite(value: &Value, label: &str) -> Result<f64, ThemeError> {
         .as_f64()
         .filter(|value| value.is_finite())
         .ok_or_else(|| ThemeError::Resolution(format!("{label} must be a finite number")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::expand_group_extends;
+
+    #[test]
+    fn group_extends_inherits_and_overrides_members() {
+        let document = serde_json::json!({
+            "base": {
+                "$type": "color",
+                "background": {"$value": "#000000"},
+                "foreground": {"$value": "#ffffff"}
+            },
+            "brand": {
+                "$extends": "{base}",
+                "background": {"$value": "#112233"}
+            }
+        });
+        let expanded = expand_group_extends(&document).expect("expand group");
+        assert_eq!(
+            expanded["brand"]["background"]["$value"],
+            serde_json::json!("#112233")
+        );
+        assert_eq!(
+            expanded["brand"]["foreground"]["$value"],
+            serde_json::json!("#ffffff")
+        );
+        assert_eq!(expanded["brand"]["$type"], serde_json::json!("color"));
+        assert!(expanded["brand"].get("$extends").is_none());
+    }
+
+    #[test]
+    fn group_extension_cycles_fail() {
+        let document = serde_json::json!({
+            "a": {"$extends": "{b}"},
+            "b": {"$extends": "{a}"}
+        });
+        assert!(expand_group_extends(&document).is_err());
+    }
 }

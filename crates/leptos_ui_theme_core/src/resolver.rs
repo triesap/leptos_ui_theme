@@ -2,7 +2,8 @@ use crate::contract::{KitTokenContract, TokenDomain};
 use crate::model::{ColorScheme, Profile, ProjectConfig};
 use crate::{
     CONFIG_FILE, DtcgType, LogicalPath, SourceLoader, ThemeError, discover_kit, dtcg_alias_target,
-    read_json, validate_contrast, validate_reserved_members, validate_token_value,
+    expand_group_extends, read_json, validate_contrast, validate_reserved_members,
+    validate_token_value,
 };
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -77,14 +78,13 @@ impl ThemeCompiler {
 
     pub fn resolve(&self) -> Result<Vec<ResolvedProfile>, ThemeError> {
         let resolver_logical = LogicalPath::new(self.config.resolver.clone())?;
-        let resolver_path = self.loader.resolve_file(&resolver_logical)?;
         let resolver: ResolverDocument = self.loader.read_json(&resolver_logical)?;
         validate_resolver(&resolver, &self.config)?;
         self.config
             .profiles
             .named
             .iter()
-            .map(|profile| self.resolve_profile(profile, &resolver, &resolver_path, None))
+            .map(|profile| self.resolve_profile(profile, &resolver, &resolver_logical, None))
             .collect()
     }
 
@@ -101,7 +101,6 @@ impl ThemeCompiler {
         contexts: &[String],
     ) -> Result<Vec<ResolvedProfile>, ThemeError> {
         let resolver_logical = LogicalPath::new(self.config.resolver.clone())?;
-        let resolver_path = self.loader.resolve_file(&resolver_logical)?;
         let resolver: ResolverDocument = self.loader.read_json(&resolver_logical)?;
         validate_resolver(&resolver, &self.config)?;
         let base = self.config.profile(&self.config.profiles.default)?;
@@ -122,7 +121,7 @@ impl ThemeCompiler {
                         )));
                     }
                 };
-                self.resolve_profile(&profile, &resolver, &resolver_path, Some(domain))
+                self.resolve_profile(&profile, &resolver, &resolver_logical, Some(domain))
             })
             .collect()
     }
@@ -131,7 +130,7 @@ impl ThemeCompiler {
         &self,
         profile: &Profile,
         resolver: &ResolverDocument,
-        resolver_path: &Path,
+        resolver_path: &LogicalPath,
         axis_domain: Option<TokenDomain>,
     ) -> Result<ResolvedProfile, ThemeError> {
         let mut raw = BTreeMap::<String, RawToken>::new();
@@ -157,7 +156,13 @@ impl ThemeCompiler {
                 let set = resolver.sets.get(name).ok_or_else(|| {
                     ThemeError::Resolution(format!("unknown resolver set `{name}`"))
                 })?;
-                apply_sources(set.get("sources"), resolver_path, &mut raw, &self.config)?;
+                apply_sources(
+                    set.get("sources"),
+                    resolver_path,
+                    &self.loader,
+                    &mut raw,
+                    &self.config,
+                )?;
             } else if let Some(modifier_name) = reference.strip_prefix("#/modifiers/") {
                 self.apply_modifier(profile, resolver, modifier_name, resolver_path, &mut raw)?;
             } else {
@@ -176,7 +181,11 @@ impl ThemeCompiler {
             }
         }
 
-        resolve_aliases(&mut raw, self.config.limits.reference_depth)?;
+        resolve_aliases(
+            &mut raw,
+            self.config.limits.reference_depth,
+            self.config.limits.reference_edges,
+        )?;
         apply_deprecations(&self.contract, &mut raw)?;
         let mut values = Vec::with_capacity(self.contract.tokens.len());
         for mapping in &self.contract.tokens {
@@ -237,7 +246,7 @@ impl ThemeCompiler {
         profile: &Profile,
         resolver: &ResolverDocument,
         modifier_name: &str,
-        resolver_path: &Path,
+        resolver_path: &LogicalPath,
         raw: &mut BTreeMap<String, RawToken>,
     ) -> Result<(), ThemeError> {
         let context = profile.inputs.get(modifier_name).ok_or_else(|| {
@@ -253,7 +262,7 @@ impl ThemeCompiler {
         let sources = modifier
             .get("contexts")
             .and_then(|value| value.get(context));
-        apply_sources(sources, resolver_path, raw, &self.config)
+        apply_sources(sources, resolver_path, &self.loader, raw, &self.config)
     }
 }
 
@@ -291,7 +300,8 @@ fn validate_resolver(
 
 fn apply_sources(
     sources: Option<&serde_json::Value>,
-    resolver_path: &Path,
+    resolver_path: &LogicalPath,
+    loader: &SourceLoader,
     raw: &mut BTreeMap<String, RawToken>,
     config: &ProjectConfig,
 ) -> Result<(), ThemeError> {
@@ -300,6 +310,11 @@ fn apply_sources(
             "resolver source list is missing".into(),
         ));
     };
+    if sources.len() > config.limits.source_files as usize {
+        return Err(ThemeError::Resolution(
+            "resolver source list exceeds limits.sourceFiles".into(),
+        ));
+    }
     for source in sources {
         let reference = source
             .get("$ref")
@@ -313,38 +328,50 @@ fn apply_sources(
             || file_reference.contains("..")
             || file_reference.contains('\\')
             || file_reference.contains(':')
-            || pointer.is_some_and(|pointer| !pointer.is_empty() && !pointer.starts_with('/'))
+            || pointer.is_some_and(|pointer| pointer.contains('#'))
         {
             return Err(ThemeError::Security(format!(
                 "unsafe resolver reference `{reference}`"
             )));
         }
-        let base = resolver_path.parent().unwrap_or_else(|| Path::new("."));
-        let path = base.join(file_reference);
-        let canonical_base = std::fs::canonicalize(base).map_err(|source| ThemeError::Io {
-            path: base.to_path_buf(),
-            source,
+        let base = Path::new(resolver_path.as_str())
+            .parent()
+            .unwrap_or_else(|| Path::new(""));
+        let joined = base.join(file_reference);
+        let joined = joined.to_str().ok_or_else(|| {
+            ThemeError::Security(format!("resolver reference is not UTF-8: `{reference}`"))
         })?;
-        let path = std::fs::canonicalize(&path).map_err(|source| ThemeError::Io {
-            path: path.clone(),
-            source,
-        })?;
-        if !path.starts_with(&canonical_base) {
+        let logical = LogicalPath::new(joined.to_owned())?;
+        let token_root = LogicalPath::new(config.token_root.clone())?;
+        if logical.as_str() != token_root.as_str()
+            && !logical
+                .as_str()
+                .starts_with(&format!("{}/", token_root.as_str()))
+        {
             return Err(ThemeError::Security(format!(
                 "resolver reference escapes the token root: `{reference}`"
             )));
         }
-        let value: serde_json::Value = read_json(&path)?;
+        let value: serde_json::Value = loader.read_json(&logical)?;
+        let value = expand_group_extends(&value)?;
         let value = match pointer {
             Some("") | None => &value,
-            Some(pointer) => value.pointer(pointer).ok_or_else(|| {
-                ThemeError::Resolution(format!(
-                    "unknown JSON Pointer `#{pointer}` in `{file_reference}`"
-                ))
-            })?,
+            Some(pointer) => {
+                let pointer = decode_uri_fragment(pointer)?;
+                if !pointer.starts_with('/') {
+                    return Err(ThemeError::Resolution(format!(
+                        "JSON Pointer fragment must be empty or start with `/`: `#{pointer}`"
+                    )));
+                }
+                value.pointer(&pointer).ok_or_else(|| {
+                    ThemeError::Resolution(format!(
+                        "unknown JSON Pointer `#{pointer}` in `{file_reference}`"
+                    ))
+                })?
+            }
         };
         let mut flattened = BTreeMap::new();
-        flatten_tokens(value, None, "", &path, &mut flattened)?;
+        flatten_tokens(value, None, "", Path::new(logical.as_str()), &mut flattened)?;
         if flattened.len() > config.limits.tokens as usize
             || raw.len().saturating_add(flattened.len()) > config.limits.tokens as usize
         {
@@ -355,6 +382,41 @@ fn apply_sources(
         raw.extend(flattened);
     }
     Ok(())
+}
+
+fn decode_uri_fragment(value: &str) -> Result<String, ThemeError> {
+    let bytes = value.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            output.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        if index + 2 >= bytes.len() {
+            return Err(ThemeError::Resolution(
+                "JSON Pointer fragment has incomplete percent encoding".into(),
+            ));
+        }
+        let high = hex_digit(bytes[index + 1])?;
+        let low = hex_digit(bytes[index + 2])?;
+        output.push((high << 4) | low);
+        index += 3;
+    }
+    String::from_utf8(output)
+        .map_err(|_| ThemeError::Resolution("JSON Pointer fragment is not UTF-8".into()))
+}
+
+fn hex_digit(value: u8) -> Result<u8, ThemeError> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        b'A'..=b'F' => Ok(value - b'A' + 10),
+        _ => Err(ThemeError::Resolution(
+            "JSON Pointer fragment has invalid percent encoding".into(),
+        )),
+    }
 }
 
 fn flatten_tokens(
@@ -444,45 +506,153 @@ fn flatten_tokens(
 fn resolve_aliases(
     values: &mut BTreeMap<String, RawToken>,
     max_depth: u32,
+    max_edges: u32,
 ) -> Result<(), ThemeError> {
-    let keys: Vec<String> = values.keys().cloned().collect();
-    for key in keys {
-        let mut seen = BTreeSet::new();
-        let mut current = key.clone();
-        let mut resolved = false;
-        for _ in 0..=max_depth {
-            if !seen.insert(current.clone()) {
-                return Err(ThemeError::Resolution(format!("alias cycle at `{key}`")));
-            }
-            let Some(raw) = values.get(&current).cloned() else {
-                return Err(ThemeError::Resolution(format!(
-                    "unknown alias target `{current}`"
-                )));
-            };
-            let Some(alias) = dtcg_alias_target(&raw.value)? else {
-                if current != key {
-                    let target = values
-                        .get(&current)
-                        .cloned()
-                        .expect("resolved alias target");
-                    values.insert(
-                        key.clone(),
-                        RawToken {
-                            provenance: format!("{} -> {}", values[&key].provenance, current),
-                            ..target
-                        },
-                    );
-                }
-                resolved = true;
-                break;
-            };
-            current = alias.as_str().into();
-        }
-        if !resolved {
+    let unresolved = values.clone();
+    let mut resolved = BTreeMap::new();
+    let mut visiting = BTreeSet::new();
+    let mut edges = 0_u32;
+    for key in unresolved.keys() {
+        let token = resolve_raw_token(
+            key,
+            &unresolved,
+            &mut resolved,
+            &mut visiting,
+            0,
+            max_depth,
+            &mut edges,
+            max_edges,
+        )?;
+        resolved.insert(key.clone(), token);
+    }
+    *values = resolved;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_raw_token(
+    key: &str,
+    unresolved: &BTreeMap<String, RawToken>,
+    resolved: &mut BTreeMap<String, RawToken>,
+    visiting: &mut BTreeSet<String>,
+    depth: u32,
+    max_depth: u32,
+    edges: &mut u32,
+    max_edges: u32,
+) -> Result<RawToken, ThemeError> {
+    if let Some(value) = resolved.get(key) {
+        return Ok(value.clone());
+    }
+    if depth > max_depth {
+        return Err(ThemeError::Resolution(format!(
+            "alias depth exceeds configured maximum at `{key}`"
+        )));
+    }
+    if !visiting.insert(key.to_owned()) {
+        return Err(ThemeError::Resolution(format!("alias cycle at `{key}`")));
+    }
+    let mut token = unresolved
+        .get(key)
+        .cloned()
+        .ok_or_else(|| ThemeError::Resolution(format!("unknown alias target `{key}`")))?;
+
+    if let Some(alias) = dtcg_alias_target(&token.value)? {
+        record_reference_edge(edges, max_edges)?;
+        let target = resolve_raw_token(
+            alias.as_str(),
+            unresolved,
+            resolved,
+            visiting,
+            depth.saturating_add(1),
+            max_depth,
+            edges,
+            max_edges,
+        )?;
+        if target.token_type != token.token_type {
             return Err(ThemeError::Resolution(format!(
-                "alias depth exceeds configured maximum at `{key}`"
+                "alias `{key}` has type `{}` but target `{}` has type `{}`",
+                token.token_type,
+                alias.as_str(),
+                target.token_type
             )));
         }
+        token.value = target.value;
+        token.provenance = format!("{} -> {}", token.provenance, alias.as_str());
+    } else {
+        token.value = resolve_property_aliases(
+            &token.value,
+            unresolved,
+            resolved,
+            visiting,
+            depth,
+            max_depth,
+            edges,
+            max_edges,
+        )?;
+    }
+
+    let token_type = DtcgType::parse(&token.token_type)?;
+    validate_token_value(token_type, &token.value)?;
+    visiting.remove(key);
+    resolved.insert(key.to_owned(), token.clone());
+    Ok(token)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_property_aliases(
+    value: &serde_json::Value,
+    unresolved: &BTreeMap<String, RawToken>,
+    resolved: &mut BTreeMap<String, RawToken>,
+    visiting: &mut BTreeSet<String>,
+    depth: u32,
+    max_depth: u32,
+    edges: &mut u32,
+    max_edges: u32,
+) -> Result<serde_json::Value, ThemeError> {
+    if let Some(alias) = dtcg_alias_target(value)? {
+        record_reference_edge(edges, max_edges)?;
+        return resolve_raw_token(
+            alias.as_str(),
+            unresolved,
+            resolved,
+            visiting,
+            depth.saturating_add(1),
+            max_depth,
+            edges,
+            max_edges,
+        )
+        .map(|token| token.value);
+    }
+    match value {
+        serde_json::Value::Array(values) => values
+            .iter()
+            .map(|value| {
+                resolve_property_aliases(
+                    value, unresolved, resolved, visiting, depth, max_depth, edges, max_edges,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(serde_json::Value::Array),
+        serde_json::Value::Object(values) => values
+            .iter()
+            .map(|(name, value)| {
+                resolve_property_aliases(
+                    value, unresolved, resolved, visiting, depth, max_depth, edges, max_edges,
+                )
+                .map(|value| (name.clone(), value))
+            })
+            .collect::<Result<serde_json::Map<_, _>, _>>()
+            .map(serde_json::Value::Object),
+        _ => Ok(value.clone()),
+    }
+}
+
+fn record_reference_edge(edges: &mut u32, max_edges: u32) -> Result<(), ThemeError> {
+    *edges = edges.saturating_add(1);
+    if *edges > max_edges {
+        return Err(ThemeError::Resolution(
+            "alias graph exceeds limits.referenceEdges".into(),
+        ));
     }
     Ok(())
 }
@@ -682,6 +852,36 @@ mod tests {
                 },
             ),
         ]);
-        assert!(resolve_aliases(&mut values, 1).is_err());
+        assert!(resolve_aliases(&mut values, 1, 8).is_err());
+    }
+
+    #[test]
+    fn property_aliases_resolve_inside_composite_values() {
+        let mut values = BTreeMap::from([
+            (
+                "color.shadow".into(),
+                RawToken {
+                    token_type: "color".into(),
+                    value: serde_json::json!("#000000"),
+                    provenance: "test".into(),
+                },
+            ),
+            (
+                "shadow.card".into(),
+                RawToken {
+                    token_type: "shadow".into(),
+                    value: serde_json::json!({
+                        "color": "{color.shadow}",
+                        "offsetX": {"value": 0, "unit": "px"},
+                        "offsetY": {"value": 1, "unit": "px"},
+                        "blur": {"value": 4, "unit": "px"},
+                        "spread": {"value": 0, "unit": "px"}
+                    }),
+                    provenance: "test".into(),
+                },
+            ),
+        ]);
+        resolve_aliases(&mut values, 8, 8).expect("resolve property alias");
+        assert_eq!(values["shadow.card"].value["color"], "#000000");
     }
 }
