@@ -1,5 +1,5 @@
 use crate::model::KitConfig;
-use crate::{KitTokenContract, ThemeError, read_json, sha256};
+use crate::{KitTokenContract, Limits, LogicalPath, SourceLoader, ThemeError, sha256};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -117,11 +117,16 @@ pub struct PortalCapability {
     pub body_host: bool,
 }
 
-pub fn discover_kit(root: &Path, config: &KitConfig) -> Result<VerifiedKit, ThemeError> {
+pub fn discover_kit(
+    root: &Path,
+    config: &KitConfig,
+    limits: Limits,
+) -> Result<VerifiedKit, ThemeError> {
+    let loader = SourceLoader::new(root, limits)?;
     let mut candidates = Vec::new();
     let mut failures = Vec::new();
     for lock_path in &config.lock_paths {
-        match verify_candidate(root, lock_path, config.contract_path.as_deref()) {
+        match verify_candidate(&loader, lock_path, config.contract_path.as_deref()) {
             Ok(candidate) => candidates.push(candidate),
             Err(error) => failures.push(format!("{lock_path}: {error}")),
         }
@@ -139,12 +144,12 @@ pub fn discover_kit(root: &Path, config: &KitConfig) -> Result<VerifiedKit, Them
 }
 
 fn verify_candidate(
-    root: &Path,
+    loader: &SourceLoader,
     lock_relative: &str,
     explicit_contract: Option<&str>,
 ) -> Result<VerifiedKit, ThemeError> {
-    let lock_path = root.join(lock_relative);
-    let lock: KitLock = read_json(&lock_path)?;
+    let lock_logical = LogicalPath::new(lock_relative.to_owned())?;
+    let lock: KitLock = loader.read_json(&lock_logical)?;
     let record = &lock.theme_integration;
     require_constants(record)?;
     if explicit_contract.is_some_and(|path| path != record.contract_path) {
@@ -152,19 +157,24 @@ fn verify_candidate(
             "candidate does not match explicit contractPath".into(),
         ));
     }
-    let contract_path = root.join(&record.contract_path);
-    let capability_path = root.join(&record.capability_path);
-    let stylesheet_path = root.join(&record.stylesheet_path);
-    verify_digest(&contract_path, &record.contract_bytes_digest)?;
-    verify_digest(&capability_path, &record.capability_bytes_digest)?;
-    verify_digest(&stylesheet_path, &record.stylesheet_bytes_digest)?;
-    let capability: KitCapability = read_json(&capability_path)?;
-    verify_capability(&capability, record, &capability_path, &contract_path)?;
+    let contract_logical = LogicalPath::new(record.contract_path.clone())?;
+    let capability_logical = LogicalPath::new(record.capability_path.clone())?;
+    let stylesheet_logical = LogicalPath::new(record.stylesheet_path.clone())?;
+    verify_digest(loader, &contract_logical, &record.contract_bytes_digest)?;
+    verify_digest(loader, &capability_logical, &record.capability_bytes_digest)?;
+    verify_digest(loader, &stylesheet_logical, &record.stylesheet_bytes_digest)?;
+    let capability: KitCapability = loader.read_json(&capability_logical)?;
+    verify_capability(&capability, record, &capability_logical)?;
+    let contract_path = loader.resolve_file(&contract_logical)?;
+    let capability_path = loader.resolve_file(&capability_logical)?;
+    let stylesheet_path = loader.resolve_file(&stylesheet_logical)?;
     let contract = KitTokenContract::load(&contract_path)?;
     if contract.contract_id != record.contract_id
         || contract.abi_version != record.contract_abi_version
         || contract.revision != record.contract_revision
         || contract.canonical_digest != record.contract_canonical_digest
+        || contract.schema
+            != "https://triesap.github.io/leptos_ui_kit/schema/0.2.0/token-contract.schema.json"
     {
         return Err(ThemeError::Contract(
             "kit lock and token contract identities differ".into(),
@@ -192,7 +202,14 @@ fn require_constants(record: &KitLockRecord) -> Result<(), ThemeError> {
             .eq(LAYER_ORDER)
         && record.portal_abi_version == 1
         && record.portal_mount_type == "web_ui_primitives::leptos::PortalMount"
-        && record.portal_body_host;
+        && record.portal_body_host
+        && valid_digest(&record.contract_canonical_digest)
+        && valid_digest(&record.contract_bytes_digest)
+        && valid_digest(&record.capability_bytes_digest)
+        && valid_digest(&record.stylesheet_bytes_digest)
+        && !record.producer_version.is_empty()
+        && !record.primitives_version.is_empty()
+        && !record.primitives_checksum.is_empty();
     if valid {
         Ok(())
     } else {
@@ -205,13 +222,17 @@ fn require_constants(record: &KitLockRecord) -> Result<(), ThemeError> {
 fn verify_capability(
     capability: &KitCapability,
     lock: &KitLockRecord,
-    capability_path: &Path,
-    contract_path: &Path,
+    capability_path: &LogicalPath,
 ) -> Result<(), ThemeError> {
-    let manifest_contract = capability_path
+    let capability_contract = LogicalPath::new(capability.contract.path.clone())?;
+    let parent = Path::new(capability_path.as_str())
         .parent()
-        .unwrap_or_else(|| Path::new(""))
-        .join(&capability.contract.path);
+        .unwrap_or_else(|| Path::new(""));
+    let manifest_contract = parent.join(capability_contract.as_str());
+    let manifest_contract = manifest_contract
+        .to_str()
+        .ok_or_else(|| ThemeError::Contract("manifest contract path is not UTF-8".into()))?;
+    let manifest_contract = LogicalPath::new(manifest_contract.to_owned())?;
     let valid = capability.schema
         == "https://triesap.github.io/leptos_ui_kit/schema/0.2.0/theme-integration.schema.json"
         && capability.schema_version == "1.0.0"
@@ -224,7 +245,7 @@ fn verify_capability(
         && capability.primitives.version == lock.primitives_version
         && capability.primitives.checksum == lock.primitives_checksum
         && capability.primitives.presence_abi == lock.presence_abi_version
-        && manifest_contract == contract_path
+        && manifest_contract.as_str() == lock.contract_path
         && capability.contract.contract_id == lock.contract_id
         && capability.contract.abi_version == lock.contract_abi_version
         && capability.contract.revision == lock.contract_revision
@@ -246,18 +267,32 @@ fn verify_capability(
     }
 }
 
-fn verify_digest(path: &Path, expected: &str) -> Result<(), ThemeError> {
-    let bytes = std::fs::read(path).map_err(|source| ThemeError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
+fn verify_digest(
+    loader: &SourceLoader,
+    path: &LogicalPath,
+    expected: &str,
+) -> Result<(), ThemeError> {
+    if !valid_digest(expected) {
+        return Err(ThemeError::Contract(format!(
+            "installed byte digest for `{path}` is malformed"
+        )));
+    }
+    let bytes = loader.read_bytes(path)?;
     let actual = format!("sha256:{}", sha256(&bytes));
     if actual == expected {
         Ok(())
     } else {
         Err(ThemeError::Contract(format!(
-            "installed byte digest mismatch for {}",
-            path.display()
+            "installed byte digest mismatch for `{path}`"
         )))
     }
+}
+
+fn valid_digest(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
 }

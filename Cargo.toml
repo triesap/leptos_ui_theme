@@ -22,6 +22,7 @@ unsafe_code = "forbid"
 clap = { version = "4.5.50", features = ["derive"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.145", features = ["preserve_order"] }
+serde_json_canonicalizer = "0.3.2"
 sha2 = "0.10.9"
 thiserror = "2.0.17"
 

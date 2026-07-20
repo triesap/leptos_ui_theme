@@ -62,7 +62,7 @@ impl ThemeCompiler {
         let config_path = root.join(CONFIG_FILE);
         let config: ProjectConfig = read_json(&config_path)?;
         config.validate()?;
-        let kit = discover_kit(&root, &config.kit)?;
+        let kit = discover_kit(&root, &config.kit, config.limits.clone())?;
         let contract_path = kit.contract_path;
         let contract = kit.contract;
         let loader = SourceLoader::new(&root, config.limits.clone())?;
@@ -715,7 +715,7 @@ mod tests {
             "revision": 2,
             "dtcgVersion": "2025.10",
             "dtcgProfile": "format+color+resolver:2025.10",
-            "canonicalDigest": "unused",
+            "canonicalDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
             "tokens": [
                 {
                     "path": "color.legacy",

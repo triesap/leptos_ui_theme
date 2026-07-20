@@ -1,4 +1,4 @@
-use crate::{ThemeError, sha256};
+use crate::{DtcgType, ThemeError, dtcg_alias_target, read_json, sha256, validate_token_value};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -91,15 +91,7 @@ pub enum ContractCompatibility {
 
 impl KitTokenContract {
     pub fn load(path: &Path) -> Result<Self, ThemeError> {
-        let bytes = std::fs::read(path).map_err(|source| ThemeError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        let value: serde_json::Value =
-            serde_json::from_slice(&bytes).map_err(|source| ThemeError::Json {
-                path: path.to_path_buf(),
-                source,
-            })?;
+        let value: serde_json::Value = read_json(path)?;
         let contract: Self =
             serde_json::from_value(value.clone()).map_err(|source| ThemeError::Json {
                 path: path.to_path_buf(),
@@ -107,13 +99,11 @@ impl KitTokenContract {
             })?;
         contract.validate()?;
         let actual = canonical_contract_digest(&value)?;
-        let expected = contract
-            .canonical_digest
-            .strip_prefix("sha256:")
-            .unwrap_or(&contract.canonical_digest);
-        if expected != actual {
+        let expected = format!("sha256:{actual}");
+        if contract.canonical_digest != expected {
             return Err(ThemeError::Contract(format!(
-                "canonical digest mismatch: declared {expected}, computed {actual}"
+                "canonical digest mismatch: declared {}, computed {expected}",
+                contract.canonical_digest
             )));
         }
         Ok(contract)
@@ -147,6 +137,18 @@ impl KitTokenContract {
                 "token mapping inventory is empty".into(),
             ));
         }
+        if !valid_digest(&self.canonical_digest) {
+            return Err(ThemeError::Contract(
+                "canonicalDigest is not a SHA-256 wire value".into(),
+            ));
+        }
+        for namespace in self.extensions.keys() {
+            if !valid_extension_namespace(namespace) {
+                return Err(ThemeError::Contract(format!(
+                    "invalid extension namespace `{namespace}`"
+                )));
+            }
+        }
         let mut paths = BTreeSet::new();
         let mut properties = BTreeSet::new();
         let mut orders = BTreeSet::new();
@@ -169,6 +171,32 @@ impl KitTokenContract {
                     "required mapping `{}` has no default",
                     mapping.path
                 )));
+            }
+            let token_type = DtcgType::parse(&mapping.token_type).map_err(|_| {
+                ThemeError::Contract(format!(
+                    "mapping `{}` has unsupported DTCG type `{}`",
+                    mapping.path, mapping.token_type
+                ))
+            })?;
+            if mapping.required && !supported_serializer(token_type) {
+                return Err(ThemeError::Contract(format!(
+                    "required mapping `{}` uses an unsupported ABI v1 serializer",
+                    mapping.path
+                )));
+            }
+            if let Some(default) = &mapping.default {
+                if contains_alias(default)? {
+                    return Err(ThemeError::Contract(format!(
+                        "mapping `{}` has a non-concrete default",
+                        mapping.path
+                    )));
+                }
+                validate_token_value(token_type, default).map_err(|error| {
+                    ThemeError::Contract(format!(
+                        "mapping `{}` has an invalid typed default: {error}",
+                        mapping.path
+                    ))
+                })?;
             }
             previous = Some(mapping.order);
         }
@@ -199,8 +227,7 @@ impl KitTokenContract {
         }
         let mut contrast_ids = BTreeSet::new();
         for check in &self.contrast_checks {
-            if check.id.is_empty()
-                || check.id.len() > 63
+            if !valid_identifier(&check.id)
                 || !check.minimum.is_finite()
                 || !(1.0..=21.0).contains(&check.minimum)
                 || !contrast_ids.insert(&check.id)
@@ -211,6 +238,37 @@ impl KitTokenContract {
                     "invalid contrast check `{}`",
                     check.id
                 )));
+            }
+            for path in [&check.foreground, &check.background] {
+                let terminal = self.terminal_mapping(path)?;
+                if terminal.token_type != "color" {
+                    return Err(ThemeError::Contract(format!(
+                        "contrast check `{}` references non-color mapping `{path}`",
+                        check.id
+                    )));
+                }
+            }
+            if let Some(alternatives) = &check.composite_on {
+                if alternatives.is_empty() || alternatives.iter().any(Vec::is_empty) {
+                    return Err(ThemeError::Contract(format!(
+                        "contrast check `{}` has an empty compositing alternative",
+                        check.id
+                    )));
+                }
+                for stack in alternatives {
+                    let mut seen = BTreeSet::new();
+                    for path in stack {
+                        if !seen.insert(path)
+                            || path == &check.background
+                            || self.terminal_mapping(path)?.token_type != "color"
+                        {
+                            return Err(ThemeError::Contract(format!(
+                                "contrast check `{}` has an invalid compositing path `{path}`",
+                                check.id
+                            )));
+                        }
+                    }
+                }
             }
         }
         Ok(compatibility)
@@ -246,7 +304,7 @@ impl KitTokenContract {
             path: path.to_path_buf(),
             source,
         })?;
-        Ok(sha256(&bytes))
+        Ok(format!("sha256:{}", sha256(&bytes)))
     }
 }
 
@@ -256,53 +314,89 @@ pub fn canonical_contract_digest(value: &serde_json::Value) -> Result<String, Th
         .as_object_mut()
         .ok_or_else(|| ThemeError::Contract("token contract must be an object".into()))?
         .remove("canonicalDigest");
-    let mut bytes = Vec::new();
-    write_canonical(&semantic, &mut bytes)?;
+    validate_ijson(&semantic)?;
+    let bytes = serde_json_canonicalizer::to_vec(&semantic)
+        .map_err(|error| ThemeError::Contract(format!("cannot canonicalize contract: {error}")))?;
     Ok(sha256(&bytes))
 }
 
-fn write_canonical(value: &serde_json::Value, output: &mut Vec<u8>) -> Result<(), ThemeError> {
+fn validate_ijson(value: &serde_json::Value) -> Result<(), ThemeError> {
     match value {
-        serde_json::Value::Null => output.extend_from_slice(b"null"),
-        serde_json::Value::Bool(value) => {
-            output.extend_from_slice(if *value { b"true" } else { b"false" })
-        }
-        serde_json::Value::Number(value) => output.extend_from_slice(value.to_string().as_bytes()),
-        serde_json::Value::String(value) => output.extend_from_slice(
-            serde_json::to_string(value)
-                .map_err(|error| ThemeError::Contract(error.to_string()))?
-                .as_bytes(),
-        ),
-        serde_json::Value::Array(values) => {
-            output.push(b'[');
-            for (index, value) in values.iter().enumerate() {
-                if index != 0 {
-                    output.push(b',');
+        serde_json::Value::Number(value) => {
+            if let Some(integer) = value.as_i64() {
+                if !(-9_007_199_254_740_991..=9_007_199_254_740_991).contains(&integer) {
+                    return Err(ThemeError::Contract(
+                        "contract integer exceeds the I-JSON interoperable range".into(),
+                    ));
                 }
-                write_canonical(value, output)?;
+            } else if let Some(integer) = value.as_u64() {
+                if integer > 9_007_199_254_740_991 {
+                    return Err(ThemeError::Contract(
+                        "contract integer exceeds the I-JSON interoperable range".into(),
+                    ));
+                }
+            } else {
+                let number = value
+                    .as_f64()
+                    .filter(|number| number.is_finite())
+                    .ok_or_else(|| ThemeError::Contract("contract number is not finite".into()))?;
+                if number.fract() == 0.0 && number.abs() > 9_007_199_254_740_991.0 {
+                    return Err(ThemeError::Contract(
+                        "contract integer exceeds the I-JSON interoperable range".into(),
+                    ));
+                }
             }
-            output.push(b']');
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                validate_ijson(value)?;
+            }
         }
         serde_json::Value::Object(values) => {
-            output.push(b'{');
-            let mut entries: Vec<_> = values.iter().collect();
-            entries.sort_by(|(left, _), (right, _)| left.encode_utf16().cmp(right.encode_utf16()));
-            for (index, (key, value)) in entries.into_iter().enumerate() {
-                if index != 0 {
-                    output.push(b',');
-                }
-                output.extend_from_slice(
-                    serde_json::to_string(key)
-                        .map_err(|error| ThemeError::Contract(error.to_string()))?
-                        .as_bytes(),
-                );
-                output.push(b':');
-                write_canonical(value, output)?;
+            for value in values.values() {
+                validate_ijson(value)?;
             }
-            output.push(b'}');
         }
+        _ => {}
     }
     Ok(())
+}
+
+fn contains_alias(value: &serde_json::Value) -> Result<bool, ThemeError> {
+    if dtcg_alias_target(value)?.is_some() {
+        return Ok(true);
+    }
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                if contains_alias(value)? {
+                    return Ok(true);
+                }
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values() {
+                if contains_alias(value)? {
+                    return Ok(true);
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+fn supported_serializer(token_type: DtcgType) -> bool {
+    matches!(
+        token_type,
+        DtcgType::Color
+            | DtcgType::Dimension
+            | DtcgType::Duration
+            | DtcgType::Number
+            | DtcgType::CubicBezier
+            | DtcgType::Shadow
+            | DtcgType::FontFamily
+    )
 }
 
 fn valid_mapping_path(value: &str) -> bool {
@@ -328,4 +422,40 @@ fn valid_property(value: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
         && !value.ends_with('-')
         && !value[6..].contains("--")
+}
+
+fn valid_identifier(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 63
+        && bytes[0].is_ascii_lowercase()
+        && bytes[bytes.len() - 1].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+        && !value.contains("--")
+}
+
+fn valid_extension_namespace(value: &str) -> bool {
+    value.len() <= 253
+        && value.contains('.')
+        && value.split('.').all(|segment| {
+            let bytes = segment.as_bytes();
+            !bytes.is_empty()
+                && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
+                && (bytes[bytes.len() - 1].is_ascii_lowercase()
+                    || bytes[bytes.len() - 1].is_ascii_digit())
+                && bytes
+                    .iter()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+        })
+}
+
+fn valid_digest(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
 }
