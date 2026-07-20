@@ -168,7 +168,7 @@ impl ThemeCompiler {
             }
         }
 
-        resolve_aliases(&mut raw, self.config.limits.max_reference_depth)?;
+        resolve_aliases(&mut raw, self.config.limits.reference_depth)?;
         apply_deprecations(&self.contract, &mut raw)?;
         let mut values = Vec::with_capacity(self.contract.tokens.len());
         for mapping in &self.contract.tokens {

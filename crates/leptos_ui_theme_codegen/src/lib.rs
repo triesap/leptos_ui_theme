@@ -165,7 +165,11 @@ pub fn build(root: &Path) -> Result<BuildResult, CodegenError> {
         bytes: lock_bytes,
     });
     let total: usize = artifacts.iter().map(|artifact| artifact.bytes.len()).sum();
-    if total as u64 > compiler.config.limits.max_output_bytes {
+    if total as u64 > compiler.config.limits.generated_bytes
+        || artifacts.iter().any(|artifact| {
+            artifact.bytes.len() as u64 > compiler.config.limits.generated_artifact_bytes
+        })
+    {
         return Err(CodegenError::OutputLimit);
     }
     Ok(BuildResult {

@@ -3,16 +3,24 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const COMPILED_LIMITS: Limits = Limits {
-    max_file_bytes: 16_777_216,
-    max_files: 4_096,
-    max_json_depth: 256,
-    max_tokens: 100_000,
-    max_references: 500_000,
-    max_reference_depth: 256,
-    max_resolver_nodes: 500_000,
-    max_profiles: 256,
-    max_output_bytes: 67_108_864,
-    max_diagnostics: 10_000,
+    file_bytes: 16_777_216,
+    files: 8_192,
+    aggregate_input_bytes: 536_870_912,
+    source_files: 4_096,
+    journal_entries: 1_024,
+    evidence_manifests: 4_096,
+    retained_backups: 4_096,
+    retained_backup_bytes: 536_870_912,
+    json_depth: 256,
+    tokens: 100_000,
+    reference_edges: 500_000,
+    reference_depth: 256,
+    resolver_nodes: 500_000,
+    profiles: 256,
+    resolver_contexts: 512,
+    generated_bytes: 134_217_728,
+    generated_artifact_bytes: 16_777_216,
+    diagnostics: 10_000,
 };
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -173,16 +181,24 @@ pub struct HtmlConfig {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Limits {
-    pub max_file_bytes: u64,
-    pub max_files: u32,
-    pub max_json_depth: u32,
-    pub max_tokens: u32,
-    pub max_references: u32,
-    pub max_reference_depth: u32,
-    pub max_resolver_nodes: u32,
-    pub max_profiles: u32,
-    pub max_output_bytes: u64,
-    pub max_diagnostics: u32,
+    pub file_bytes: u64,
+    pub files: u32,
+    pub aggregate_input_bytes: u64,
+    pub source_files: u32,
+    pub journal_entries: u32,
+    pub evidence_manifests: u32,
+    pub retained_backups: u32,
+    pub retained_backup_bytes: u64,
+    pub json_depth: u32,
+    pub tokens: u32,
+    pub reference_edges: u32,
+    pub reference_depth: u32,
+    pub resolver_nodes: u32,
+    pub profiles: u32,
+    pub resolver_contexts: u32,
+    pub generated_bytes: u64,
+    pub generated_artifact_bytes: u64,
+    pub diagnostics: u32,
 }
 
 impl Default for ProjectConfig {
@@ -248,16 +264,24 @@ impl Default for ProjectConfig {
             },
             runtime_evidence: None,
             limits: Limits {
-                max_file_bytes: 1_048_576,
-                max_files: 256,
-                max_json_depth: 64,
-                max_tokens: 10_000,
-                max_references: 50_000,
-                max_reference_depth: 64,
-                max_resolver_nodes: 50_000,
-                max_profiles: 64,
-                max_output_bytes: 4_194_304,
-                max_diagnostics: 1_000,
+                file_bytes: 2_097_152,
+                files: 1_024,
+                aggregate_input_bytes: 67_108_864,
+                source_files: 512,
+                journal_entries: 128,
+                evidence_manifests: 512,
+                retained_backups: 128,
+                retained_backup_bytes: 67_108_864,
+                json_depth: 64,
+                tokens: 25_000,
+                reference_edges: 125_000,
+                reference_depth: 64,
+                resolver_nodes: 12_500,
+                profiles: 128,
+                resolver_contexts: 128,
+                generated_bytes: 16_777_216,
+                generated_artifact_bytes: 2_097_152,
+                diagnostics: 1_250,
             },
         }
     }
@@ -292,7 +316,7 @@ impl ProjectConfig {
             ));
         }
         if self.profiles.named.is_empty()
-            || self.profiles.named.len() > self.limits.max_profiles as usize
+            || self.profiles.named.len() > self.limits.profiles as usize
         {
             return Err(ThemeError::Config(
                 "profile count is outside configured limits".into(),
@@ -443,7 +467,7 @@ impl ProjectConfig {
             }
             let unique: BTreeSet<_> = axis.contexts.iter().collect();
             if unique.len() != axis.contexts.len()
-                || axis.contexts.len() > self.limits.max_profiles as usize
+                || axis.contexts.len() > self.limits.resolver_contexts as usize
                 || !unique.contains(&axis.default_context)
             {
                 return Err(ThemeError::Config(format!(
@@ -596,55 +620,91 @@ fn validate_attribute(value: &str) -> Result<(), ThemeError> {
 impl Limits {
     pub fn validate(&self) -> Result<(), ThemeError> {
         for (name, value, compiled) in [
+            ("fileBytes", self.file_bytes, COMPILED_LIMITS.file_bytes),
             (
-                "maxFileBytes",
-                self.max_file_bytes,
-                COMPILED_LIMITS.max_file_bytes,
+                "files",
+                u64::from(self.files),
+                u64::from(COMPILED_LIMITS.files),
             ),
             (
-                "maxFiles",
-                u64::from(self.max_files),
-                u64::from(COMPILED_LIMITS.max_files),
+                "aggregateInputBytes",
+                self.aggregate_input_bytes,
+                COMPILED_LIMITS.aggregate_input_bytes,
             ),
             (
-                "maxJsonDepth",
-                u64::from(self.max_json_depth),
-                u64::from(COMPILED_LIMITS.max_json_depth),
+                "sourceFiles",
+                u64::from(self.source_files),
+                u64::from(COMPILED_LIMITS.source_files),
             ),
             (
-                "maxTokens",
-                u64::from(self.max_tokens),
-                u64::from(COMPILED_LIMITS.max_tokens),
+                "journalEntries",
+                u64::from(self.journal_entries),
+                u64::from(COMPILED_LIMITS.journal_entries),
             ),
             (
-                "maxReferences",
-                u64::from(self.max_references),
-                u64::from(COMPILED_LIMITS.max_references),
+                "evidenceManifests",
+                u64::from(self.evidence_manifests),
+                u64::from(COMPILED_LIMITS.evidence_manifests),
             ),
             (
-                "maxReferenceDepth",
-                u64::from(self.max_reference_depth),
-                u64::from(COMPILED_LIMITS.max_reference_depth),
+                "retainedBackups",
+                u64::from(self.retained_backups),
+                u64::from(COMPILED_LIMITS.retained_backups),
             ),
             (
-                "maxResolverNodes",
-                u64::from(self.max_resolver_nodes),
-                u64::from(COMPILED_LIMITS.max_resolver_nodes),
+                "retainedBackupBytes",
+                self.retained_backup_bytes,
+                COMPILED_LIMITS.retained_backup_bytes,
             ),
             (
-                "maxProfiles",
-                u64::from(self.max_profiles),
-                u64::from(COMPILED_LIMITS.max_profiles),
+                "jsonDepth",
+                u64::from(self.json_depth),
+                u64::from(COMPILED_LIMITS.json_depth),
             ),
             (
-                "maxOutputBytes",
-                self.max_output_bytes,
-                COMPILED_LIMITS.max_output_bytes,
+                "tokens",
+                u64::from(self.tokens),
+                u64::from(COMPILED_LIMITS.tokens),
             ),
             (
-                "maxDiagnostics",
-                u64::from(self.max_diagnostics),
-                u64::from(COMPILED_LIMITS.max_diagnostics),
+                "referenceEdges",
+                u64::from(self.reference_edges),
+                u64::from(COMPILED_LIMITS.reference_edges),
+            ),
+            (
+                "referenceDepth",
+                u64::from(self.reference_depth),
+                u64::from(COMPILED_LIMITS.reference_depth),
+            ),
+            (
+                "resolverNodes",
+                u64::from(self.resolver_nodes),
+                u64::from(COMPILED_LIMITS.resolver_nodes),
+            ),
+            (
+                "profiles",
+                u64::from(self.profiles),
+                u64::from(COMPILED_LIMITS.profiles),
+            ),
+            (
+                "resolverContexts",
+                u64::from(self.resolver_contexts),
+                u64::from(COMPILED_LIMITS.resolver_contexts),
+            ),
+            (
+                "generatedBytes",
+                self.generated_bytes,
+                COMPILED_LIMITS.generated_bytes,
+            ),
+            (
+                "generatedArtifactBytes",
+                self.generated_artifact_bytes,
+                COMPILED_LIMITS.generated_artifact_bytes,
+            ),
+            (
+                "diagnostics",
+                u64::from(self.diagnostics),
+                u64::from(COMPILED_LIMITS.diagnostics),
             ),
         ] {
             if value == 0 || value > compiled {

@@ -69,7 +69,7 @@ impl SourceLoader {
             path: path.clone(),
             source,
         })?;
-        if metadata.len() > self.limits.max_file_bytes {
+        if metadata.len() > self.limits.file_bytes {
             return Err(ThemeError::Config(format!(
                 "source `{logical}` exceeds limits.maxFileBytes"
             )));
@@ -80,7 +80,7 @@ impl SourceLoader {
     pub fn read_json<T: DeserializeOwned>(&self, logical: &LogicalPath) -> Result<T, ThemeError> {
         let path = self.resolve_file(logical)?;
         let bytes = self.read_bytes(logical)?;
-        parse_json(&path, &bytes, self.limits.max_json_depth)
+        parse_json(&path, &bytes, self.limits.json_depth)
     }
 }
 
@@ -91,7 +91,7 @@ pub(crate) fn read_json_file<T: DeserializeOwned>(path: &Path) -> Result<T, Them
     })?;
     if metadata.file_type().is_symlink()
         || !metadata.is_file()
-        || metadata.len() > COMPILED_LIMITS.max_file_bytes
+        || metadata.len() > COMPILED_LIMITS.file_bytes
     {
         return Err(ThemeError::Security(format!(
             "JSON input is not a bounded regular file: {}",
@@ -102,7 +102,7 @@ pub(crate) fn read_json_file<T: DeserializeOwned>(path: &Path) -> Result<T, Them
         path: path.to_path_buf(),
         source,
     })?;
-    parse_json(path, &bytes, COMPILED_LIMITS.max_json_depth)
+    parse_json(path, &bytes, COMPILED_LIMITS.json_depth)
 }
 
 fn parse_json<T: DeserializeOwned>(
