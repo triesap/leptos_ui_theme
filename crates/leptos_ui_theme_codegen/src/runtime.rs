@@ -103,6 +103,9 @@ impl ThemeController {
     }
 
     pub fn set_preference(self, preference: ThemePreference) {
+        if self.preference.get_untracked() == preference {
+            return;
+        }
         self.preference.set(preference);
         if let Err(issue) = browser::apply(preference) {
             self.latest_issue.set(Some(issue));
@@ -372,10 +375,16 @@ mod browser {
             .and_then(|document| document.document_element())
             .ok_or(RuntimeIssue::DomApplyFailed)?;
         match preference {
-            ThemePreference::System => root.remove_attribute(THEME_ATTRIBUTE),
-            ThemePreference::Named(theme) => {
+            ThemePreference::System if root.has_attribute(THEME_ATTRIBUTE) => {
+                root.remove_attribute(THEME_ATTRIBUTE)
+            }
+            ThemePreference::Named(theme)
+                if root.get_attribute(THEME_ATTRIBUTE).as_deref()
+                    != Some(theme.as_str()) =>
+            {
                 root.set_attribute(THEME_ATTRIBUTE, theme.as_str())
             }
+            ThemePreference::System | ThemePreference::Named(_) => Ok(()),
         }
         .map_err(|_| RuntimeIssue::DomApplyFailed)
     }
@@ -540,7 +549,7 @@ pub fn ThemeScope(
     let effective_theme = Signal::derive(move || {
         theme
             .get()
-            .or_else(|| parent_theme.and_then(Signal::get))
+            .or_else(|| parent_theme.and_then(|signal| signal.get()))
     });
     let portal_mount = create_portal_mount(provide_portal_host).or_else(|| {
         parent
@@ -572,9 +581,14 @@ fn create_portal_mount(enabled: bool) -> Option<PortalMount> {
         .document()?;
     let body = document.body()?;
     let host = document.create_element("div").ok()?;
+    host.set_attribute("data-leptos-ui-theme-portal-host", "")
+        .ok()?;
     body.append_child(&host).ok()?;
     let cleanup = StoredValue::new_local((body, host.clone()));
     on_cleanup(move || {
+        // Leptos disposes child owners before parent cleanup callbacks. A
+        // web_ui_primitives Portal therefore drops its mount handle and
+        // removes portaled content before this scope-owned host is removed.
         if let Some((body, host)) = cleanup.into_inner() {
             let _ = body.remove_child(&host);
         }
@@ -599,12 +613,16 @@ fn sync_portal_theme(
         return;
     };
     Effect::new(move |_| match effective_theme.get() {
-        Some(theme) => {
+        Some(theme)
+            if host.get_attribute(THEME_ATTRIBUTE).as_deref()
+                != Some(theme.as_str()) =>
+        {
             let _ = host.set_attribute(THEME_ATTRIBUTE, theme.as_str());
         }
-        None => {
+        None if host.has_attribute(THEME_ATTRIBUTE) => {
             let _ = host.remove_attribute(THEME_ATTRIBUTE);
         }
+        Some(_) | None => {}
     });
 }
 "#
@@ -633,9 +651,11 @@ mod tests {
         let scope = seeded_scope(&ProjectConfig::default());
 
         assert!(scope.contains("pub effective_theme: Signal<Option<ThemeId>>"));
-        assert!(scope.contains("parent_theme.and_then(Signal::get)"));
+        assert!(scope.contains("parent_theme.and_then(|signal| signal.get())"));
         assert!(scope.contains("scope.portal_mount.clone()"));
         assert!(scope.contains("cleanup.into_inner()"));
+        assert!(scope.contains("data-leptos-ui-theme-portal-host"));
+        assert!(scope.contains("host.get_attribute(THEME_ATTRIBUTE)"));
     }
 
     #[test]
@@ -646,6 +666,8 @@ mod tests {
         assert!(controller.contains("pub enum RuntimeIssue"));
         assert!(controller.contains("\"storage\""));
         assert!(controller.contains("\"matchMedia\""));
+        assert!(controller.contains("self.preference.get_untracked() == preference"));
+        assert!(controller.contains("root.get_attribute(THEME_ATTRIBUTE)"));
         assert_eq!(
             controller
                 .matches("let parsed_outcome = match outcome.as_str()")
