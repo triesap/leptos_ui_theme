@@ -20,6 +20,18 @@ leptos_ui_theme doctor --strict
 `doctor --strict` inspect the project without writing. The tool never edits
 kit-owned files or application dependencies.
 
+## Leptos render modes
+
+Generated theme source is render-mode neutral. Final applications select CSR,
+hydration, or SSR without the theme dependency plan forcing CSR.
+
+The first-paint compiler owns one canonical bootstrap script semantics with
+two security projections: an exact hash-authorized CSR snippet and a
+per-response nonce template for SSR. Hydration must attach to deterministic
+server component state before adopting the browser bootstrap outcome. Stored
+theme selection may change document colors before hydration, but it must not
+rewrite the component DOM being hydrated.
+
 ## Contributing
 
 See `CONTRIBUTING.md`.

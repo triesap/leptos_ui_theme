@@ -7,6 +7,9 @@ Semantic Versioning.
 
 ## [Unreleased]
 
+- Define render-neutral CSR, hydration, and SSR dependency compatibility.
+- Derive hash and nonce first-paint projections from one script contract.
+- Require hydration-stable browser adoption after the server DOM is attached.
 - Add the three-crate compiler workspace, DTCG resolution, deterministic CSS
   and Rust generation, locks, and the `init`, `add`, `build`, `check`, `list`,
   `explain`, and strict `doctor` CLI flows.
