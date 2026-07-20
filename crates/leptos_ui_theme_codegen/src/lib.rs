@@ -3,7 +3,8 @@
 
 use leptos_ui_theme_core::{
     BootstrapMode, ColorScheme, ProjectConfig, ResolvedProfile, ResolvedToken, ThemeCompiler,
-    ThemeError, TokenDomain, parse_color, sha256,
+    ThemeError, TokenDomain, format_css_number, serialize_color_fallback, serialize_color_modern,
+    sha256,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -527,13 +528,7 @@ fn selector_block<'a>(
 }
 
 fn has_modern_color(token: &ResolvedToken) -> bool {
-    token.token_type == "color"
-        && token.alias_of.is_none()
-        && token
-            .value
-            .get("colorSpace")
-            .and_then(serde_json::Value::as_str)
-            == Some("oklch")
+    token.alias_of.is_none() && matches!(token.token_type.as_str(), "color" | "shadow")
 }
 
 fn serialize_css(token: &ResolvedToken, mode: CssMode) -> Result<String, CodegenError> {
@@ -541,89 +536,195 @@ fn serialize_css(token: &ResolvedToken, mode: CssMode) -> Result<String, Codegen
         path: token.path.clone(),
         reason: reason.into(),
     };
-    match &token.value {
-        serde_json::Value::String(value) => {
-            if value.contains([';', '{', '}']) {
-                Err(fail("unsafe string value"))
-            } else {
-                Ok(value.clone())
-            }
+    if token.alias_of.is_some() {
+        return token
+            .value
+            .as_str()
+            .filter(|value| {
+                value.starts_with("var(--kit-")
+                    && value.ends_with(')')
+                    && !value.contains([';', '{', '}', '\n', '\r'])
+            })
+            .map(str::to_owned)
+            .ok_or_else(|| fail("invalid deprecated property alias"));
+    }
+    match token.token_type.as_str() {
+        "color" => match mode {
+            CssMode::Fallback => serialize_color_fallback(&token.value),
+            CssMode::Modern => serialize_color_modern(&token.value),
         }
-        serde_json::Value::Number(value) => Ok(value.to_string()),
-        serde_json::Value::Bool(value) => Ok(value.to_string()),
-        serde_json::Value::Object(object) => {
-            if token.token_type == "color" && mode == CssMode::Fallback {
-                let color = parse_color(&token.value).map_err(CodegenError::Core)?;
-                return Ok(format!(
-                    "rgb({} {} {} / {})",
-                    format_number(color.red * 255.0),
-                    format_number(color.green * 255.0),
-                    format_number(color.blue * 255.0),
-                    format_number(color.alpha)
-                ));
-            }
-            if let (Some(value), Some(unit)) = (
-                object.get("value").and_then(serde_json::Value::as_f64),
-                object.get("unit").and_then(serde_json::Value::as_str),
-            ) {
-                if !unit
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphabetic() || byte == b'%')
-                {
-                    return Err(fail("invalid unit"));
-                }
-                return Ok(format_number(value) + unit);
-            }
-            if let (Some(space), Some(components)) = (
-                object.get("colorSpace").and_then(serde_json::Value::as_str),
-                object
-                    .get("components")
-                    .and_then(serde_json::Value::as_array),
-            ) {
-                if components.len() != 3
-                    || !space
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-                {
-                    return Err(fail("invalid color"));
-                }
-                let components = components
-                    .iter()
-                    .map(|value| {
-                        value
-                            .as_f64()
-                            .map(format_number)
-                            .ok_or_else(|| fail("invalid color component"))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let alpha = object
-                    .get("alpha")
-                    .and_then(serde_json::Value::as_f64)
-                    .unwrap_or(1.0);
-                let components = components.join(" ");
-                let alpha = format_number(alpha);
-                return match space {
-                    "oklch" => Ok(format!("oklch({components} / {alpha})")),
-                    "srgb" | "display-p3" => Ok(format!("color({space} {components} / {alpha})")),
-                    _ => Err(fail("unsupported color space")),
-                };
-            }
-            Err(fail("unsupported object value"))
+        .map_err(CodegenError::Core),
+        "dimension" => {
+            serialize_unit(&token.value, &["px", "rem"], 1.0, false).map_err(|reason| fail(&reason))
         }
-        _ => Err(fail("unsupported JSON value")),
+        "duration" => serialize_duration(&token.value).map_err(|reason| fail(&reason)),
+        "number" => token
+            .value
+            .as_f64()
+            .ok_or_else(|| fail("number must be numeric"))
+            .and_then(|value| format_css_number(value).map_err(CodegenError::Core)),
+        "cubicBezier" => serialize_cubic_bezier(&token.value).map_err(|reason| fail(&reason)),
+        "fontFamily" => serialize_font_family(&token.value).map_err(|reason| fail(&reason)),
+        "shadow" => serialize_shadow(&token.value, mode).map_err(CodegenError::Core),
+        _ => Err(fail("unsupported ABI v1 serializer type")),
     }
 }
 
-fn format_number(value: f64) -> String {
-    let value = if value == 0.0 { 0.0 } else { value };
-    let mut rendered = format!("{value:.6}");
-    while rendered.contains('.') && rendered.ends_with('0') {
-        rendered.pop();
+fn serialize_unit(
+    value: &serde_json::Value,
+    units: &[&str],
+    multiplier: f64,
+    nonnegative: bool,
+) -> Result<String, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "unit value must be an object".to_owned())?;
+    if object.len() != 2 || !object.contains_key("value") || !object.contains_key("unit") {
+        return Err("unit value has missing or unknown members".into());
     }
-    if rendered.ends_with('.') {
-        rendered.pop();
+    let number = object["value"]
+        .as_f64()
+        .filter(|number| number.is_finite())
+        .ok_or_else(|| "unit value must be finite".to_owned())?;
+    if nonnegative && number < 0.0 {
+        return Err("unit value cannot be negative".into());
     }
-    rendered
+    let unit = object["unit"]
+        .as_str()
+        .filter(|unit| units.contains(unit))
+        .ok_or_else(|| "unit is unsupported".to_owned())?;
+    format_css_number(number * multiplier)
+        .map(|number| format!("{number}{unit}"))
+        .map_err(|error| error.to_string())
+}
+
+fn serialize_duration(value: &serde_json::Value) -> Result<String, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "duration must be an object".to_owned())?;
+    let unit = object
+        .get("unit")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "duration unit is missing".to_owned())?;
+    let multiplier = match unit {
+        "ms" => 1.0,
+        "s" => 1_000.0,
+        _ => return Err("duration unit is unsupported".into()),
+    };
+    let mut rendered = serialize_unit(value, &["ms", "s"], multiplier, true)?;
+    if unit == "s" {
+        rendered.truncate(rendered.len() - 1);
+        rendered.push_str("ms");
+    }
+    Ok(rendered)
+}
+
+fn serialize_cubic_bezier(value: &serde_json::Value) -> Result<String, String> {
+    let values = value
+        .as_array()
+        .filter(|values| values.len() == 4)
+        .ok_or_else(|| "cubicBezier must contain four values".to_owned())?;
+    let values = values
+        .iter()
+        .map(|value| {
+            value
+                .as_f64()
+                .ok_or_else(|| "cubicBezier value must be numeric".to_owned())
+                .and_then(|value| format_css_number(value).map_err(|error| error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(format!(
+        "cubic-bezier({}, {}, {}, {})",
+        values[0], values[1], values[2], values[3]
+    ))
+}
+
+fn serialize_font_family(value: &serde_json::Value) -> Result<String, String> {
+    let families = if let Some(value) = value.as_str() {
+        vec![value]
+    } else {
+        value
+            .as_array()
+            .ok_or_else(|| "fontFamily must be a string or array".to_owned())?
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .ok_or_else(|| "fontFamily entry must be a string".to_owned())
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    const GENERICS: &[&str] = &[
+        "serif",
+        "sans-serif",
+        "monospace",
+        "cursive",
+        "fantasy",
+        "system-ui",
+        "ui-serif",
+        "ui-sans-serif",
+        "ui-monospace",
+        "ui-rounded",
+        "math",
+        "fangsong",
+    ];
+    Ok(families
+        .into_iter()
+        .map(|family| {
+            if GENERICS.contains(&family) {
+                family.to_owned()
+            } else {
+                format!("\"{}\"", family.replace('\\', "\\\\").replace('"', "\\\""))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", "))
+}
+
+fn serialize_shadow(value: &serde_json::Value, mode: CssMode) -> Result<String, ThemeError> {
+    let values = value
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_else(|| std::slice::from_ref(value));
+    values
+        .iter()
+        .map(|value| serialize_shadow_entry(value, mode))
+        .collect::<Result<Vec<_>, _>>()
+        .map(|values| values.join(", "))
+}
+
+fn serialize_shadow_entry(value: &serde_json::Value, mode: CssMode) -> Result<String, ThemeError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| ThemeError::Resolution("shadow entry must be an object".into()))?;
+    let dimension = |name: &str| {
+        object
+            .get(name)
+            .ok_or_else(|| ThemeError::Resolution(format!("shadow `{name}` is missing")))
+            .and_then(|value| {
+                serialize_unit(value, &["px", "rem"], 1.0, false).map_err(ThemeError::Resolution)
+            })
+    };
+    let color_value = object
+        .get("color")
+        .ok_or_else(|| ThemeError::Resolution("shadow color is missing".into()))?;
+    let color = match mode {
+        CssMode::Fallback => serialize_color_fallback(color_value)?,
+        CssMode::Modern => serialize_color_modern(color_value)?,
+    };
+    let prefix = object
+        .get("inset")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        .then_some("inset ")
+        .unwrap_or("");
+    Ok(format!(
+        "{prefix}{} {} {} {} {color}",
+        dimension("offsetX")?,
+        dimension("offsetY")?,
+        dimension("blur")?,
+        dimension("spread")?
+    ))
 }
 
 fn generate_rust(config: &ProjectConfig, profiles: &[ResolvedProfile]) -> String {
@@ -858,11 +959,9 @@ fn profile<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CssMode, GeneratedArtifact, apply_artifacts, format_number, generate_css, serialize_css,
-    };
+    use super::{CssMode, GeneratedArtifact, apply_artifacts, generate_css, serialize_css};
     use leptos_ui_theme_core::{
-        ColorScheme, ProjectConfig, ResolvedProfile, ResolvedToken, TokenDomain,
+        ColorScheme, ProjectConfig, ResolvedProfile, ResolvedToken, TokenDomain, format_css_number,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -880,8 +979,8 @@ mod tests {
 
     #[test]
     fn numbers_are_stable() {
-        assert_eq!(format_number(-0.0), "0");
-        assert_eq!(format_number(1.25), "1.25");
+        assert_eq!(format_css_number(-0.0).unwrap(), "0");
+        assert_eq!(format_css_number(1.25).unwrap(), "1.25");
     }
 
     #[test]
@@ -894,7 +993,7 @@ mod tests {
         assert!(
             serialize_css(&token, CssMode::Fallback)
                 .expect("serialize fallback")
-                .starts_with("rgb(")
+                .starts_with('#')
         );
     }
 

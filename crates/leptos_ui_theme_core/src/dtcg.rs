@@ -475,6 +475,17 @@ fn validate_shadow_entry(value: &Value) -> Result<(), ThemeError> {
     for name in ["offsetX", "offsetY", "blur", "spread"] {
         validate_nested(DtcgType::Dimension, &object[name])?;
     }
+    if alias_target(&object["blur"])?.is_none() {
+        let blur = object["blur"]
+            .get("value")
+            .and_then(Value::as_f64)
+            .ok_or_else(|| ThemeError::Resolution("shadow blur must be concrete".into()))?;
+        if blur < 0.0 {
+            return Err(ThemeError::Resolution(
+                "shadow blur cannot be negative".into(),
+            ));
+        }
+    }
     if object.get("inset").is_some_and(|value| !value.is_boolean()) {
         return Err(ThemeError::Resolution(
             "shadow inset must be boolean".into(),

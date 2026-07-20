@@ -12,7 +12,10 @@ mod path;
 mod resolver;
 mod source;
 
-pub use color::{Srgb, parse_color, validate_contrast};
+pub use color::{
+    NormalizedColor, Oklch, Srgb, format_css_number, normalize_color, parse_color,
+    serialize_color_fallback, serialize_color_modern, validate_contrast,
+};
 pub use contract::{
     ContractCompatibility, ContrastCheck, ContrastKind, Deprecation, KitTokenContract, TokenDomain,
     TokenMapping, canonical_contract_digest,
