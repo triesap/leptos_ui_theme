@@ -4,11 +4,13 @@
 use clap::{Args, Parser, Subcommand};
 use leptos_ui_theme_codegen::{
     ApplyCommand, BuildOptions as CodegenBuildOptions, Change as PlannedChange, ChangeOperation,
-    ChangeScope, CodegenError, GeneratedArtifact, Ownership, apply_artifacts_for_with_wait,
-    apply_with_wait, build, build_with_options, check, seeded_controller, seeded_module,
-    seeded_scope,
+    ChangeScope, CodegenError, DependencyRecord, DependencyState, GeneratedArtifact, Ownership,
+    apply_artifacts_for_with_wait, apply_with_wait, build_with_options, check,
+    default_dependency_records, seeded_controller, seeded_module, seeded_scope,
 };
-use leptos_ui_theme_core::{CONFIG_FILE, Profile, ProjectConfig, ThemeCompiler, ThemeError};
+use leptos_ui_theme_core::{
+    CONFIG_FILE, Profile, ProjectConfig, ThemeCompiler, ThemeError, discover_kit,
+};
 use serde::Serialize;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -88,6 +90,12 @@ pub enum CliError {
     Codegen(#[from] leptos_ui_theme_codegen::CodegenError),
     #[error("cannot serialize output: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("invalid TOML in {path}: {source}")]
+    Toml {
+        path: PathBuf,
+        #[source]
+        source: toml::de::Error,
+    },
     #[error("{0}")]
     Conflict(String),
     #[error("cannot write {path}: {source}")]
@@ -109,6 +117,7 @@ impl CliError {
             Self::Codegen(CodegenError::Core(ThemeError::Security(_))) => 5,
             Self::Codegen(CodegenError::Core(ThemeError::Contract(_))) => 6,
             Self::Codegen(CodegenError::Core(_)) => 3,
+            Self::Toml { .. } => 3,
             Self::Codegen(_) | Self::Json(_) | Self::Io { .. } => 70,
         }
     }
@@ -186,6 +195,11 @@ struct Outcome {
     exit_code: i32,
     changes: Vec<Change>,
     data: serde_json::Value,
+}
+
+struct DependencyPlan {
+    state: DependencyState,
+    records: Vec<DependencyRecord>,
 }
 
 pub fn run(cli: Cli) -> i32 {
@@ -380,6 +394,7 @@ fn init(
     }
     let config = ProjectConfig::default();
     config.validate()?;
+    let dependency_plan = dependency_plan(&root, &config, true)?;
     let resolver = starter_resolver();
     let starter_profiles = config
         .profiles
@@ -437,6 +452,8 @@ fn init(
             &root,
             CodegenBuildOptions {
                 patch_index: !no_patch_index,
+                dependency_state: dependency_plan.state,
+                dependencies: dependency_plan.records.clone(),
             },
         )?;
         let applied = apply_with_wait(&root, &result, lock_wait)?;
@@ -453,8 +470,10 @@ fn init(
         command: "init",
         status: if dry_run {
             Status::Planned
-        } else {
+        } else if dependency_plan.state == DependencyState::Pending {
             Status::Warning
+        } else {
+            Status::Success
         },
         exit_code: 0,
         changes,
@@ -462,7 +481,8 @@ fn init(
             "root": ".",
             "config": CONFIG_FILE,
             "htmlMode": if no_patch_index { "manual" } else { "patched" },
-            "dependencies": dependency_requirements(),
+            "dependencyState": dependency_plan.state,
+            "dependencies": dependency_plan.records,
         }),
     })
 }
@@ -473,10 +493,14 @@ fn build_command(
     no_patch_index: bool,
     lock_wait_ms: u64,
 ) -> Result<Outcome, CliError> {
+    let config: ProjectConfig = read_json(&root.join(CONFIG_FILE))?;
+    let dependency_plan = dependency_plan(root, &config, false)?;
     let result = build_with_options(
         root,
         CodegenBuildOptions {
             patch_index: !no_patch_index,
+            dependency_state: dependency_plan.state,
+            dependencies: dependency_plan.records.clone(),
         },
     )?;
     let stale = check(root, &result);
@@ -513,13 +537,23 @@ fn build_command(
             },
             "htmlMode": if no_patch_index { "manual" } else { "patched" },
             "htmlSnippet": no_patch_index.then_some(result.bootstrap.html_snippet),
-            "dependencies": dependency_requirements(),
+            "dependencyState": dependency_plan.state,
+            "dependencies": dependency_plan.records,
         }),
     })
 }
 
 fn check_command(root: &Path) -> Result<Outcome, CliError> {
-    let result = build(root)?;
+    let config: ProjectConfig = read_json(&root.join(CONFIG_FILE))?;
+    let dependency_plan = dependency_plan(root, &config, false)?;
+    let result = build_with_options(
+        root,
+        CodegenBuildOptions {
+            patch_index: true,
+            dependency_state: dependency_plan.state,
+            dependencies: dependency_plan.records,
+        },
+    )?;
     let stale = check(root, &result);
     Ok(Outcome {
         command: "check",
@@ -563,18 +597,80 @@ fn explain_command(root: &Path, token_path: &str, profile: &str) -> Result<Outco
 }
 
 fn doctor_command(root: &Path) -> Result<Outcome, CliError> {
-    let result = build(root)?;
+    let config: ProjectConfig = read_json(&root.join(CONFIG_FILE))?;
+    let dependency_plan = dependency_plan(root, &config, true)?;
+    let result = build_with_options(
+        root,
+        CodegenBuildOptions {
+            patch_index: true,
+            dependency_state: dependency_plan.state,
+            dependencies: dependency_plan.records.clone(),
+        },
+    )?;
     let stale = check(root, &result);
+    let dependencies_resolved = dependency_plan.state == DependencyState::Resolved;
+    let healthy = stale.is_empty() && dependencies_resolved;
+    let checks = vec![
+        doctor_check(
+            "app-shape",
+            true,
+            true,
+            "project root and configuration are readable",
+        ),
+        doctor_check(
+            "kit-contract",
+            true,
+            true,
+            "kit capability and contract are compatible",
+        ),
+        doctor_check(
+            "token-resolution",
+            true,
+            true,
+            "all configured profiles resolve",
+        ),
+        doctor_check(
+            "dependency-plan",
+            true,
+            dependencies_resolved,
+            if dependencies_resolved {
+                "generated runtime dependencies are declared and resolved"
+            } else {
+                "generated runtime dependencies are pending"
+            },
+        ),
+        doctor_check(
+            "output-freshness",
+            true,
+            stale.is_empty(),
+            if stale.is_empty() {
+                "generated outputs and HTML integration are fresh"
+            } else {
+                "generated outputs or HTML integration are stale"
+            },
+        ),
+        doctor_check(
+            "portal-abi",
+            true,
+            true,
+            "direct-body portal mount capability is compatible",
+        ),
+    ];
     Ok(Outcome {
         command: "doctor",
-        status: if stale.is_empty() {
+        status: if healthy {
             Status::Success
         } else {
             Status::Error
         },
-        exit_code: if stale.is_empty() { 0 } else { 7 },
+        exit_code: if healthy { 0 } else { 7 },
         changes: Vec::new(),
-        data: json!({"configuration": "pass", "contract": "pass", "resolution": "pass", "outputsFresh": stale.is_empty()}),
+        data: json!({
+            "strict": true,
+            "checks": checks,
+            "dependencyState": dependency_plan.state,
+            "dependencies": dependency_plan.records,
+        }),
     })
 }
 
@@ -704,25 +800,193 @@ fn pretty_json(value: &impl Serialize) -> Result<Vec<u8>, CliError> {
     Ok(bytes)
 }
 
-fn dependency_requirements() -> serde_json::Value {
-    json!([
-        {
-            "package": "leptos",
-            "requirement": "=0.9.0-alpha",
-            "features": ["csr"],
-            "defaultFeatures": false,
-            "resolvedVersion": null,
-            "checksum": null
-        },
-        {
-            "package": "web_ui_primitives",
-            "requirement": ">=0.2.0,<0.3.0",
-            "features": ["leptos"],
-            "defaultFeatures": false,
-            "resolvedVersion": null,
-            "checksum": null
+fn dependency_plan(
+    root: &Path,
+    config: &ProjectConfig,
+    allow_pending: bool,
+) -> Result<DependencyPlan, CliError> {
+    let kit = discover_kit(root, &config.kit, config.limits.clone())?;
+    let mut records = default_dependency_records();
+    let manifest_path = root.join("Cargo.toml");
+    let lock_path = root.join("Cargo.lock");
+    let manifest = read_optional_toml(&manifest_path)?;
+    let Some(manifest) = manifest else {
+        if allow_pending {
+            return Ok(DependencyPlan {
+                state: DependencyState::Pending,
+                records,
+            });
         }
-    ])
+        return Err(ThemeError::Config(
+            "Cargo.toml is required to validate generated runtime dependencies".into(),
+        )
+        .into());
+    };
+    let leptos_declared =
+        validate_dependency_declaration(&manifest, "leptos", "=0.9.0-alpha", "csr")?;
+    let primitives_declared = validate_dependency_declaration(
+        &manifest,
+        "web_ui_primitives",
+        ">=0.2.0,<0.3.0",
+        "leptos",
+    )?;
+    if !leptos_declared || !primitives_declared {
+        if allow_pending {
+            return Ok(DependencyPlan {
+                state: DependencyState::Pending,
+                records,
+            });
+        }
+        return Err(ThemeError::Config(
+            "Cargo.toml is missing generated runtime dependency declarations".into(),
+        )
+        .into());
+    }
+    let Some(lock) = read_optional_toml(&lock_path)? else {
+        if allow_pending {
+            return Ok(DependencyPlan {
+                state: DependencyState::Pending,
+                records,
+            });
+        }
+        return Err(ThemeError::Config(
+            "Cargo.lock is required to validate generated runtime dependencies".into(),
+        )
+        .into());
+    };
+    let (leptos_version, leptos_checksum) =
+        resolved_registry_package(&lock, "leptos", "0.9.0-alpha")?;
+    let primitives_expected = &kit.capability.primitives;
+    let (primitives_version, primitives_checksum) =
+        resolved_registry_package(&lock, "web_ui_primitives", &primitives_expected.version)?;
+    if primitives_checksum != primitives_expected.checksum {
+        return Err(ThemeError::Contract(
+            "resolved web_ui_primitives checksum differs from the kit capability".into(),
+        )
+        .into());
+    }
+    records[0].resolved_version = Some(leptos_version);
+    records[0].checksum = Some(leptos_checksum);
+    records[1].resolved_version = Some(primitives_version);
+    records[1].checksum = Some(primitives_checksum);
+    Ok(DependencyPlan {
+        state: DependencyState::Resolved,
+        records,
+    })
+}
+
+fn read_optional_toml(path: &Path) -> Result<Option<toml::Value>, CliError> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(CliError::Io {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| ThemeError::Config(format!("{} is not UTF-8", path.display())))?;
+    toml::from_str(text)
+        .map(Some)
+        .map_err(|source| CliError::Toml {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+fn validate_dependency_declaration(
+    manifest: &toml::Value,
+    package: &str,
+    requirement: &str,
+    feature: &str,
+) -> Result<bool, CliError> {
+    let Some(entry) = manifest
+        .get("dependencies")
+        .and_then(toml::Value::as_table)
+        .and_then(|dependencies| dependencies.get(package))
+    else {
+        return Ok(false);
+    };
+    let Some(table) = entry.as_table() else {
+        return Err(ThemeError::Config(format!(
+            "dependency `{package}` must use the supported table form"
+        ))
+        .into());
+    };
+    let keys = table.keys().map(String::as_str).collect::<Vec<_>>();
+    if table.len() != 3
+        || !keys.contains(&"version")
+        || !keys.contains(&"default-features")
+        || !keys.contains(&"features")
+        || table.get("version").and_then(toml::Value::as_str) != Some(requirement)
+        || table.get("default-features").and_then(toml::Value::as_bool) != Some(false)
+        || table
+            .get("features")
+            .and_then(toml::Value::as_array)
+            .is_none_or(|features| features.len() != 1 || features[0].as_str() != Some(feature))
+    {
+        return Err(ThemeError::Config(format!(
+            "dependency `{package}` differs from the generated runtime requirement"
+        ))
+        .into());
+    }
+    Ok(true)
+}
+
+fn resolved_registry_package(
+    lock: &toml::Value,
+    package: &str,
+    expected_version: &str,
+) -> Result<(String, String), CliError> {
+    let matches = lock
+        .get("package")
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(toml::Value::as_table)
+        .filter(|record| {
+            record.get("name").and_then(toml::Value::as_str) == Some(package)
+                && record.get("version").and_then(toml::Value::as_str) == Some(expected_version)
+        })
+        .collect::<Vec<_>>();
+    let [record] = matches.as_slice() else {
+        return Err(ThemeError::Config(format!(
+            "Cargo.lock must contain exactly one `{package}` {expected_version} registry package"
+        ))
+        .into());
+    };
+    let source = record
+        .get("source")
+        .and_then(toml::Value::as_str)
+        .filter(|source| source.starts_with("registry+"))
+        .ok_or_else(|| {
+            ThemeError::Config(format!(
+                "resolved dependency `{package}` must come from a registry"
+            ))
+        })?;
+    let _ = source;
+    let checksum = record
+        .get("checksum")
+        .and_then(toml::Value::as_str)
+        .filter(|checksum| !checksum.is_empty())
+        .ok_or_else(|| {
+            ThemeError::Config(format!(
+                "resolved dependency `{package}` has no registry checksum"
+            ))
+        })?;
+    Ok((expected_version.to_owned(), checksum.to_owned()))
+}
+
+fn doctor_check(id: &str, required: bool, pass: bool, summary: &str) -> serde_json::Value {
+    json!({
+        "id": id,
+        "required": required,
+        "status": if pass { "pass" } else { "fail" },
+        "summary": summary,
+        "evidenceDigest": null,
+    })
 }
 
 fn create_change(path: &str, bytes: &[u8]) -> Change {
@@ -852,6 +1116,37 @@ mod tests {
             std::fs::remove_dir_all(&root).unwrap();
         }
         std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            r#"[package]
+name = "theme-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+leptos = { version = "=0.9.0-alpha", default-features = false, features = ["csr"] }
+web_ui_primitives = { version = ">=0.2.0,<0.3.0", default-features = false, features = ["leptos"] }
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Cargo.lock"),
+            r#"version = 4
+
+[[package]]
+name = "leptos"
+version = "0.9.0-alpha"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "leptos-checksum"
+
+[[package]]
+name = "web_ui_primitives"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "sha256:test"
+"#,
+        )
+        .unwrap();
         let contract_path = root.join("src/components/ui/_kit/token-contract.json");
         std::fs::create_dir_all(contract_path.parent().unwrap()).unwrap();
         let mut contract = serde_json::json!({

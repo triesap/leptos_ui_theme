@@ -14,6 +14,7 @@ pub struct VerifiedKit {
     pub contract_path: PathBuf,
     pub capability_path: PathBuf,
     pub stylesheet_path: PathBuf,
+    pub capability: KitCapability,
     pub contract: KitTokenContract,
 }
 
@@ -184,6 +185,7 @@ fn verify_candidate(
         contract_path,
         capability_path,
         stylesheet_path,
+        capability,
         contract,
     })
 }

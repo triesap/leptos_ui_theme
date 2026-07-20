@@ -67,15 +67,95 @@ pub struct BootstrapMetadata {
     pub html_snippet: String,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct DependencyRecord {
+    pub package: String,
+    pub requirement: String,
+    pub features: Vec<String>,
+    pub default_features: bool,
+    pub resolved_version: Option<String>,
+    pub checksum: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DependencyState {
+    Pending,
+    Resolved,
+}
+
+#[derive(Clone, Debug)]
 pub struct BuildOptions {
     pub patch_index: bool,
+    pub dependency_state: DependencyState,
+    pub dependencies: Vec<DependencyRecord>,
 }
 
 impl Default for BuildOptions {
     fn default() -> Self {
-        Self { patch_index: true }
+        Self {
+            patch_index: true,
+            dependency_state: DependencyState::Pending,
+            dependencies: default_dependency_records(),
+        }
     }
+}
+
+#[must_use]
+pub fn default_dependency_records() -> Vec<DependencyRecord> {
+    vec![
+        DependencyRecord {
+            package: "leptos".into(),
+            requirement: "=0.9.0-alpha".into(),
+            features: vec!["csr".into()],
+            default_features: false,
+            resolved_version: None,
+            checksum: None,
+        },
+        DependencyRecord {
+            package: "web_ui_primitives".into(),
+            requirement: ">=0.2.0,<0.3.0".into(),
+            features: vec!["leptos".into()],
+            default_features: false,
+            resolved_version: None,
+            checksum: None,
+        },
+    ]
+}
+
+fn validate_dependency_records(
+    state: DependencyState,
+    dependencies: &[DependencyRecord],
+) -> Result<(), CodegenError> {
+    if dependencies.len() != 2
+        || dependencies[0].package != "leptos"
+        || dependencies[0].requirement != "=0.9.0-alpha"
+        || dependencies[0].features != ["csr"]
+        || dependencies[0].default_features
+        || dependencies[1].package != "web_ui_primitives"
+        || dependencies[1].requirement != ">=0.2.0,<0.3.0"
+        || dependencies[1].features != ["leptos"]
+        || dependencies[1].default_features
+    {
+        return Err(CodegenError::Core(ThemeError::Config(
+            "dependency plan differs from the generated runtime contract".into(),
+        )));
+    }
+    let all_resolved = dependencies
+        .iter()
+        .all(|dependency| dependency.resolved_version.is_some() && dependency.checksum.is_some());
+    let all_pending = dependencies
+        .iter()
+        .all(|dependency| dependency.resolved_version.is_none() && dependency.checksum.is_none());
+    if (state == DependencyState::Resolved && !all_resolved)
+        || (state == DependencyState::Pending && !all_pending)
+    {
+        return Err(CodegenError::Core(ThemeError::Config(
+            "dependency state and resolution records differ".into(),
+        )));
+    }
+    Ok(())
 }
 
 impl GeneratedArtifact {
@@ -127,6 +207,8 @@ struct ThemeLock<'a> {
     config_digest: String,
     contract_digest: String,
     profiles: Vec<&'a str>,
+    dependency_state: DependencyState,
+    dependencies: &'a [DependencyRecord],
     bootstrap: BootstrapLock,
     html_integration: HtmlIntegrationLock,
     outputs: BTreeMap<&'a str, String>,
@@ -160,6 +242,7 @@ pub fn build(root: &Path) -> Result<BuildResult, CodegenError> {
 }
 
 pub fn build_with_options(root: &Path, options: BuildOptions) -> Result<BuildResult, CodegenError> {
+    validate_dependency_records(options.dependency_state, &options.dependencies)?;
     let compiler = ThemeCompiler::load(root)?;
     let profiles = compiler.resolve()?;
     let mut axes = Vec::new();
@@ -287,6 +370,8 @@ pub fn build_with_options(root: &Path, options: BuildOptions) -> Result<BuildRes
         config_digest: format!("sha256:{}", sha256(&config_bytes)),
         contract_digest: format!("sha256:{}", sha256(&contract_bytes)),
         profiles: profiles.iter().map(|profile| profile.id.as_str()).collect(),
+        dependency_state: options.dependency_state,
+        dependencies: &options.dependencies,
         bootstrap: BootstrapLock {
             mode: compiler.config.bootstrap.mode,
             script_digest,
