@@ -37,9 +37,7 @@ pub struct LocalReference {
 
 impl LocalReference {
     pub fn parse(referrer: &LogicalPath, reference: &str) -> Result<Self, ThemeError> {
-        let (document, fragment) = reference
-            .split_once('#')
-            .map_or((reference, ""), |parts| parts);
+        let (document, fragment) = reference.split_once('#').unwrap_or((reference, ""));
         if fragment.contains('#')
             || document.contains(['\\', '?', '#', '%'])
             || document.starts_with('/')

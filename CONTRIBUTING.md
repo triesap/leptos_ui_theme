@@ -10,11 +10,12 @@ Thanks for your interest in contributing to `leptos_ui_theme`.
 
 ## Development setup
 
-This repository is a Rust workspace. Typical checks are:
+This repository is a Rust workspace. Rust 1.99.0 is the development toolchain
+and minimum supported version. Typical checks are:
 
-- `rustup run 1.92.0 cargo fmt --all -- --check`
-- `rustup run 1.92.0 cargo check --workspace --all-targets --all-features --locked`
-- `rustup run 1.92.0 cargo test --workspace --all-targets --all-features --locked`
+- `rustup run 1.99.0 cargo fmt --all -- --check`
+- `rustup run 1.99.0 cargo check --workspace --all-targets --all-features --locked`
+- `rustup run 1.99.0 cargo test --workspace --all-targets --all-features --locked`
 
 ## Pull request checklist
 
